@@ -66,9 +66,9 @@ No root package yet. In `proxy/`:
 - `npm start` — run the proxy (build first)
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
 
-Release: `npm version patch && git push --follow-tags` — the publish workflow tests and
-publishes to npm (needs the `NPM_TOKEN` repo secret). Proxy log lives at
-`~/.onepass/proxy.log.jsonl`.
+Release (from `proxy/`): `npm version patch && git push --follow-tags` — the publish
+workflow tests and publishes to npm (needs the `NPM_TOKEN` repo secret). Proxy logs live
+at `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

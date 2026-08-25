@@ -98,7 +98,8 @@ stubbing them saves nothing).
 
 ## Log
 
-`~/.onepass/proxy.log.jsonl`, one JSON object per line: per-request entries
+`~/.onepass/proxy.log.<start-time>.jsonl` — one file per proxy run, so reports never mix
+metrics from unrelated runs. One JSON object per line: per-request entries
 (path, status, sizes, estimated tokens before/after eviction) and per-trip entries (ids
 added, chars removed). **Request and response bodies are never logged** — sizes, ids, and
 URL paths only. Human-readable mirror lines go to stdout.
@@ -114,8 +115,8 @@ npx onepass-report ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
 evicted:recalled ratio (the product metric — 100:1 is a real product), and estimated tokens
-sent per request over time (flat is good). The proxy log path defaults to
-`~/.onepass/proxy.log.jsonl`.
+sent per request over time (flat is good). The proxy log path defaults to the newest
+`proxy.log.*.jsonl` under `~/.onepass/`.
 
 ## Verification
 
@@ -162,6 +163,7 @@ The local pass-through and recall loop are confirmed too — measurements in
 ## Releasing (maintainers)
 
 ```
+cd proxy
 npm version patch        # or minor/major — bumps version, commits, tags
 git push --follow-tags
 ```

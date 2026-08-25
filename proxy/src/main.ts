@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { createProxyServer } from "./server.js";
-import { defaultProxyLogPath } from "./log.js";
+import { newProxyLogPath } from "./log.js";
 
 if (process.argv.includes("--version")) {
   const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -27,7 +27,7 @@ const config = {
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
   tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
   minResultChars: 2000,
-  logFilePath: defaultProxyLogPath,
+  logFilePath: newProxyLogPath(),
 };
 
 const server = createProxyServer(config);

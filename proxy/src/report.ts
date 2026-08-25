@@ -8,7 +8,7 @@ import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { formatThousands, measureContentChars } from "./evict.js";
-import { defaultProxyLogPath, type ProxyLogEntry, type RequestLogEntry, type TripLogEntry } from "./log.js";
+import { latestProxyLogPath, proxyLogDir, type ProxyLogEntry, type RequestLogEntry, type TripLogEntry } from "./log.js";
 
 const RECALL_TOOL_NAME = /(^|__)recall_(search|get)$/;
 
@@ -134,7 +134,7 @@ async function main(): Promise<void> {
     console.error(`no transcript at ${sessionPath}`);
     process.exit(1);
   }
-  const proxyLogPath = proxyLogArg ?? defaultProxyLogPath;
+  const proxyLogPath = proxyLogArg ?? latestProxyLogPath();
 
   const transcript = await scanTranscript(sessionPath);
   const recalledTokens = Math.round(transcript.recallChars / 4);
@@ -159,8 +159,10 @@ async function main(): Promise<void> {
   );
   console.log("");
 
-  if (!existsSync(proxyLogPath)) {
-    console.log(`Proxy log: none found at ${proxyLogPath} — start the proxy and run the session through it.`);
+  if (proxyLogPath === null || !existsSync(proxyLogPath)) {
+    console.log(
+      `Proxy log: none found at ${proxyLogPath ?? proxyLogDir} — start the proxy and run the session through it.`,
+    );
     return;
   }
 

@@ -12,6 +12,7 @@ Initial release.
 - Pressure pass: relaxes the age gate when a burst of large reads outruns it.
 - `count_tokens` requests get the same transform as `messages`.
 - `onepass-report`: compaction / eviction / recall report over a session transcript plus the
-  proxy log.
+  proxy log. Logs are written one file per proxy run under `~/.onepass/`; the report defaults
+  to the newest.
 - Verified against Claude Code CLI 2.1.241–2.1.243: ~1.49M raw tokens in one session, sent
   peak 146,947, 289 turns, zero compactions.

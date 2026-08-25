@@ -1,4 +1,4 @@
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, readdirSync, type WriteStream } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -42,7 +42,28 @@ export interface ProxyErrorLogEntry {
 
 export type ProxyLogEntry = RequestLogEntry | TripLogEntry | ProxyErrorLogEntry;
 
-export const defaultProxyLogPath = join(homedir(), ".onepass", "proxy.log.jsonl");
+export const proxyLogDir = join(homedir(), ".onepass");
+
+// One log file per proxy run, so a report never mixes metrics from unrelated runs.
+// The ISO timestamp in the name sorts lexically, so "latest" is a plain string max.
+const proxyLogFilePattern = /^proxy\.log\..+\.jsonl$/;
+
+export function newProxyLogPath(): string {
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(proxyLogDir, `proxy.log.${startedAt}.jsonl`);
+}
+
+export function latestProxyLogPath(): string | null {
+  let names: string[];
+  try {
+    names = readdirSync(proxyLogDir);
+  } catch {
+    return null;
+  }
+  const logNames = names.filter((name) => proxyLogFilePattern.test(name)).sort();
+  const newest = logNames.at(-1);
+  return newest === undefined ? null : join(proxyLogDir, newest);
+}
 
 export interface ProxyLogWriter {
   append(entry: ProxyLogEntry): void;

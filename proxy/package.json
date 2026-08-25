@@ -31,7 +31,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
-    "test": "npm run build && node --test \"dist/**/*.test.js\"",
+    "test": "npm run build && node --test dist/*.test.js",
     "report": "npm run build && node dist/report.js",
     "prepublishOnly": "npm test"
   },
