@@ -22,6 +22,10 @@ interface TranscriptStats {
   compactionCount: number;
   recallResultCount: number;
   recallChars: number;
+  /** Peak of API-reported context (input + cache_creation + cache_read) across assistant turns. */
+  realUsagePeak: number;
+  realUsageSamples: number;
+  realUsageTurnsAbove150k: number;
 }
 
 async function scanTranscript(path: string): Promise<TranscriptStats> {
@@ -32,6 +36,9 @@ async function scanTranscript(path: string): Promise<TranscriptStats> {
     compactionCount: 0,
     recallResultCount: 0,
     recallChars: 0,
+    realUsagePeak: 0,
+    realUsageSamples: 0,
+    realUsageTurnsAbove150k: 0,
   };
   const recallToolUseIds = new Set<string>();
 
@@ -56,7 +63,21 @@ async function scanTranscript(path: string): Promise<TranscriptStats> {
     }
 
     const message = entry.message;
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
+    if (!isRecord(message)) continue;
+    if (entry.type === "assistant" && isRecord(message.usage)) {
+      const usage = message.usage;
+      const asNumber = (value: unknown): number => (typeof value === "number" ? value : 0);
+      const realContext =
+        asNumber(usage.input_tokens) +
+        asNumber(usage.cache_creation_input_tokens) +
+        asNumber(usage.cache_read_input_tokens);
+      if (realContext > 0) {
+        stats.realUsageSamples++;
+        if (realContext > stats.realUsagePeak) stats.realUsagePeak = realContext;
+        if (realContext > 150_000) stats.realUsageTurnsAbove150k++;
+      }
+    }
+    if (!Array.isArray(message.content)) continue;
     for (const block of message.content) {
       if (!isRecord(block)) continue;
       if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
@@ -125,6 +146,13 @@ async function main(): Promise<void> {
       (transcript.firstTimestamp !== null ? ` (${transcript.firstTimestamp} -> ${transcript.lastTimestamp})` : ""),
   );
   console.log(`  compactions: ${transcript.compactionCount}  (target: 0)`);
+  if (transcript.realUsageSamples > 0) {
+    console.log(
+      `  peak real context (API-reported usage): ${formatThousands(transcript.realUsagePeak)} tokens ` +
+        `over ${transcript.realUsageSamples} assistant turns — ` +
+        `${transcript.realUsageTurnsAbove150k} above 150,000 (goal: 0)`,
+    );
+  }
   console.log(
     `  recall results: ${transcript.recallResultCount} — ~${formatThousands(recalledTokens)} tokens recalled`,
   );

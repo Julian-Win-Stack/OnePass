@@ -8,6 +8,7 @@ const ALWAYS_TRIP: EvictionConfig = {
   protectLastAssistantTurns: 2,
   minResultChars: 100,
   tripThresholdTokens: 0,
+  charsPerToken: 4,
 };
 
 const NEVER_TRIP: EvictionConfig = { ...ALWAYS_TRIP, tripThresholdTokens: 1_000_000_000 };
@@ -253,6 +254,48 @@ test("a tool_use input with no path or command gets the generic stub", () => {
     blockAt(outcome.body, 1).content,
     '[onepass: evicted WebFetch result (3,000 chars). Use recall_search("WebFetch") for the output as it was.]',
   );
+});
+
+test("pressure: a burst younger than N but older than K is evicted when still over T", () => {
+  const config: EvictionConfig = { ...ALWAYS_TRIP, evictAfterAssistantTurns: 8, protectLastAssistantTurns: 2 };
+  const body = requestBody([
+    assistantToolUse("toolu_burst", "Read", { file_path: "/burst.ts" }),
+    userToolResult("toolu_burst", "B".repeat(50_000)),
+    ...filler(3), // age 3: younger than N=8, older than K=2
+  ]);
+  const outcome = evictToolResults(body, NO_EVICTED_IDS, config);
+  assert.equal(outcome.pressure, true);
+  assert.deepEqual(outcome.newlyEvictedToolUseIds, ["toolu_burst"]);
+  const stub = blockAt(outcome.body, 1).content;
+  assert.ok(typeof stub === "string" && stub.startsWith("[onepass: evicted Read result for /burst.ts"));
+});
+
+test("pressure never touches the last K turns", () => {
+  const config: EvictionConfig = { ...ALWAYS_TRIP, evictAfterAssistantTurns: 8, protectLastAssistantTurns: 2 };
+  const body = requestBody([
+    assistantToolUse("toolu_recent", "Read", { file_path: "/recent.ts" }),
+    userToolResult("toolu_recent", "R".repeat(50_000)),
+    ...filler(1), // age 1: inside the last K=2 turns
+  ]);
+  const outcome = evictToolResults(body, NO_EVICTED_IDS, config);
+  assert.equal(outcome.pressure, false);
+  assert.equal(outcome.bodyChanged, false);
+  assert.equal(blockAt(outcome.body, 1).content, "R".repeat(50_000));
+});
+
+test("no pressure pass when the normal pass gets under T", () => {
+  const config: EvictionConfig = { ...ALWAYS_TRIP, tripThresholdTokens: 5_000 };
+  const body = requestBody([
+    assistantToolUse("toolu_old", "Read", { file_path: "/old.ts" }),
+    userToolResult("toolu_old", "O".repeat(100_000)), // age 3 ≥ N=3: normal eviction gets under T
+    assistantToolUse("toolu_young", "Read", { file_path: "/young.ts" }),
+    userToolResult("toolu_young", "Y".repeat(3000)), // age 2: pressure-eligible, but must survive
+    ...filler(2),
+  ]);
+  const outcome = evictToolResults(body, NO_EVICTED_IDS, config);
+  assert.equal(outcome.pressure, false);
+  assert.deepEqual(outcome.newlyEvictedToolUseIds, ["toolu_old"]);
+  assert.equal(blockAt(outcome.body, 3).content, "Y".repeat(3000));
 });
 
 test("the transform is deterministic", () => {

@@ -17,6 +17,8 @@ export interface RequestLogEntry {
   estimatedTokensSent?: number;
   stubbedResultCount?: number;
   newlyEvictedCount?: number;
+  /** Chars-per-token ratio used for this request's token estimates (calibrated from API usage). */
+  charsPerToken?: number;
 }
 
 export interface TripLogEntry {
@@ -26,6 +28,8 @@ export interface TripLogEntry {
   charsRemoved: number;
   estimatedTokensBefore: number;
   estimatedTokensSent: number;
+  /** The age gate was relaxed from N down to K because the normal pass left the request over T. */
+  pressure?: boolean;
 }
 
 export interface ProxyErrorLogEntry {

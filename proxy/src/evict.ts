@@ -10,11 +10,18 @@ export interface EvictionConfig {
   /** Results smaller than this many chars are never stubbed — stubbing them saves nothing. */
   minResultChars: number;
   /**
-   * T: new ids are evicted only when the estimated request size (total chars ÷ 4), measured
-   * after re-applying already-evicted stubs, exceeds this. Keeps the message prefix stable
-   * between trips so prompt caching survives.
+   * T: new ids are evicted only when the estimated request size, measured after re-applying
+   * already-evicted stubs, exceeds this. Keeps the message prefix stable between trips so
+   * prompt caching survives. Denominated in real tokens via `charsPerToken`.
    */
   tripThresholdTokens: number;
+  /**
+   * Chars-per-token ratio used to convert body size to tokens. The server calibrates this
+   * from the API's reported usage on the previous response; 4 is the uncalibrated fallback.
+   * Real code averages ~3.2, so chars ÷ 4 alone under-counts by ~25% — enough to let a
+   * session cross the client's compaction threshold while the estimate still looks safe.
+   */
+  charsPerToken: number;
 }
 
 export interface EvictionOutcome {
@@ -27,6 +34,11 @@ export interface EvictionOutcome {
   newlyEvictedToolUseIds: string[];
   /** Every id stubbed in this request, previously evicted ones included. */
   stubbedToolUseIds: string[];
+  /**
+   * The normal pass (age ≥ N) left the request above T, so results aged K..N were evicted
+   * too. Bounds a burst of fresh large reads: only the last K turns are ever untouchable.
+   */
+  pressure: boolean;
   charsRemoved: number;
   newlyEvictedCharsRemoved: number;
   estimatedTokensBefore: number;
@@ -44,10 +56,10 @@ export function formatThousands(n: number): string {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-export function estimateTokens(value: unknown): number {
+export function estimateTokens(value: unknown, charsPerToken = 4): number {
   try {
     const json = JSON.stringify(value);
-    return json === undefined ? 0 : Math.round(json.length / 4);
+    return json === undefined ? 0 : Math.round(json.length / charsPerToken);
   } catch {
     return 0;
   }
@@ -203,13 +215,14 @@ export function evictToolResults(
   alreadyEvictedToolUseIds: ReadonlySet<string>,
   config: EvictionConfig,
 ): EvictionOutcome {
-  const estimatedTokensBefore = estimateTokens(body);
+  const estimatedTokensBefore = estimateTokens(body, config.charsPerToken);
   const passthrough: EvictionOutcome = {
     body,
     bodyChanged: false,
     tripped: false,
     newlyEvictedToolUseIds: [],
     stubbedToolUseIds: [],
+    pressure: false,
     charsRemoved: 0,
     newlyEvictedCharsRemoved: 0,
     estimatedTokensBefore,
@@ -226,34 +239,56 @@ export function evictToolResults(
   const afterExisting = applyStubs(messages, existingTargets, toolUseInfoById);
   const estimatedTokensAfterExisting =
     afterExisting.stubbedToolUseIds.length > 0
-      ? estimateTokens({ ...body, messages: afterExisting.messages })
+      ? estimateTokens({ ...body, messages: afterExisting.messages }, config.charsPerToken)
       : estimatedTokensBefore;
 
   const tripped = estimatedTokensAfterExisting > config.tripThresholdTokens;
+  const isNewTarget = (candidate: ResultCandidate, minAge: number): boolean =>
+    !alreadyEvictedToolUseIds.has(candidate.toolUseId) &&
+    candidate.assistantTurnsAfter >= minAge &&
+    candidate.assistantTurnsAfter >= config.protectLastAssistantTurns &&
+    candidate.contentChars >= config.minResultChars;
   const newTargets = tripped
-    ? candidates.filter(
-        (candidate) =>
-          !alreadyEvictedToolUseIds.has(candidate.toolUseId) &&
-          candidate.assistantTurnsAfter >= config.evictAfterAssistantTurns &&
-          candidate.assistantTurnsAfter >= config.protectLastAssistantTurns &&
-          candidate.contentChars >= config.minResultChars,
-      )
+    ? candidates.filter((candidate) => isNewTarget(candidate, config.evictAfterAssistantTurns))
     : [];
   const afterNew = applyStubs(afterExisting.messages, newTargets, toolUseInfoById);
 
-  const stubbedToolUseIds = [...afterExisting.stubbedToolUseIds, ...afterNew.stubbedToolUseIds];
+  // Pressure pass: a burst of fresh large results can leave the request above T with nothing
+  // aged past N yet. Rather than let the client cross its compaction threshold, relax the age
+  // gate down to K — the last K turns stay untouchable, everything older is fair game.
+  let pressure = false;
+  let afterPressure: StubApplication = { messages: afterNew.messages, charsRemoved: 0, stubbedToolUseIds: [] };
+  if (tripped) {
+    const stillOverThreshold =
+      estimateTokens({ ...body, messages: afterNew.messages }, config.charsPerToken) > config.tripThresholdTokens;
+    if (stillOverThreshold) {
+      const alreadyTargeted = new Set(newTargets.map((target) => target.toolUseId));
+      const pressureTargets = candidates.filter(
+        (candidate) =>
+          !alreadyTargeted.has(candidate.toolUseId) && isNewTarget(candidate, config.protectLastAssistantTurns),
+      );
+      if (pressureTargets.length > 0) {
+        pressure = true;
+        afterPressure = applyStubs(afterNew.messages, pressureTargets, toolUseInfoById);
+      }
+    }
+  }
+
+  const newlyEvictedToolUseIds = [...afterNew.stubbedToolUseIds, ...afterPressure.stubbedToolUseIds];
+  const stubbedToolUseIds = [...afterExisting.stubbedToolUseIds, ...newlyEvictedToolUseIds];
   if (stubbedToolUseIds.length === 0) return { ...passthrough, tripped };
 
-  const finalBody = { ...body, messages: afterNew.messages };
+  const finalBody = { ...body, messages: afterPressure.messages };
   return {
     body: finalBody,
     bodyChanged: true,
     tripped,
-    newlyEvictedToolUseIds: afterNew.stubbedToolUseIds,
+    newlyEvictedToolUseIds,
     stubbedToolUseIds,
-    charsRemoved: afterExisting.charsRemoved + afterNew.charsRemoved,
-    newlyEvictedCharsRemoved: afterNew.charsRemoved,
+    pressure,
+    charsRemoved: afterExisting.charsRemoved + afterNew.charsRemoved + afterPressure.charsRemoved,
+    newlyEvictedCharsRemoved: afterNew.charsRemoved + afterPressure.charsRemoved,
     estimatedTokensBefore,
-    estimatedTokensSent: estimateTokens(finalBody),
+    estimatedTokensSent: estimateTokens(finalBody, config.charsPerToken),
   };
 }

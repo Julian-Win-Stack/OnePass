@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createProxyServer } from "./server.js";
-import type { ProxyLogEntry } from "./log.js";
+import type { ProxyLogEntry, RequestLogEntry } from "./log.js";
 
 interface RecordedRequest {
   method: string;
@@ -37,8 +37,22 @@ const upstream = http.createServer((request, response) => {
         response.end();
       });
     } else {
+      const isMessages = (request.url ?? "").split("?")[0] === "/v1/messages";
       response.writeHead(200, { "content-type": "application/json", "x-upstream": "stub" });
-      response.end(JSON.stringify({ ok: true, echoPath: request.url }));
+      // /v1/messages responses report usage at 2 chars per token so calibration is observable.
+      response.end(
+        isMessages
+          ? JSON.stringify({
+              ok: true,
+              echoPath: request.url,
+              usage: {
+                input_tokens: Math.round(body.byteLength / 2),
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+              },
+            })
+          : JSON.stringify({ ok: true, echoPath: request.url }),
+      );
     }
   });
 });
@@ -204,6 +218,34 @@ test("leaves /v1/messages/count_tokens untouched even with evictable content", a
     body,
   });
   assert.equal(lastRecorded().body.toString("utf8"), body);
+});
+
+test("calibrates chars-per-token from the API's reported usage", async () => {
+  // The first request teaches the ratio: the stub reports input_tokens = bytes ÷ 2.
+  const teach = JSON.stringify({
+    model: "claude-test",
+    max_tokens: 100,
+    messages: [{ role: "user", content: "c".repeat(6000) }],
+  });
+  await sendRequest(proxyOrigin, "/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: teach,
+  });
+  const second = JSON.stringify({ model: "claude-test", max_tokens: 100, messages: [{ role: "user", content: "hello again" }] });
+  await sendRequest(proxyOrigin, "/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: second,
+  });
+  const requests = readFileSync(logFilePath, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as ProxyLogEntry)
+    .filter((entry): entry is RequestLogEntry => entry.kind === "request" && entry.path === "/v1/messages");
+  const last = requests[requests.length - 1];
+  assert.ok(last?.charsPerToken !== undefined, "request log entry should record charsPerToken");
+  assert.ok(Math.abs(last.charsPerToken - 2) < 0.1, `expected ~2 chars/token, got ${last.charsPerToken}`);
 });
 
 test("forwards malformed /v1/messages bodies unchanged", async () => {
