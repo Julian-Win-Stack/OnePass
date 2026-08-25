@@ -1,6 +1,6 @@
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 // One JSON object per line. Never any request or response body — sizes, ids, and paths only.
 
@@ -42,7 +42,7 @@ export interface ProxyErrorLogEntry {
 
 export type ProxyLogEntry = RequestLogEntry | TripLogEntry | ProxyErrorLogEntry;
 
-export const defaultProxyLogPath = join(dirname(fileURLToPath(import.meta.url)), "..", "proxy.log.jsonl");
+export const defaultProxyLogPath = join(homedir(), ".onepass", "proxy.log.jsonl");
 
 export interface ProxyLogWriter {
   append(entry: ProxyLogEntry): void;
@@ -62,6 +62,7 @@ export function createProxyLogWriter(filePath: string): ProxyLogWriter {
     append(entry) {
       try {
         if (stream === null) {
+          mkdirSync(dirname(filePath), { recursive: true });
           stream = createWriteStream(filePath, { flags: "a" });
           stream.on("error", warnOnce);
         }

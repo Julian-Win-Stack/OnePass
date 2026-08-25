@@ -10,7 +10,17 @@ is never lost: the original transcript on disk is untouched, and the recall MCP 
 Stubs are pointers, never summaries. The stub names the file or command and says how to get
 the content back (`Re-read the file …, or recall_search("…")`).
 
+Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
+`ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
+and request/response bodies are never logged.
+
 ## Run it
+
+```
+npx onepass-proxy
+```
+
+Or from a clone of this repo:
 
 ```
 cd proxy
@@ -77,7 +87,7 @@ stubbing them saves nothing).
 - **A localhost base URL downgrades the 1M window.** Pointed directly at
   `api.anthropic.com`, sonnet-class models get a 1,000,000-token window; pointed at
   `ANTHROPIC_BASE_URL=http://localhost:…` the same session reports 200,000. Through the
-  proxy, plan for a 200k window (threshold ≈ 187k). The 125k default keeps clear of it.
+  proxy, plan for a 200k window (threshold ≈ 187k). The 110k default keeps clear of it.
 - **Gzipped request bodies bypass eviction.** With `CLAUDE_CODE_GZIP_REQUEST_BODIES=1` the
   client compresses `/v1/messages` bodies and the proxy forwards `content-encoding` bodies
   untouched by design. Unset it for proxied sessions (local desktop sessions don't set it).
@@ -88,7 +98,7 @@ stubbing them saves nothing).
 
 ## Log
 
-`proxy/proxy.log.jsonl` (next to this file), one JSON object per line: per-request entries
+`~/.onepass/proxy.log.jsonl`, one JSON object per line: per-request entries
 (path, status, sizes, estimated tokens before/after eviction) and per-trip entries (ids
 added, chars removed). **Request and response bodies are never logged** — sizes, ids, and
 URL paths only. Human-readable mirror lines go to stdout.
@@ -96,14 +106,16 @@ URL paths only. Human-readable mirror lines go to stdout.
 ## Report
 
 ```
-npm run report -- ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
+npx onepass-report ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
 ```
+
+(from a clone: `npm run report -- <session-jsonl> [proxy-log-path]`)
 
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
 evicted:recalled ratio (the product metric — 100:1 is a real product), and estimated tokens
 sent per request over time (flat is good). The proxy log path defaults to
-`proxy/proxy.log.jsonl`.
+`~/.onepass/proxy.log.jsonl`.
 
 ## Verification
 
@@ -146,3 +158,14 @@ The local pass-through and recall loop are confirmed too — measurements in
    armed window ran with **zero compactions**, a flat sent curve, and **evicted:recalled =
    99:1**; an unannounced probe for evicted content was answered exactly, via
    `recall_search`/`recall_get` — disk first, recall second, no confabulation.
+
+## Releasing (maintainers)
+
+```
+npm version patch        # or minor/major — bumps version, commits, tags
+git push --follow-tags
+```
+
+The tag push triggers the publish workflow, which runs the full test suite
+(`prepublishOnly`) and publishes to npm. Requires the `NPM_TOKEN` repo secret. To publish
+from your machine instead: `npm publish` (after `npm login`) — the same test gate runs.

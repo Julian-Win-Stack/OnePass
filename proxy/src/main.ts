@@ -1,5 +1,13 @@
+#!/usr/bin/env node
+import { createRequire } from "node:module";
 import { createProxyServer } from "./server.js";
 import { defaultProxyLogPath } from "./log.js";
+
+if (process.argv.includes("--version")) {
+  const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
+  console.log(packageJson.version);
+  process.exit(0);
+}
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -22,7 +30,15 @@ const config = {
   logFilePath: defaultProxyLogPath,
 };
 
-createProxyServer(config).listen(port, () => {
+const server = createProxyServer(config);
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`[onepass] port ${port} is already in use — is another onepass-proxy running?`);
+    process.exit(1);
+  }
+  throw err;
+});
+server.listen(port, () => {
   console.log(`[onepass] eviction proxy listening on http://localhost:${port}`);
   console.log(`[onepass] upstream: ${config.upstreamUrl}`);
   console.log(

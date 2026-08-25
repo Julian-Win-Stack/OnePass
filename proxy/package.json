@@ -1,14 +1,39 @@
 {
   "name": "onepass-proxy",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Local HTTP proxy between Claude Code and the Anthropic API that evicts old tool results from outgoing requests.",
+  "description": "Local HTTP proxy between Claude Code and the Anthropic API that evicts old tool results from outgoing requests, so long sessions never hit auto-compact.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Julian-Win-Stack/OnePass.git",
+    "directory": "proxy"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "anthropic",
+    "context-window",
+    "proxy",
+    "compaction"
+  ],
+  "bin": {
+    "onepass-proxy": "dist/main.js",
+    "onepass-report": "dist/report.js"
+  },
+  "files": [
+    "dist",
+    "!dist/*.test.js"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
     "test": "npm run build && node --test \"dist/**/*.test.js\"",
-    "report": "npm run build && node dist/report.js"
+    "report": "npm run build && node dist/report.js",
+    "prepublishOnly": "npm test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

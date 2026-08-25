@@ -50,7 +50,9 @@ spike/             throwaway probes, not the product. MCP recall server (src/), 
                    librarian subagent (librarian.md), and the harness that measures
                    them against each other (harness/). See spike/README.md.
 proxy/             eviction proxy: sits between Claude Code and the API, stubs old tool
-                   results out of /v1/messages requests. See proxy/README.md.
+                   results out of /v1/messages requests. Published to npm as onepass-proxy
+                   (bins: onepass-proxy, onepass-report). See proxy/README.md.
+.github/           CI (build + tests, Node 20/22/24) and tag-push npm publish workflows.
 ```
 
 Otherwise greenfield. Update as directories land.
@@ -63,6 +65,10 @@ No root package yet. In `proxy/`:
 - `npm test` — build, then unit + integration tests (recorded stub upstream, no network)
 - `npm start` — run the proxy (build first)
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
+
+Release: `npm version patch && git push --follow-tags` — the publish workflow tests and
+publishes to npm (needs the `NPM_TOKEN` repo secret). Proxy log lives at
+`~/.onepass/proxy.log.jsonl`.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Reads a Claude Code session transcript (read-only) plus the proxy's JSONL log and prints:
 // compaction count, tokens evicted, tokens recalled, and per-request size over time.
 //
@@ -126,7 +127,7 @@ function ratioLine(tokensEvicted: number, tokensRecalled: number): string {
 async function main(): Promise<void> {
   const [sessionPath, proxyLogArg] = process.argv.slice(2);
   if (sessionPath === undefined) {
-    console.error("usage: npm run report -- <session-jsonl-path> [proxy-log-path]");
+    console.error("usage: onepass-report <session-jsonl-path> [proxy-log-path]");
     process.exit(1);
   }
   if (!existsSync(sessionPath)) {
