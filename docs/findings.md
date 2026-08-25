@@ -4,6 +4,7 @@ Everything here was measured from local Claude Code transcripts under `~/.claude
 No published source has these numbers. They are the starting evidence for Onepass.
 
 Sample: 335 transcript files. 132 sessions contained at least one compaction, 205 compactions total.
+§§9-10 are different: they come from a controlled harness run, not from mined sessions.
 
 ## 1. Compaction is recursive
 
@@ -97,6 +98,47 @@ Across 334 transcripts, zero instances of an agent spontaneously reading its own
 `.jsonl` after compaction. The originals are on disk and complete; nothing tells the agent they
 exist or where they are.
 
+## 9. Keyword recall vs. librarian subagent
+
+The first head-to-head between the two retrieval shapes. Rig: [spike/harness](../spike/harness)
+— a 4-turn session that reads a 40-module build manifest, has the manifest deleted underneath it,
+reads ~110k tokens of trace logs to blow past the 100k autocompact threshold, then is asked for
+one module's build hash. Both arms were told which mechanism to use.
+
+| | keyword MCP | librarian subagent |
+|---|---|---|
+| lookups | 3 | 1 |
+| empty lookups | 0 | 0 |
+| tokens returned into main context | 2,009 | **110** |
+| wall clock for the lookup | <1s | **41s** |
+| answer correct | yes | yes |
+
+The librarian's 110 tokens were a single verbatim line with its location, exactly to spec. But
+producing them cost **13,957 tokens across 8 tool calls** inside the subagent. The trade is
+18x less context pollution for ~40x the latency and ~7x the total tokens.
+
+On tokens evicted / tokens recalled against a 40,000-token eviction: **~364:1** librarian,
+**~20:1** keyword.
+
+Structural limit found while building the librarian arm: **a subagent cannot use a tool the
+session's own allowlist excludes.** So the caller can always do by hand whatever the librarian
+does — the librarian buys context hygiene, never capability. An unforced comparison is not
+possible in this rig for that reason; both arms were told which mechanism to use.
+
+## 10. Claude Code aborts the turn when compaction thrashes
+
+Filling context fast enough triggers a circuit breaker, not a slow compaction:
+
+> Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous
+> compact, 3 times in a row.
+
+The turn exits `rc=1` with `terminal_reason: "rapid_refill_breaker"` and the user is told to
+`/clear`. It fired on both fill turns, in both arms, in every run. Each run logged 14
+compactions.
+
+This is the sharpest statement of the problem Onepass exists to solve: under real pressure
+compaction does not merely degrade the session, it ends the turn.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -105,8 +147,11 @@ exist or where they are.
   pure coding session.
 - A transcript records what happened, not precisely what was sent to the API on each request.
   §2 and §7 use server-reported `usage`, which is exact; §4–§6 infer from transcript content.
+- §9 is n=1 per arm. The direction is large enough to act on; the magnitudes are not settled.
 
 ## Reproducing
 
 Scripts are ad-hoc. Each figure above was produced by walking the `.jsonl` files and grouping
 message content blocks; `compactMetadata` supplies §2 and the recursion test in §1.
+
+§§9-10 are reproducible: see [spike/harness/README.md](../spike/harness/README.md).

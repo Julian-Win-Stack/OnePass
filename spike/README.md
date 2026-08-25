@@ -6,17 +6,23 @@ Throwaway. Answers one question, then gets deleted.
 
 Everything else about Onepass depends on the answer. If the agent won't call recall when it should, offering recall is the wrong product shape and we need to force retrieval instead.
 
+**Answered: it does.** In 3/3 runs the agent called recall unprompted with no hook installed, and never confabulated. It tries disk first, recall second. The hook is no longer wired up; `nudge.sh` is kept only as a record of what was tried. Still open: whether it notices something is missing when the task does not announce it.
+
 ## What's here
 
 | | |
 |---|---|
 | `src/server.ts` | MCP server exposing `recall_search` / `recall_get` over this session's transcript |
-| `nudge.sh` | UserPromptSubmit hook — states that context may be trimmed and originals exist |
+| `librarian.md` | The other retrieval shape: a subagent that greps the transcript and returns verbatim excerpts. Not installed as an agent here — the harness copies it in. |
+| `harness/` | The measured comparison between the two. See [harness/README.md](harness/README.md). |
+| `nudge.sh` | UserPromptSubmit hook, **no longer wired up**. Stated that context may be trimmed and originals exist. |
 | `recall-calls.log` | Every call the agent makes, appended. This is the evidence. |
 
-The nudge states a fact rather than giving an order, on purpose. Ordering the agent to always recall would guarantee a pass and prove nothing.
+The nudge stated a fact rather than giving an order, on purpose. Ordering the agent to always recall would have guaranteed a pass and proved nothing.
 
 ## Protocol
+
+The original hand-run version. `harness/` automates a stricter version of the same idea.
 
 1. `cd` here, start a **fresh** Claude Code session, approve the `onepass` MCP server.
 2. Do real work — enough file reading to build up genuine context.
@@ -38,6 +44,5 @@ The nudge states a fact rather than giving an order, on purpose. Ordering the ag
 
 ## Caveats
 
-- The nudge fires every turn. A real product cannot lean this hard — treat a pass here as the **optimistic** bound.
 - N=1 proves nothing. Run it three or four times, on different work.
-- Worth also running once with the hook disabled, to see whether the tool description alone is enough.
+- The protocol above tells the agent that a past fact is needed. Real work does not.

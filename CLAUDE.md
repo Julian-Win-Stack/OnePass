@@ -16,8 +16,10 @@ volume, and most of the rest is still-valid data that cannot be dropped safely.
 
 Two parts, built in this order:
 
-1. **Recall** — an MCP server exposing search + fetch over the session transcript, so anything
-   dropped from context can be retrieved verbatim.
+1. **Recall** — search + fetch over the session transcript, so anything dropped from context can
+   be retrieved verbatim. Two shapes exist and are not yet decided between: an MCP server the
+   agent queries directly, and a librarian subagent that greps and returns verbatim excerpts.
+   Raced once — [docs/findings.md](docs/findings.md) §9.
 2. **Eviction** — aggressive removal of superseded *and* still-valid tool results, made safe by (1).
 
 Order is load-bearing. Eviction without recall must be timid, which is why the existing
@@ -39,8 +41,10 @@ Real work does not.
 ## Structure
 
 ```
-docs/findings.md   baseline measurements from local transcripts — the evidence base
-spike/             throwaway probe: MCP recall server + nudge hook. Not the product.
+docs/findings.md   baseline measurements — the evidence base
+spike/             throwaway probes, not the product. MCP recall server (src/), the
+                   librarian subagent (librarian.md), and the harness that measures
+                   them against each other (harness/). See spike/README.md.
 proxy/             eviction proxy: sits between Claude Code and the API, stubs old tool
                    results out of /v1/messages requests. See proxy/README.md.
 ```
@@ -55,6 +59,9 @@ No root package yet. In `proxy/`:
 - `npm test` — build, then unit + integration tests (recorded stub upstream, no network)
 - `npm start` — run the proxy (build first)
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
+
+In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
+run instructions in [spike/harness/README.md](spike/harness/README.md).
 
 ## Data
 
