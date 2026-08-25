@@ -1,11 +1,11 @@
-import { readFileSync, readdirSync, statSync, appendFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const CALL_LOG = join(process.cwd(), "spike", "recall-calls.log");
+const CALL_LOG = join(homedir(), ".onepass", "recall-calls.log");
 const MAX_RESULT_CHARS = 8000;
 
 type Entry = {
@@ -114,6 +114,7 @@ function truncate(text: string): string {
 function logCall(tool: string, args: unknown, outcome: string): void {
   const line = JSON.stringify({ at: new Date().toISOString(), tool, args, outcome });
   try {
+    mkdirSync(dirname(CALL_LOG), { recursive: true });
     appendFileSync(CALL_LOG, `${line}\n`);
   } catch {
     // the log is spike instrumentation; never fail a recall because it could not be written

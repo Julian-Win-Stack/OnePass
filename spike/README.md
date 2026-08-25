@@ -16,7 +16,7 @@ Everything else about Onepass depends on the answer. If the agent won't call rec
 | `librarian.md` | The other retrieval shape: a subagent that greps the transcript and returns verbatim excerpts. Not installed as an agent here — the harness copies it in. |
 | `harness/` | The measured comparison between the two. See [harness/README.md](harness/README.md). |
 | `nudge.sh` | UserPromptSubmit hook, **no longer wired up**. Stated that context may be trimmed and originals exist. |
-| `recall-calls.log` | Every call the agent makes, appended. This is the evidence. |
+| `~/.onepass/recall-calls.log` | Every call the agent makes, appended. This is the evidence. Written outside the repo so it works from any project. |
 
 The nudge stated a fact rather than giving an order, on purpose. Ordering the agent to always recall would have guaranteed a pass and proved nothing.
 
@@ -31,7 +31,7 @@ The original hand-run version. `harness/` automates a stricter version of the sa
    - "What was the exact error message when that first build failed?"
    - "What did `src/server.ts` look like before we changed the search function?"
    - Anything needing a literal quote from before the boundary.
-5. Read `recall-calls.log`.
+5. Read `~/.onepass/recall-calls.log`.
 
 ## Reading the result
 
