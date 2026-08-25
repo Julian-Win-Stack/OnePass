@@ -183,9 +183,36 @@ lifted the sent-size floor from ~90k to ~137k over 289 turns. At this workload s
 150k line survives to roughly turn 330; past that needs aged-small-result eviction or a
 lower K. That, not summarization quality, is the next lever.
 
+## 12. Recall closes the loop: an unannounced probe is answered from evicted content
+
+One 5-turn synthetic session (opus, CLI 2.1.243, subscription OAuth, autocompact window
+160k, aggressive `T=50000-est N=2 K=1`): read a 16 KB build manifest, delete it from disk,
+read six ~220 KB trace logs, then ask for one manifest row's hash — with no hint that
+anything was evicted or that recall exists. The stub in context is the only announcement.
+
+- **0 compactions.** Raw request size grew to **365k estimated tokens** (2.3× the armed
+  window); sent stayed in a **33k–50k est sawtooth** (~60–90k API-reported). 49 requests,
+  20 trips, 29 results evicted, 6.87M tokens kept out of requests cumulatively.
+- **Evicted : recalled = 99 : 1** — ~3,227 tokens recalled to answer the probe against
+  ~318k evicted.
+- **The unannounced probe passed.** Sequence: Grep cwd (nothing) → Read the manifest (gone)
+  → Glob (traces only) → `recall_search` → `recall_get` → exact hash, correctly attributed
+  to session history. Disk first, recall second, no confabulation — same pattern as the
+  spike, now without any announcement. This resolves the open question behind §8.
+- **Auto-compact is driven by API-reported `usage`, confirmed from both directions.** A
+  mis-calibrated attempt let full bodies through: compaction fired at
+  `compactMetadata.preTokens: 140831` against the 160k window (fire margin ≈ 88%). The
+  rerun held raw history at 2.3× the window while reported usage stayed ~90k: no
+  compaction. Matches the binary-derived formula in §11.
+- chars÷4 underestimated API tokens **~1.79×** on this digit-heavy noise (est 78,742 when
+  the API counted 140,831) — the worst ratio observed, past §11's 25–40% on real code.
+  This run is part of why the trip threshold is now denominated in calibrated real tokens.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
+- §12 is n=1 on synthetic noise content. Its 1.79× estimate ratio is content-dependent
+  (digit-heavy logs tokenize badly); real code sits lower (§11 measured 25–40%).
 - §6 is a single session. Verify across more before relying on the 55% figure.
 - The sampled sessions are browser-heavy, which inflates the image share in §4 relative to a
   pure coding session.

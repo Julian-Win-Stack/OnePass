@@ -29,9 +29,13 @@ An awareness hook was planned as a third part and dropped. Across 3 spike runs t
 recall unprompted with no hook installed, and never confabulated. It tries disk first, recall
 second.
 
-**Still unverified and load-bearing:** whether the agent notices something is missing when the
-task does not announce it. Every probe so far has told the agent that a past fact was needed.
-Real work does not.
+The load-bearing question — does the agent notice something is missing when the task does not
+announce it? — is now verified under the proxy: the stub is the only announcement, and an
+unannounced probe was answered exactly via recall (disk first, recall second, no
+confabulation). [docs/findings.md](docs/findings.md) §12. Because a chars÷4 estimate
+undercounts real tokens by 25–79% depending on content, the trip threshold is denominated
+in real tokens, live-calibrated from API `usage` (default `ONEPASS_TRIP_TOKENS=110000` —
+see proxy/README.md).
 
 ## Stack
 

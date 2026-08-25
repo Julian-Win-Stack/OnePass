@@ -19,8 +19,9 @@ npm run build
 npm start
 ```
 
-Then point Claude Code at it (auth is your normal `ANTHROPIC_API_KEY`; OAuth/subscription
-sessions are not supported):
+Then point Claude Code at it. Auth passes straight through: `ANTHROPIC_API_KEY` and
+subscription OAuth both work (verified live on CLI 2.1.243 — the CLI does send OAuth
+credentials to a custom `ANTHROPIC_BASE_URL`, whatever the docs say):
 
 ```
 ANTHROPIC_BASE_URL=http://localhost:3777 claude
@@ -134,8 +135,14 @@ makes that stopgap unnecessary for proxied sessions — a low window like 160k p
 compact line at ~144–147k, inside the proxy's own peak range. Drop the setting or lower
 `ONEPASS_TRIP_TOKENS` so peaks clear it.
 
-### Remaining local step
+### Verified locally (2026-08-25, CLI 2.1.243, subscription OAuth, macOS)
 
-Run your own long workload through it, then
-`npm run report -- <that session's .jsonl>` — targets: zero compactions, a flat
-tokens-sent curve, peak real context under your window's compact line.
+The local pass-through and recall loop are confirmed too — measurements in
+[docs/findings.md](../docs/findings.md) §12:
+
+1. **Pass-through parity**: `ANTHROPIC_BASE_URL=http://localhost:3777 claude -p …` behaves
+   identically to a direct run, on real subscription OAuth from a local machine.
+2. **Recall closes the loop**: a 5-turn session whose raw request size grew to 2.3× the
+   armed window ran with **zero compactions**, a flat sent curve, and **evicted:recalled =
+   99:1**; an unannounced probe for evicted content was answered exactly, via
+   `recall_search`/`recall_get` — disk first, recall second, no confabulation.
