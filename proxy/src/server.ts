@@ -11,7 +11,9 @@ export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
   quiet?: boolean;
 }
 
-export const FALLBACK_CHARS_PER_TOKEN = 4;
+// Deliberately low (code averages ~3.2–3.5): over-estimating tokens before the first
+// calibration sample trips eviction early rather than letting a session overshoot the cap.
+export const FALLBACK_CHARS_PER_TOKEN = 3.2;
 const CALIBRATION_MIN_TOKENS = 1000;
 const USAGE_SCAN_LIMIT_CHARS = 262_144;
 
@@ -116,6 +118,8 @@ export function createProxyServer(config: ProxyConfig): http.Server {
 
     const headers = filterHeaders(clientRequest.headers, DROPPED_REQUEST_HEADERS);
     if (bufferedBody !== null) headers["content-length"] = bufferedBody.byteLength;
+    // The usage scan reads the response as plain text, so ask the upstream not to compress.
+    if (calibrate) delete headers["accept-encoding"];
 
     let requestBodyBytes = bufferedBody?.byteLength ?? 0;
     let logged = false;
@@ -208,8 +212,13 @@ export function createProxyServer(config: ProxyConfig): http.Server {
   async function handle(clientRequest: http.IncomingMessage, clientResponse: http.ServerResponse): Promise<void> {
     const method = clientRequest.method ?? "GET";
     const pathname = new URL(clientRequest.url ?? "/", "http://proxy.local").pathname;
+    // count_tokens carries the same messages array and must be evicted identically: the
+    // client's context bookkeeping may consume the count, and an un-evicted count describes
+    // a request that will never be sent.
     const transformable =
-      method === "POST" && pathname === "/v1/messages" && clientRequest.headers["content-encoding"] === undefined;
+      method === "POST" &&
+      (pathname === "/v1/messages" || pathname === "/v1/messages/count_tokens") &&
+      clientRequest.headers["content-encoding"] === undefined;
 
     if (!transformable) {
       forward(clientRequest, clientResponse, null, null);

@@ -210,14 +210,21 @@ test("stubs old large tool results and keeps them stubbed on later requests", as
   assert.ok(messageRequests.length >= 2);
 });
 
-test("leaves /v1/messages/count_tokens untouched even with evictable content", async () => {
+test("count_tokens is evicted identically so counts describe the real request", async () => {
   const body = agedConversation();
   await sendRequest(proxyOrigin, "/v1/messages/count_tokens", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
   });
-  assert.equal(lastRecorded().body.toString("utf8"), body);
+  const seen = JSON.parse(lastRecorded().body.toString("utf8")) as {
+    messages: { content: { content?: unknown }[] }[];
+  };
+  const stub = seen.messages[1]?.content[0]?.content;
+  assert.ok(
+    typeof stub === "string" && stub.startsWith("[onepass: evicted Read result for /big.ts"),
+    `count_tokens body was not evicted: ${String(stub).slice(0, 80)}`,
+  );
 });
 
 test("calibrates chars-per-token from the API's reported usage", async () => {

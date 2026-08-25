@@ -17,7 +17,7 @@ const config = {
   upstreamUrl: process.env.ONEPASS_UPSTREAM ?? "https://api.anthropic.com",
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
-  tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 125_000),
+  tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
   minResultChars: 2000,
   logFilePath: defaultProxyLogPath,
 };

@@ -139,6 +139,50 @@ compactions.
 This is the sharpest statement of the problem Onepass exists to solve: under real pressure
 compaction does not merely degrade the session, it ends the turn.
 
+## 11. The eviction proxy against the real API: 1.49M raw tokens, zero compactions
+
+Verified in a cloud container with real authenticated `claude` (2.1.241) sessions routed
+through the proxy to `api.anthropic.com`. Four results, in increasing order of weight:
+
+**The client's compaction decision is exactly the number the proxy shrinks.** From the
+shipped binary: auto-compact fires when `input_tokens + cache_creation_input_tokens +
+cache_read_input_tokens + output_tokens` from the last assistant message crosses
+`effective_window − 13,000` (a `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` and a ~10% precompute
+buffer can lower it). Nothing re-measures the original conversation. `usage` in, decision
+out — the proxy owns the input.
+
+**A real debugging session survives eviction.** A session given a repo with two planted
+bugs fixed both correctly (character-exact fixes, 22/22 tests) while the proxy stubbed its
+early context mid-task. It re-read files and re-ran commands instead of trusting stubs —
+disk first, exactly as §8 predicted — and never confabulated. The same session shape under
+an artificially low compact threshold (30%) reproduced §10's `rapid_refill_breaker` abort
+when run *without* headroom for eviction: the un-evictable floor (system + tools + last-K
+turns) sat above the threshold, so compaction refilled instantly, three times, and the
+client killed the turn. Eviction cannot rescue a threshold set below the floor.
+
+**Chars ÷ 4 is not a safe unit.** Measured chars-per-token on real traffic: 2.1–2.7 for
+`.d.ts`-heavy content, ~3.2 for mixed code — a fixed ÷ 4 under-counts by 25–40%. The proxy
+now calibrates the ratio from each response's `usage` and denominates its threshold in real
+tokens. Two client behaviors force sibling fixes: responses arrive compressed unless
+`accept-encoding` is stripped, and `count_tokens` requests must be evicted identically or
+they describe a conversation that will never be sent. One more: pointing the client at a
+localhost base URL silently drops sonnet's 1M window to 200k.
+
+**The long run.** A 3.3MB / four-file audit sweep (68,617 lines of TypeScript lib
+definitions), default proxy config, clean environment, one session:
+
+- raw conversation grew to **~1.49M tokens**; requests actually sent peaked at **146,947**
+- **289 assistant turns, zero compactions, zero turns above 150k** (goal line)
+- 75 tool results evicted along the way; the task finished correctly (324 accurate audit
+  bullets + summary, exit 0)
+
+An unproxied 200k-window session hard-stops near 187k — this session processed **~8×** that
+in one sitting with the context gauge flat. The remaining structural limit: the un-evictable
+skeleton (assistant text, sub-2,000-char results) grows ~130–150 tokens per turn, which
+lifted the sent-size floor from ~90k to ~137k over 289 turns. At this workload shape the
+150k line survives to roughly turn 330; past that needs aged-small-result eviction or a
+lower K. That, not summarization quality, is the next lever.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
