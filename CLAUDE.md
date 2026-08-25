@@ -41,13 +41,20 @@ Real work does not.
 ```
 docs/findings.md   baseline measurements from local transcripts — the evidence base
 spike/             throwaway probe: MCP recall server + nudge hook. Not the product.
+proxy/             eviction proxy: sits between Claude Code and the API, stubs old tool
+                   results out of /v1/messages requests. See proxy/README.md.
 ```
 
 Otherwise greenfield. Update as directories land.
 
 ## Commands
 
-Not yet defined. Add here as `package.json` scripts land (`dev`, `build`, `test`, `lint`).
+No root package yet. In `proxy/`:
+
+- `npm run build` — compile (strict tsc)
+- `npm test` — build, then unit + integration tests (recorded stub upstream, no network)
+- `npm start` — run the proxy (build first)
+- `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
 
 ## Data
 

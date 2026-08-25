@@ -1,0 +1,17 @@
+{
+  "name": "onepass-proxy",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Local HTTP proxy between Claude Code and the Anthropic API that evicts old tool results from outgoing requests.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test \"dist/**/*.test.js\"",
+    "report": "npm run build && node dist/report.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
