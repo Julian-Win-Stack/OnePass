@@ -125,6 +125,11 @@ session's own allowlist excludes.** So the caller can always do by hand whatever
 does — the librarian buys context hygiene, never capability. An unforced comparison is not
 possible in this rig for that reason; both arms were told which mechanism to use.
 
+The librarian prompt was corrected after this race: it now tells the subagent to undo JSON string
+escaping when copying an excerpt out. The numbers above stand — the retrieved value was a build
+hash, which escaping leaves untouched — but an excerpt containing quotes, backslashes, or newlines
+would have come back escaped.
+
 ## 10. Claude Code aborts the turn when compaction thrashes
 
 Filling context fast enough triggers a circuit breaker, not a slow compaction:

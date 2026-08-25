@@ -1,5 +1,22 @@
 # Build plan: the Onepass eviction proxy
 
+> **Historical — this brief has shipped. Do not build from it.**
+>
+> Kept as the record of what the proxy was asked to be. For what it actually is, read
+> [proxy/README.md](../proxy/README.md) (behavior, env vars, verification),
+> [CLAUDE.md](../CLAUDE.md) (current rules), and [findings.md](findings.md) §11–12 (results).
+>
+> Where the shipped proxy diverges from this brief:
+> - **Auth** — §3 says API key only. Subscription OAuth works too; it passes through
+>   untouched, so nothing had to be built for it.
+> - **Trip threshold** — step 3 says `T` defaults to 150,000 estimated as chars ÷ 4. It is
+>   110,000 **real** tokens, live-calibrated from API `usage`; chars ÷ 4 under-counts by
+>   25–79%. A pressure pass, not in this brief, relaxes the age gate when a burst of large
+>   reads outruns it.
+> - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. All three
+>   happened: the proxy ships as the `onepass-proxy` package, and `spike/` gained the
+>   retrieval harness.
+
 Written for a Claude session with **zero prior context**. Everything you need is in this
 file. Read it top to bottom before writing any code.
 

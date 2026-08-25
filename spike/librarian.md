@@ -15,7 +15,9 @@ How to work:
 1. Grep the log for the distinctive words the caller gave you. Because the text is stored escaped,
    long exact phrases often fail where single distinctive words succeed — try individual words.
 2. When grep gives you a line number, Read the log around that line to see the content in place.
-3. Copy the answer out character for character.
+3. Copy the answer out character for character, undoing the JSON string escaping as you go:
+   `\"` is a quote, `\\` is one backslash, `\n` is a real line break, `\t` is a tab. The caller
+   needs the text as it originally was, not as JSON stores it. Keep citing the raw line number.
 
 Rules, most important first:
 - Return VERBATIM text, copied exactly. Never paraphrase, never summarise, never round a number,

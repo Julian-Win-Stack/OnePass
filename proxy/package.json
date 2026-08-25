@@ -2,7 +2,7 @@
   "name": "onepass-proxy",
   "version": "0.1.0",
   "type": "module",
-  "description": "Local HTTP proxy between Claude Code and the Anthropic API that evicts old tool results from outgoing requests, so long sessions never hit auto-compact.",
+  "description": "Local HTTP proxy between Claude Code and the Anthropic API that evicts old tool results from outgoing requests, keeping long sessions clear of auto-compact.",
   "license": "MIT",
   "repository": {
     "type": "git",
