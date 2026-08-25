@@ -1,0 +1,4 @@
+node_modules/
+spike/dist/
+spike/recall-calls.log
+.claude/settings.local.json

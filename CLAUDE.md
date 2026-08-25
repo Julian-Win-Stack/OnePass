@@ -8,7 +8,28 @@ Two halves:
 - **Runtime** — keeps what the agent sees small and useful.
 - **Eval** — measures whether a context strategy actually works, since there is currently no accepted way to compare them.
 
-The runtime approach is **not yet decided**. Do not encode a strategy here until it is.
+## Approach
+
+Compaction is recursive — measured at 85% of second-and-later compactions — so detail loss
+compounds. But the fix is not better summarization: the conversation is under 10% of context
+volume, and most of the rest is still-valid data that cannot be dropped safely.
+
+Two parts, built in this order:
+
+1. **Recall** — an MCP server exposing search + fetch over the session transcript, so anything
+   dropped from context can be retrieved verbatim.
+2. **Eviction** — aggressive removal of superseded *and* still-valid tool results, made safe by (1).
+
+Order is load-bearing. Eviction without recall must be timid, which is why the existing
+implementations do not prevent compaction. See [docs/findings.md](docs/findings.md) §6.
+
+An awareness hook was planned as a third part and dropped. Across 3 spike runs the agent called
+recall unprompted with no hook installed, and never confabulated. It tries disk first, recall
+second.
+
+**Still unverified and load-bearing:** whether the agent notices something is missing when the
+task does not announce it. Every probe so far has told the agent that a past fact was needed.
+Real work does not.
 
 ## Stack
 
@@ -17,7 +38,12 @@ The runtime approach is **not yet decided**. Do not encode a strategy here until
 
 ## Structure
 
-Greenfield — nothing committed yet. Update this section as directories land.
+```
+docs/findings.md   baseline measurements from local transcripts — the evidence base
+spike/             throwaway probe: MCP recall server + nudge hook. Not the product.
+```
+
+Otherwise greenfield. Update as directories land.
 
 ## Commands
 
@@ -38,7 +64,11 @@ One JSON object per line. Relevant shape:
 - `isCompactSummary` / `compactMetadata` mark compaction boundaries
 - `timestamp`, `cwd`, `gitBranch`, `sessionId`
 
-This is the primary input for both halves. Treat it as read-only — never write to or mutate a transcript.
+This is the primary input for both halves, and the source recall reads from. Treat it as
+read-only — never write to or mutate a transcript.
+
+Measured properties of this data live in [docs/findings.md](docs/findings.md). Read it before
+proposing a context strategy; several obvious approaches are already ruled out there.
 
 ## Code style
 
