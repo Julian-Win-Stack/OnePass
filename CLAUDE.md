@@ -70,9 +70,11 @@ No root package yet. In `proxy/`:
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
 
 Deploy (local): `npm i -g .` from `proxy/` symlinks the global bins to the working
-tree; the launchd service `com.onepass.proxy` runs them — restart it after a rebuild with
-`launchctl kickstart -k gui/501/com.onepass.proxy`. Not published to npm. Proxy logs live
-at `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
+tree, so a rebuild is the whole deploy. The proxy is not a background service — start
+`onepass-proxy` in a terminal when you want it, and restart it after a rebuild. Nothing
+routes through it by default; opt in per session with the `claudep` shell alias
+(`ANTHROPIC_BASE_URL=http://localhost:3777 claude`). Not published to npm. Proxy logs
+live at `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

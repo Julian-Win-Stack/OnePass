@@ -37,11 +37,12 @@ npm start
 ```
 
 Or install the bins globally (`npm i -g .` from `proxy/`, which symlinks them to the
-working tree) and run `onepass-proxy` — e.g. from a launchd/systemd service.
+working tree) and run `onepass-proxy` in a terminal for as long as you want it.
 
-Then point Claude Code at it. Auth passes straight through: `ANTHROPIC_API_KEY` and
-subscription OAuth both work (verified live on CLI 2.1.243 — the CLI does send OAuth
-credentials to a custom `ANTHROPIC_BASE_URL`, whatever the docs say):
+Then point Claude Code at it — per session, so an ordinary `claude` run is unaffected.
+Auth passes straight through: `ANTHROPIC_API_KEY` and subscription OAuth both work
+(verified live on CLI 2.1.243 — the CLI does send OAuth credentials to a custom
+`ANTHROPIC_BASE_URL`, whatever the docs say):
 
 ```
 ANTHROPIC_BASE_URL=http://localhost:3777 claude
@@ -181,12 +182,16 @@ The local pass-through and recall loop are confirmed too — measurements in
 ## Deploying (this machine)
 
 The global bins are a symlink to this working tree (`npm i -g .`), so a rebuild is all a
-deploy needs — then restart the service:
+deploy needs — then restart `onepass-proxy`:
 
 ```
 npm test
-launchctl kickstart -k gui/501/com.onepass.proxy
+onepass-proxy
 ```
+
+It runs in the foreground, one process for as long as you want it. There is deliberately
+no launchd/systemd unit: nothing should reach the proxy unless a session opts in, so a
+run that forgets the alias is a direct run rather than a silently proxied one.
 
 The package is intentionally not published to npm; a tag-push publish workflow exists in
 `.github/` should that ever change.
