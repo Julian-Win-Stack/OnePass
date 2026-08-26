@@ -27,11 +27,7 @@ and request/response bodies are never logged.
 
 ## Run it
 
-```
-npx onepass-proxy
-```
-
-Or from a clone of this repo:
+From a clone of this repo (not published to npm):
 
 ```
 cd proxy
@@ -39,6 +35,9 @@ npm install
 npm run build
 npm start
 ```
+
+Or install the bins globally (`npm i -g .` from `proxy/`, which symlinks them to the
+working tree) and run `onepass-proxy` — e.g. from a launchd/systemd service.
 
 Then point Claude Code at it. Auth passes straight through: `ANTHROPIC_API_KEY` and
 subscription OAuth both work (verified live on CLI 2.1.243 — the CLI does send OAuth
@@ -126,10 +125,10 @@ URL paths only. Human-readable mirror lines go to stdout.
 ## Report
 
 ```
-npx onepass-report ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
+npm run report -- ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
 ```
 
-(from a clone: `npm run report -- <session-jsonl> [proxy-log-path]`)
+(or `onepass-report …` with the global install)
 
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
@@ -179,14 +178,15 @@ The local pass-through and recall loop are confirmed too — measurements in
    99:1**; an unannounced probe for evicted content was answered exactly, via
    `recall_search`/`recall_get` — disk first, recall second, no confabulation.
 
-## Releasing (maintainers)
+## Deploying (this machine)
+
+The global bins are a symlink to this working tree (`npm i -g .`), so a rebuild is all a
+deploy needs — then restart the service:
 
 ```
-cd proxy
-npm version patch        # or minor/major — bumps version, commits, tags
-git push --follow-tags
+npm test
+launchctl kickstart -k gui/501/com.onepass.proxy
 ```
 
-The tag push triggers the publish workflow, which runs the full test suite
-(`prepublishOnly`) and publishes to npm. Requires the `NPM_TOKEN` repo secret. To publish
-from your machine instead: `npm publish` (after `npm login`) — the same test gate runs.
+The package is intentionally not published to npm; a tag-push publish workflow exists in
+`.github/` should that ever change.

@@ -51,9 +51,11 @@ spike/             throwaway probes, not the product. MCP recall server (src/), 
                    them against each other (harness/). See spike/README.md.
 proxy/             eviction proxy: sits between Claude Code and the API, stubs old
                    whitelisted segments (tool results, attached-file injections, task
-                   notifications) out of /v1/messages requests. Published to npm as
-                   onepass-proxy (bins: onepass-proxy, onepass-report). See proxy/README.md.
-.github/           CI (build + tests, Node 20/22/24) and tag-push npm publish workflows.
+                   notifications) out of /v1/messages requests. Installed locally
+                   (bins: onepass-proxy, onepass-report), not published to npm.
+                   See proxy/README.md.
+.github/           CI (build + tests, Node 20/22/24). A tag-push publish workflow exists
+                   but is unused — the package is not published to npm.
 ```
 
 Otherwise greenfield. Update as directories land.
@@ -67,8 +69,9 @@ No root package yet. In `proxy/`:
 - `npm start` — run the proxy (build first)
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
 
-Release (from `proxy/`): `npm version patch && git push --follow-tags` — the publish
-workflow tests and publishes to npm (needs the `NPM_TOKEN` repo secret). Proxy logs live
+Deploy (local): `npm i -g .` from `proxy/` symlinks the global bins to the working
+tree; the launchd service `com.onepass.proxy` runs them — restart it after a rebuild with
+`launchctl kickstart -k gui/501/com.onepass.proxy`. Not published to npm. Proxy logs live
 at `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
