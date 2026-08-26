@@ -1,6 +1,8 @@
 import * as http from "node:http";
 import * as https from "node:https";
-import { evictToolResults, formatThousands, type EvictionConfig } from "./evict.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { evictContextSegments, formatThousands, type EvictionConfig } from "./evict.js";
 import { createProxyLogWriter, type RequestLogEntry } from "./log.js";
 
 /** charsPerToken is calibrated live from API responses, not configured. */
@@ -9,6 +11,8 @@ export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
   logFilePath: string;
   /** Suppress per-request stdout lines (used by tests). The JSONL log is always written. */
   quiet?: boolean;
+  /** When set, every transformable request body is written here pre-eviction — debugging only. */
+  dumpDir?: string;
 }
 
 // Deliberately low (code averages ~3.2–3.5): over-estimating tokens before the first
@@ -91,7 +95,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
   const agent = upstreamIsHttps ? new https.Agent({ keepAlive: true }) : new http.Agent({ keepAlive: true });
 
   const logWriter = createProxyLogWriter(config.logFilePath);
-  const evictedToolUseIds = new Set<string>();
+  const evictedSegmentIds = new Set<string>();
   // Live chars-per-token ratio, calibrated from the API's reported usage on each response so
   // the trip threshold is denominated in real tokens rather than a fixed chars ÷ 4 guess.
   let charsPerToken = FALLBACK_CHARS_PER_TOKEN;
@@ -226,24 +230,33 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     }
 
     const rawBody = await readEntireBody(clientRequest);
+    if (config.dumpDir !== undefined) {
+      try {
+        mkdirSync(config.dumpDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        writeFileSync(join(config.dumpDir, `${stamp}${pathname.replace(/[^a-zA-Z0-9]/g, "_")}.json`), rawBody);
+      } catch {
+        // Dumping is best-effort; never fail the request over it.
+      }
+    }
     let forwardBody = rawBody;
     let evictionMeta: EvictionRequestMeta | null = null;
     try {
       const parsedBody: unknown = JSON.parse(rawBody.toString("utf8"));
       const requestCharsPerToken = Math.round(charsPerToken * 100) / 100;
-      const outcome = evictToolResults(parsedBody, evictedToolUseIds, {
+      const outcome = evictContextSegments(parsedBody, evictedSegmentIds, {
         evictAfterAssistantTurns: config.evictAfterAssistantTurns,
         protectLastAssistantTurns: config.protectLastAssistantTurns,
-        minResultChars: config.minResultChars,
+        minSegmentChars: config.minSegmentChars,
         tripThresholdTokens: config.tripThresholdTokens,
         charsPerToken: requestCharsPerToken,
       });
-      for (const id of outcome.newlyEvictedToolUseIds) evictedToolUseIds.add(id);
-      if (outcome.newlyEvictedToolUseIds.length > 0) {
+      for (const id of outcome.newlyEvictedIds) evictedSegmentIds.add(id);
+      if (outcome.newlyEvictedIds.length > 0) {
         logWriter.append({
           kind: "trip",
           timestamp: new Date().toISOString(),
-          addedToolUseIds: outcome.newlyEvictedToolUseIds,
+          addedToolUseIds: outcome.newlyEvictedIds,
           charsRemoved: outcome.newlyEvictedCharsRemoved,
           estimatedTokensBefore: outcome.estimatedTokensBefore,
           estimatedTokensSent: outcome.estimatedTokensSent,
@@ -251,10 +264,10 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         });
         if (config.quiet !== true) {
           console.log(
-            `[onepass] TRIP${outcome.pressure ? " (pressure)" : ""}: evicted ${outcome.newlyEvictedToolUseIds.length} tool result(s), ` +
+            `[onepass] TRIP${outcome.pressure ? " (pressure)" : ""}: evicted ${outcome.newlyEvictedIds.length} segment(s), ` +
               `${formatThousands(outcome.newlyEvictedCharsRemoved)} chars removed ` +
               `(est ${formatTokensShort(outcome.estimatedTokensBefore)} -> ${formatTokensShort(outcome.estimatedTokensSent)} tok, ` +
-              `${evictedToolUseIds.size} evicted total)`,
+              `${evictedSegmentIds.size} evicted total)`,
           );
         }
       }
@@ -262,8 +275,8 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
-        stubbedResultCount: outcome.stubbedToolUseIds.length,
-        newlyEvictedCount: outcome.newlyEvictedToolUseIds.length,
+        stubbedResultCount: outcome.stubbedIds.length,
+        newlyEvictedCount: outcome.newlyEvictedIds.length,
         charsPerToken: requestCharsPerToken,
       };
     } catch {

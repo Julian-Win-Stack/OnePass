@@ -1,14 +1,25 @@
 # Onepass eviction proxy
 
 A local HTTP proxy between Claude Code and the Anthropic API. Claude Code resends the entire
-conversation on every turn; the proxy replaces the content of old, large `tool_result` blocks
-with short deterministic stubs before forwarding, so the context the model sees — and the
-`usage` numbers Claude Code bases its auto-compact decision on — stop growing. Evicted content
-is never lost: the original transcript on disk is untouched, and the recall MCP server in
+conversation on every turn; the proxy replaces old, large, recoverable context segments with
+short deterministic stubs before forwarding, so the context the model sees — and the `usage`
+numbers Claude Code bases its auto-compact decision on — stop growing. Three segment kinds,
+a fixed whitelist (measured against real sessions in docs/findings.md §13 — tool results
+alone are only ~6% of a real request body):
+
+- `tool_result` blocks
+- **attached file content** Claude Code injects as `<system-reminder>` user text after a Read
+  — the biggest single mass in real sessions (~20%)
+- **task notifications** (`<task-notification>` user messages carrying background-task output)
+
+Everything else is protected by omission: CLAUDE.md instructions, skill/agent listings,
+compaction summaries, thinking blocks (the client already manages those via the API's
+`context_management` thinking-clearing), and anything the user typed. Evicted content is
+never lost: the original transcript on disk is untouched, and the recall MCP server in
 `spike/` can fetch any of it back verbatim.
 
-Stubs are pointers, never summaries. The stub names the file or command and says how to get
-the content back (`Re-read the file …, or recall_search("…")`).
+Stubs are pointers, never summaries. The stub names the file, command, or task and says how
+to get the content back (`Read the file …, or recall_search("…")`).
 
 Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
 `ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
@@ -46,9 +57,8 @@ ANTHROPIC_BASE_URL=http://localhost:3777 claude
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
 | `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`) |
-
-Results smaller than 2,000 chars are never stubbed (fixed constant, not an env var —
-stubbing them saves nothing).
+| `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing |
+| `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every request body is written to this directory before eviction. Bodies contain the full conversation — never leave it on |
 
 ## How eviction behaves
 
@@ -56,14 +66,23 @@ stubbing them saves nothing).
   the client's context bookkeeping may consume the count, so it must describe the evicted
   request that will actually be sent, not the raw conversation. Everything else is forwarded
   verbatim. Responses stream straight through (SSE included), never buffered.
-- Eviction replaces only the `content` of a `tool_result` block. The block itself,
-  `tool_use_id`, `is_error`, user text, assistant text, thinking blocks, system prompt, and
-  tool definitions are never touched. `is_error` results are evicted like any other.
+- Eviction replaces only the content of whitelisted segments: a `tool_result` block's
+  `content`, an attached-file text block's `text`, or a task-notification user message's
+  string content. Block structure, `tool_use_id`, `is_error`, assistant text, thinking
+  blocks, system prompt, and tool definitions are never touched — and injected text is
+  matched by exact prefix, so CLAUDE.md/skill-listing `<system-reminder>` blocks (same
+  envelope, different prefix) are never candidates. `is_error` results are evicted like any
+  other. Attached-file stubs name the original file path, recovered from the paired
+  `Called the Read tool` reminder; task-notification stubs name the task id and output file.
 - Eviction is **monotonic and batched** to protect prompt caching: the proxy keeps an
-  in-memory set of evicted `tool_use_id`s, re-stubs those on every request, and adds new ids
-  only when the size threshold T trips — all currently eligible ids at once. The message
-  prefix therefore changes once per trip, not every turn. A proxy restart loses the set;
-  originals reappear and the cache rebuilds once. Nothing breaks.
+  in-memory set of evicted segment ids (`tool_use_id` for results, a sha1 content hash for
+  text — the client resends originals every request, so hashes re-match), re-stubs those on
+  every request (except inside the protected last-K window: content re-attached by a fresh
+  Read of an evicted file has the same hash, and stubbing the young copy would break the
+  stub's own recovery path), and adds new ids only when the size threshold T trips — all
+  currently eligible ids at once. The message prefix therefore changes once per trip, not every turn.
+  A proxy restart loses the set; originals reappear and the cache rebuilds once. Nothing
+  breaks.
 - T is denominated in **real tokens**, not chars ÷ 4. The proxy reads the `usage` object out
   of every API response it forwards (stripping `accept-encoding` on those requests so the
   body is scannable) and calibrates a live chars-per-token ratio. Real code runs ~2.5–3.5

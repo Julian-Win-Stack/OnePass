@@ -213,6 +213,59 @@ anything was evicted or that recall exists. The stub in context is the only anno
   the API counted 140,831) — the worst ratio observed, past §11's 25–40% on real code.
   This run is part of why the trip threshold is now denominated in calibrated real tokens.
 
+## 13. The proxy fails in the wild: tool results are 6% of a real request body
+
+First real-workload deployment (mastra repo, session `32ac31eb`, 1.37 MB / 625 entries,
+proxied end to end) compacted twice — `preTokens` 165,358 (manual) and 174,211 (auto) —
+while the proxy ran correctly the whole time: 8 trips, every one removing only 1.2–10.5%
+of the body. Mechanically sound, aimed at the wrong mass.
+
+**Tool results were never the payload.** The session's 73 tool results total 95,930 chars
+— median 845, 57/73 under the old 2,000-char floor, 91% small Bash output. Composition of
+the peak request (466,219-byte body ↔ 165,200 API-reported tokens, 2.82 chars/token):
+
+| segment kind                        | chars   | share |
+|-------------------------------------|---------|-------|
+| attached files (Read `<system-reminder>` injections) | 94,110 | 20% |
+| thinking blocks                     | 87,930  | 19%   |
+| user-role strings (task notifications, queue echoes) | 52,957 | 11% |
+| tool_results                        | 29,102  | 6%    |
+| tool_use inputs                     | 20,375  | 4%    |
+| other `<system-reminder>` text (claudeMd, listings)  | 18,388 | 4%   |
+
+Plus a fixed prefix no proxy can touch: a 162,269-char tools array (~50k tokens after
+caching) and ~30k chars of system prompt.
+
+**Wire formats, measured from captured request bodies** (a `ONEPASS_DUMP_DIR` mode now
+records them): an attached file is a user text block starting `<system-reminder>\nResult
+of calling the Read tool:`, its path recoverable from a preceding block starting
+`<system-reminder>\nCalled the Read tool with the following input:`. Task notifications
+are whole-string user messages starting `<task-notification>`, carrying `<task-id>` and
+`<output-file>` tags. Crucially, CLAUDE.md instructions, skill/agent listings, and MCP
+instructions are *also* `<system-reminder>` user text — indistinguishable by envelope, so
+eviction must be a prefix whitelist, never "evict big injected text."
+
+**Thinking is off-limits and already handled.** Every request carries
+`context_management: {"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}` — the
+client manages thinking blocks through API-native context editing (and signatures make
+them untouchable anyway). That 19% is not the proxy's to take.
+
+The fix this measured: eviction now targets the whitelist of three segment kinds — tool
+results, attached-file injections, task notifications — identified by `tool_use_id` or
+sha1 content hash (the client resends originals every request, so hashes re-match for
+re-stubbing), with the size floor dropped 2,000 → 500 chars. On this session's shape that
+is ~55k reclaimable tokens at peak: 174k → ~119k, under the compaction line.
+
+**Live validation of the fix** (haiku, CLI local, 10-turn attachment-heavy session in the
+mastra repo, dev proxy, `T=80000`): raw request size grew to an estimated **184,676 tokens**
+— past the size at which the failing session compacted — while sent stayed at 77–126k.
+**0 compactions; peak API-reported usage 147,575; 0 turns above 150k.** 6 trips evicted 6
+segments (5 attachments by content hash, 1 tool result; 381,137 chars), all via the
+pressure pass — an attachment burst is always younger than N, exactly the §11 prediction.
+Both recovery paths fired unprompted: a probe about the first (evicted) file was answered
+correctly via `recall_search`, and re-attaching that file showed live content, not an
+instant re-stub — the protected-window guard on hash re-matching doing its job.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.

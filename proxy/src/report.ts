@@ -181,7 +181,7 @@ async function main(): Promise<void> {
   console.log(`Proxy log: ${proxyLogPath}`);
   console.log(`  /v1/messages requests: ${requests.length}`);
   console.log(
-    `  eviction trips: ${trips.length} — ${evictedIdCount} tool results evicted, ` +
+    `  eviction trips: ${trips.length} — ${evictedIdCount} segments evicted, ` +
       `${formatThousands(tripCharsRemoved)} chars removed`,
   );
   console.log(`  tokens evicted (one-time, chars/4): ${formatThousands(tokensEvictedOnce)}`);

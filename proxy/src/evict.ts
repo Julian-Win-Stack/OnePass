@@ -1,14 +1,22 @@
-// Pure transform over an Anthropic POST /v1/messages request body: replaces the content of
-// old, large tool_result blocks with short deterministic stubs. No I/O — the caller owns the
-// evicted-id set, the threshold state, and all logging.
+// Pure transform over an Anthropic POST /v1/messages request body: replaces old, large,
+// recoverable context segments with short deterministic stubs. Three segment kinds:
+//   - tool_result blocks (recover: re-run the tool / re-read the file, or recall)
+//   - attached file content the harness injects as "<system-reminder>\nResult of calling the
+//     Read tool:" user text (recover: read the file from disk, or recall)
+//   - "<task-notification>" user text (recover: read the task's output file, or recall)
+// Only that whitelist is ever touched. Other injected text — CLAUDE.md instructions, skill
+// and agent listings, compaction summaries — and everything the user typed is protected by
+// omission. No I/O — the caller owns the evicted-id set, the threshold state, and logging.
+
+import { createHash } from "node:crypto";
 
 export interface EvictionConfig {
-  /** N: a tool result becomes eligible once at least this many assistant messages follow it. */
+  /** N: a segment becomes eligible once at least this many assistant messages follow it. */
   evictAfterAssistantTurns: number;
-  /** K: results inside the last K assistant turns are never touched, regardless of size. */
+  /** K: segments inside the last K assistant turns are never touched, regardless of size. */
   protectLastAssistantTurns: number;
-  /** Results smaller than this many chars are never stubbed — stubbing them saves nothing. */
-  minResultChars: number;
+  /** Segments smaller than this many chars are never stubbed — stubbing them saves nothing. */
+  minSegmentChars: number;
   /**
    * T: new ids are evicted only when the estimated request size, measured after re-applying
    * already-evicted stubs, exceeds this. Keeps the message prefix stable between trips so
@@ -31,11 +39,11 @@ export interface EvictionOutcome {
   /** The size threshold was exceeded on this request (even if nothing new was eligible). */
   tripped: boolean;
   /** Ids evicted for the first time on this request; the caller must add them to its set. */
-  newlyEvictedToolUseIds: string[];
+  newlyEvictedIds: string[];
   /** Every id stubbed in this request, previously evicted ones included. */
-  stubbedToolUseIds: string[];
+  stubbedIds: string[];
   /**
-   * The normal pass (age ≥ N) left the request above T, so results aged K..N were evicted
+   * The normal pass (age ≥ N) left the request above T, so segments aged K..N were evicted
    * too. Bounds a burst of fresh large reads: only the last K turns are ever untouchable.
    */
   pressure: boolean;
@@ -47,6 +55,13 @@ export interface EvictionOutcome {
 
 export const STUB_PREFIX = "[onepass: evicted";
 const COMMAND_TRUNCATE_CHARS = 80;
+
+// Wire formats measured from real Claude Code requests (docs/findings.md §13). Prefix-matched
+// exactly: any drift in the harness makes the proxy skip the segment, never mis-evict it.
+const ATTACHED_FILE_PREFIX = "<system-reminder>\nResult of calling the Read tool:";
+const TASK_NOTIFICATION_PREFIX = "<task-notification>";
+const READ_INPUT_PREFIX = "<system-reminder>\nCalled the Read tool with the following input:";
+const READ_INPUT_PATH_PATTERN = /"file_path"\s*:\s*"([^"]+)"/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -111,49 +126,13 @@ function collectToolUseInfo(messages: unknown[]): Map<string, ToolUseInfo> {
   return infoById;
 }
 
-interface ResultCandidate {
-  messageIndex: number;
-  blockIndex: number;
-  toolUseId: string;
-  contentChars: number;
-  assistantTurnsAfter: number;
-  alreadyStubShaped: boolean;
-}
-
-function collectResultCandidates(messages: unknown[]): ResultCandidate[] {
-  const assistantTurnsAfterIndex: number[] = new Array<number>(messages.length).fill(0);
-  let assistantsSeen = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    assistantTurnsAfterIndex[i] = assistantsSeen;
-    const message = messages[i];
-    if (isRecord(message) && message.role === "assistant") assistantsSeen++;
-  }
-
-  const candidates: ResultCandidate[] = [];
-  messages.forEach((message, messageIndex) => {
-    if (!isRecord(message) || message.role !== "user" || !Array.isArray(message.content)) return;
-    message.content.forEach((block, blockIndex) => {
-      if (!isRecord(block) || block.type !== "tool_result" || typeof block.tool_use_id !== "string") return;
-      candidates.push({
-        messageIndex,
-        blockIndex,
-        toolUseId: block.tool_use_id,
-        contentChars: measureContentChars(block.content),
-        assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
-        alreadyStubShaped: typeof block.content === "string" && block.content.startsWith(STUB_PREFIX),
-      });
-    });
-  });
-  return candidates;
-}
-
 function sanitizeForStub(text: string): string {
   return text.replace(/\s+/g, " ").replace(/"/g, "'").trim();
 }
 
 // Deterministic on purpose: the same request must always produce the same bytes, or the
 // stubs themselves would break the prompt-cache prefix they exist to protect.
-function buildStubText(info: ToolUseInfo | undefined, originalChars: number): string {
+function buildToolResultStub(info: ToolUseInfo | undefined, originalChars: number): string {
   const resultLabel = info?.name !== undefined ? `${info.name} result` : "tool result";
   const target = info?.target;
   const forPart =
@@ -168,51 +147,186 @@ function buildStubText(info: ToolUseInfo | undefined, originalChars: number): st
   return `[onepass: evicted ${resultLabel}${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
 }
 
+function buildAttachedFileStub(filePath: string | undefined, originalChars: number): string {
+  if (filePath === undefined) {
+    return (
+      `[onepass: evicted attached file content (${formatThousands(originalChars)} chars). ` +
+      `Read the file for current content, or recall_search with a phrase from it for the content as it was.]`
+    );
+  }
+  const path = sanitizeForStub(filePath);
+  return (
+    `[onepass: evicted attached file ${path} (${formatThousands(originalChars)} chars). ` +
+    `Read the file for current content, or recall_search("${path}") for the content as it was.]`
+  );
+}
+
+function buildTaskNotificationStub(text: string, originalChars: number): string {
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1];
+  const outputFile = /<output-file>([^<]+)<\/output-file>/.exec(text)?.[1];
+  const forPart = taskId === undefined ? "" : ` for task ${sanitizeForStub(taskId)}`;
+  const hint =
+    outputFile === undefined
+      ? `Use recall_search("${sanitizeForStub(taskId ?? "task-notification")}") for it as it was.`
+      : `Read the full output on disk at ${sanitizeForStub(outputFile)}, or recall_search("${sanitizeForStub(
+          taskId ?? outputFile,
+        )}") for it as it was.`;
+  return `[onepass: evicted task notification${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
+}
+
+interface Segment {
+  /** tool_use_id for tool results; "sha1:<hex of the text>" for injected text segments. */
+  id: string;
+  messageIndex: number;
+  /** Block position for array content; null when the segment is the message's whole string content. */
+  blockIndex: number | null;
+  contentChars: number;
+  assistantTurnsAfter: number;
+  alreadyStubShaped: boolean;
+  stubText: string;
+}
+
+function textSegmentId(text: string): string {
+  return `sha1:${createHash("sha1").update(text).digest("hex")}`;
+}
+
+function collectSegments(messages: unknown[]): Segment[] {
+  const assistantTurnsAfterIndex: number[] = new Array<number>(messages.length).fill(0);
+  let assistantsSeen = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    assistantTurnsAfterIndex[i] = assistantsSeen;
+    const message = messages[i];
+    if (isRecord(message) && message.role === "assistant") assistantsSeen++;
+  }
+
+  const toolUseInfoById = collectToolUseInfo(messages);
+
+  // Attached file content and the harness message naming its path arrive as separate
+  // segments, content first paired with the nearest preceding unclaimed "Called the Read
+  // tool" input. Both are collected in one ordered walk so pairing is by position.
+  const readInputPaths: { position: number; path: string; claimed: boolean }[] = [];
+  const segments: Segment[] = [];
+  let position = 0;
+
+  const classifyText = (text: string, messageIndex: number, blockIndex: number | null): void => {
+    let stubText: string;
+    if (text.startsWith(READ_INPUT_PREFIX)) {
+      const pathMatch = READ_INPUT_PATH_PATTERN.exec(text);
+      if (pathMatch?.[1] !== undefined) readInputPaths.push({ position, path: pathMatch[1], claimed: false });
+      return;
+    }
+    if (text.startsWith(ATTACHED_FILE_PREFIX)) {
+      let pairedPath: string | undefined;
+      for (let i = readInputPaths.length - 1; i >= 0; i--) {
+        const candidate = readInputPaths[i];
+        if (candidate !== undefined && !candidate.claimed && candidate.position < position) {
+          candidate.claimed = true;
+          pairedPath = candidate.path;
+          break;
+        }
+      }
+      stubText = buildAttachedFileStub(pairedPath, text.length);
+    } else if (text.startsWith(TASK_NOTIFICATION_PREFIX)) {
+      stubText = buildTaskNotificationStub(text, text.length);
+    } else {
+      return;
+    }
+    segments.push({
+      id: textSegmentId(text),
+      messageIndex,
+      blockIndex,
+      contentChars: text.length,
+      assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
+      alreadyStubShaped: text.startsWith(STUB_PREFIX),
+      stubText,
+    });
+  };
+
+  messages.forEach((message, messageIndex) => {
+    if (!isRecord(message) || message.role !== "user") return;
+    const content = message.content;
+    if (typeof content === "string") {
+      classifyText(content, messageIndex, null);
+      position++;
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    content.forEach((block, blockIndex) => {
+      if (!isRecord(block)) {
+        position++;
+        return;
+      }
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+        const contentChars = measureContentChars(block.content);
+        segments.push({
+          id: block.tool_use_id,
+          messageIndex,
+          blockIndex,
+          contentChars,
+          assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
+          alreadyStubShaped: typeof block.content === "string" && block.content.startsWith(STUB_PREFIX),
+          stubText: buildToolResultStub(toolUseInfoById.get(block.tool_use_id), contentChars),
+        });
+      } else if (block.type === "text" && typeof block.text === "string") {
+        classifyText(block.text, messageIndex, blockIndex);
+      }
+      position++;
+    });
+  });
+  return segments;
+}
+
 interface StubApplication {
   messages: unknown[];
   charsRemoved: number;
-  stubbedToolUseIds: string[];
+  stubbedIds: string[];
 }
 
-function applyStubs(
-  messages: unknown[],
-  targets: ResultCandidate[],
-  toolUseInfoById: Map<string, ToolUseInfo>,
-): StubApplication {
-  if (targets.length === 0) return { messages, charsRemoved: 0, stubbedToolUseIds: [] };
+function applyStubs(messages: unknown[], targets: Segment[]): StubApplication {
+  if (targets.length === 0) return { messages, charsRemoved: 0, stubbedIds: [] };
 
-  const targetsByMessage = new Map<number, Map<number, ResultCandidate>>();
+  const targetsByMessage = new Map<number, Segment[]>();
   for (const target of targets) {
-    let byBlock = targetsByMessage.get(target.messageIndex);
-    if (byBlock === undefined) {
-      byBlock = new Map();
-      targetsByMessage.set(target.messageIndex, byBlock);
-    }
-    byBlock.set(target.blockIndex, target);
+    const forMessage = targetsByMessage.get(target.messageIndex);
+    if (forMessage === undefined) targetsByMessage.set(target.messageIndex, [target]);
+    else forMessage.push(target);
   }
 
   let charsRemoved = 0;
-  const stubbedToolUseIds: string[] = [];
+  const stubbedIds: string[] = [];
   const nextMessages = messages.map((message, messageIndex) => {
-    const byBlock = targetsByMessage.get(messageIndex);
-    if (byBlock === undefined || !isRecord(message) || !Array.isArray(message.content)) return message;
+    const forMessage = targetsByMessage.get(messageIndex);
+    if (forMessage === undefined || !isRecord(message)) return message;
+
+    const wholeString = forMessage.find((target) => target.blockIndex === null);
+    if (wholeString !== undefined && typeof message.content === "string") {
+      charsRemoved += Math.max(0, wholeString.contentChars - wholeString.stubText.length);
+      stubbedIds.push(wholeString.id);
+      return { ...message, content: wholeString.stubText };
+    }
+    if (!Array.isArray(message.content)) return message;
+
+    const targetByBlock = new Map<number, Segment>();
+    for (const target of forMessage) {
+      if (target.blockIndex !== null) targetByBlock.set(target.blockIndex, target);
+    }
     const nextContent = message.content.map((block, blockIndex) => {
-      const target = byBlock.get(blockIndex);
+      const target = targetByBlock.get(blockIndex);
       if (target === undefined || !isRecord(block)) return block;
-      const stub = buildStubText(toolUseInfoById.get(target.toolUseId), target.contentChars);
-      charsRemoved += Math.max(0, target.contentChars - stub.length);
-      stubbedToolUseIds.push(target.toolUseId);
-      return { ...block, content: stub };
+      charsRemoved += Math.max(0, target.contentChars - target.stubText.length);
+      stubbedIds.push(target.id);
+      // tool_result blocks carry the stub in `content`; text blocks carry it in `text`.
+      return block.type === "tool_result" ? { ...block, content: target.stubText } : { ...block, text: target.stubText };
     });
     return { ...message, content: nextContent };
   });
 
-  return { messages: nextMessages, charsRemoved, stubbedToolUseIds };
+  return { messages: nextMessages, charsRemoved, stubbedIds };
 }
 
-export function evictToolResults(
+export function evictContextSegments(
   body: unknown,
-  alreadyEvictedToolUseIds: ReadonlySet<string>,
+  alreadyEvictedIds: ReadonlySet<string>,
   config: EvictionConfig,
 ): EvictionOutcome {
   const estimatedTokensBefore = estimateTokens(body, config.charsPerToken);
@@ -220,8 +334,8 @@ export function evictToolResults(
     body,
     bodyChanged: false,
     tripped: false,
-    newlyEvictedToolUseIds: [],
-    stubbedToolUseIds: [],
+    newlyEvictedIds: [],
+    stubbedIds: [],
     pressure: false,
     charsRemoved: 0,
     newlyEvictedCharsRemoved: 0,
@@ -231,60 +345,66 @@ export function evictToolResults(
   if (!isRecord(body) || !Array.isArray(body.messages)) return passthrough;
 
   const messages = body.messages;
-  const toolUseInfoById = collectToolUseInfo(messages);
-  const candidates = collectResultCandidates(messages).filter((candidate) => !candidate.alreadyStubShaped);
+  const candidates = collectSegments(messages).filter((segment) => !segment.alreadyStubShaped);
 
   // Monotonic: an id evicted on any earlier request is stubbed again on every request.
-  const existingTargets = candidates.filter((candidate) => alreadyEvictedToolUseIds.has(candidate.toolUseId));
-  const afterExisting = applyStubs(messages, existingTargets, toolUseInfoById);
+  // The protected-window guard matters for text segments only: content re-attached after a
+  // fresh Read has the same hash, and stubbing the young copy would break the stub's own
+  // "read the file for current content" recovery path. (A tool_use_id never re-ages into
+  // the window, so the guard is a no-op for tool results.)
+  const existingTargets = candidates.filter(
+    (segment) =>
+      alreadyEvictedIds.has(segment.id) &&
+      segment.assistantTurnsAfter >= config.protectLastAssistantTurns,
+  );
+  const afterExisting = applyStubs(messages, existingTargets);
   const estimatedTokensAfterExisting =
-    afterExisting.stubbedToolUseIds.length > 0
+    afterExisting.stubbedIds.length > 0
       ? estimateTokens({ ...body, messages: afterExisting.messages }, config.charsPerToken)
       : estimatedTokensBefore;
 
   const tripped = estimatedTokensAfterExisting > config.tripThresholdTokens;
-  const isNewTarget = (candidate: ResultCandidate, minAge: number): boolean =>
-    !alreadyEvictedToolUseIds.has(candidate.toolUseId) &&
-    candidate.assistantTurnsAfter >= minAge &&
-    candidate.assistantTurnsAfter >= config.protectLastAssistantTurns &&
-    candidate.contentChars >= config.minResultChars;
+  const isNewTarget = (segment: Segment, minAge: number): boolean =>
+    !alreadyEvictedIds.has(segment.id) &&
+    segment.assistantTurnsAfter >= minAge &&
+    segment.assistantTurnsAfter >= config.protectLastAssistantTurns &&
+    segment.contentChars >= config.minSegmentChars;
   const newTargets = tripped
-    ? candidates.filter((candidate) => isNewTarget(candidate, config.evictAfterAssistantTurns))
+    ? candidates.filter((segment) => isNewTarget(segment, config.evictAfterAssistantTurns))
     : [];
-  const afterNew = applyStubs(afterExisting.messages, newTargets, toolUseInfoById);
+  const afterNew = applyStubs(afterExisting.messages, newTargets);
 
   // Pressure pass: a burst of fresh large results can leave the request above T with nothing
   // aged past N yet. Rather than let the client cross its compaction threshold, relax the age
   // gate down to K — the last K turns stay untouchable, everything older is fair game.
   let pressure = false;
-  let afterPressure: StubApplication = { messages: afterNew.messages, charsRemoved: 0, stubbedToolUseIds: [] };
+  let afterPressure: StubApplication = { messages: afterNew.messages, charsRemoved: 0, stubbedIds: [] };
   if (tripped) {
     const stillOverThreshold =
       estimateTokens({ ...body, messages: afterNew.messages }, config.charsPerToken) > config.tripThresholdTokens;
     if (stillOverThreshold) {
-      const alreadyTargeted = new Set(newTargets.map((target) => target.toolUseId));
+      const alreadyTargeted = new Set(newTargets.map((target) => target.id));
       const pressureTargets = candidates.filter(
-        (candidate) =>
-          !alreadyTargeted.has(candidate.toolUseId) && isNewTarget(candidate, config.protectLastAssistantTurns),
+        (segment) => !alreadyTargeted.has(segment.id) && isNewTarget(segment, config.protectLastAssistantTurns),
       );
       if (pressureTargets.length > 0) {
         pressure = true;
-        afterPressure = applyStubs(afterNew.messages, pressureTargets, toolUseInfoById);
+        afterPressure = applyStubs(afterNew.messages, pressureTargets);
       }
     }
   }
 
-  const newlyEvictedToolUseIds = [...afterNew.stubbedToolUseIds, ...afterPressure.stubbedToolUseIds];
-  const stubbedToolUseIds = [...afterExisting.stubbedToolUseIds, ...newlyEvictedToolUseIds];
-  if (stubbedToolUseIds.length === 0) return { ...passthrough, tripped };
+  const newlyEvictedIds = [...afterNew.stubbedIds, ...afterPressure.stubbedIds];
+  const stubbedIds = [...afterExisting.stubbedIds, ...newlyEvictedIds];
+  if (stubbedIds.length === 0) return { ...passthrough, tripped };
 
   const finalBody = { ...body, messages: afterPressure.messages };
   return {
     body: finalBody,
     bodyChanged: true,
     tripped,
-    newlyEvictedToolUseIds,
-    stubbedToolUseIds,
+    newlyEvictedIds,
+    stubbedIds,
     pressure,
     charsRemoved: afterExisting.charsRemoved + afterNew.charsRemoved + afterPressure.charsRemoved,
     newlyEvictedCharsRemoved: afterNew.charsRemoved + afterPressure.charsRemoved,

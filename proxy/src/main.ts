@@ -26,8 +26,11 @@ const config = {
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
   tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
-  minResultChars: 2000,
+  minSegmentChars: envInt("ONEPASS_MIN_SEGMENT_CHARS", 500),
   logFilePath: newProxyLogPath(),
+  ...(process.env.ONEPASS_DUMP_DIR !== undefined && process.env.ONEPASS_DUMP_DIR !== ""
+    ? { dumpDir: process.env.ONEPASS_DUMP_DIR }
+    : {}),
 };
 
 const server = createProxyServer(config);
@@ -44,7 +47,7 @@ server.listen(port, () => {
   console.log(
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
       `protect last K=${config.protectLastAssistantTurns}, trip over T=${config.tripThresholdTokens} real tokens (live-calibrated), ` +
-      `min result size ${config.minResultChars} chars`,
+      `min segment size ${config.minSegmentChars} chars`,
   );
   console.log(`[onepass] log: ${config.logFilePath}`);
   console.log(`[onepass] point Claude Code at it:  ANTHROPIC_BASE_URL=http://localhost:${port} claude`);

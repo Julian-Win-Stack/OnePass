@@ -49,9 +49,10 @@ docs/findings.md   baseline measurements — the evidence base
 spike/             throwaway probes, not the product. MCP recall server (src/), the
                    librarian subagent (librarian.md), and the harness that measures
                    them against each other (harness/). See spike/README.md.
-proxy/             eviction proxy: sits between Claude Code and the API, stubs old tool
-                   results out of /v1/messages requests. Published to npm as onepass-proxy
-                   (bins: onepass-proxy, onepass-report). See proxy/README.md.
+proxy/             eviction proxy: sits between Claude Code and the API, stubs old
+                   whitelisted segments (tool results, attached-file injections, task
+                   notifications) out of /v1/messages requests. Published to npm as
+                   onepass-proxy (bins: onepass-proxy, onepass-report). See proxy/README.md.
 .github/           CI (build + tests, Node 20/22/24) and tag-push npm publish workflows.
 ```
 
