@@ -2,6 +2,7 @@ import { createWriteStream, mkdirSync, readdirSync, type WriteStream } from "nod
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { RebuildKind } from "./speed.js";
+import type { JudgeRejectionCounts } from "./judge.js";
 
 // One JSON object per line. Never any request or response body — sizes, ids, and paths only.
 
@@ -44,6 +45,27 @@ export interface TripLogEntry {
   pressure?: boolean;
 }
 
+export interface JudgeLogEntry {
+  kind: "judge";
+  timestamp: string;
+  model: string;
+  /** The whole background run: request built, called (with its one retry), verdict validated. */
+  durationMs: number;
+  /** Present only when the judge failed after its retry; nothing was evicted in that case. */
+  error?: string;
+  /** A trip arrived while an earlier judge was still running, so this one never ran. */
+  skipped?: true;
+  inputTokens?: number;
+  outputTokens?: number;
+  /** Blocks the judge named. */
+  proposed: number;
+  /** Blocks that survived the guards and were added to the evicted set. */
+  accepted: number;
+  rejected: JudgeRejectionCounts;
+  /** Chars the accepted blocks were carrying; the stubs replacing them cost ~150 chars each. */
+  charsRemovedEstimate: number;
+}
+
 export interface ProxyErrorLogEntry {
   kind: "proxy_error";
   timestamp: string;
@@ -52,7 +74,7 @@ export interface ProxyErrorLogEntry {
   message: string;
 }
 
-export type ProxyLogEntry = RequestLogEntry | TripLogEntry | ProxyErrorLogEntry;
+export type ProxyLogEntry = RequestLogEntry | TripLogEntry | JudgeLogEntry | ProxyErrorLogEntry;
 
 export const proxyLogDir = join(homedir(), ".onepass");
 

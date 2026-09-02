@@ -4,3 +4,4 @@ spike/recall-calls.log
 proxy/dist/
 proxy/proxy.log.jsonl
 .claude/settings.local.json
+.env

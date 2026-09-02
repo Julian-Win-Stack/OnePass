@@ -16,6 +16,8 @@
 > - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. Two of the
 >   three happened: the proxy ships as the `onepass-proxy` package, installed locally and
 >   deliberately **not** published to npm, and `spike/` gained the retrieval harness.
+> - **Text eviction** — §7 ruled out evicting user text. It is now allowed, and only, where a
+>   judge model names the block; see the amended §7 bullet.
 
 Written for a Claude session with **zero prior context**. Everything you need is in this
 file. Read it top to bottom before writing any code.
@@ -210,7 +212,12 @@ that reads a session transcript plus the proxy log and prints:
 - No OAuth/subscription auth work. API key only.
 - No UI, no packaging, no npm publishing.
 - No changes to `spike/`.
-- No eviction of user/assistant text or thinking blocks — tool results only.
+- No eviction of assistant text or thinking blocks, ever. **Amended:** user text is evictable,
+  but only where the judge names that exact block, and only down to what the judge leaves
+  behind: a verbatim excerpt of the user's own words, a one-line note in the judge's own words,
+  or both, plus a pointer. The note is the one place a summary is allowed anywhere in the
+  proxy — it exists because a pure paste has no words worth quoting, and it is attributed to
+  onepass in the stub and capped so it can never be mistaken for the user's own text.
 
 ## 8. Done means
 

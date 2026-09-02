@@ -21,6 +21,11 @@ function envInt(name: string, fallback: number): number {
 }
 
 const port = envInt("ONEPASS_PORT", 3777);
+// No key means no judge: the proxy evicts by the rules alone, exactly as it did before.
+// Deliberately not ANTHROPIC_API_KEY — a `claudep` launched from the proxy's own shell would
+// then bill Claude Code to the key instead of the user's subscription.
+const judgeApiKey = process.env.ONEPASS_JUDGE_API_KEY;
+const judgeModel = process.env.ONEPASS_JUDGE_MODEL ?? "claude-sonnet-5";
 const config = {
   upstreamUrl: process.env.ONEPASS_UPSTREAM ?? "https://api.anthropic.com",
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
@@ -28,6 +33,9 @@ const config = {
   tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
   minSegmentChars: envInt("ONEPASS_MIN_SEGMENT_CHARS", 500),
   logFilePath: newProxyLogPath(),
+  ...(judgeApiKey !== undefined && judgeApiKey !== ""
+    ? { judge: { apiKey: judgeApiKey, model: judgeModel } }
+    : {}),
   ...(process.env.ONEPASS_DUMP_DIR !== undefined && process.env.ONEPASS_DUMP_DIR !== ""
     ? { dumpDir: process.env.ONEPASS_DUMP_DIR }
     : {}),
@@ -48,6 +56,11 @@ server.listen(port, () => {
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
       `protect last K=${config.protectLastAssistantTurns}, trip over T=${config.tripThresholdTokens} real tokens (live-calibrated), ` +
       `min segment size ${config.minSegmentChars} chars`,
+  );
+  console.log(
+    config.judge === undefined
+      ? "[onepass] judge: off — set ONEPASS_JUDGE_API_KEY to let a second model pick blocks the rules cannot"
+      : `[onepass] judge: on, ${config.judge.model} (fires at each trip, runs in the background)`,
   );
   console.log(`[onepass] log: ${config.logFilePath}`);
   // The flag keeps native-1M models at 1M: Claude Code caps them at 200k behind a non-api.anthropic.com host.

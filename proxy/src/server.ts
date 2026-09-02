@@ -2,8 +2,15 @@ import * as http from "node:http";
 import * as https from "node:https";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { evictContextSegments, formatThousands, type EvictionConfig } from "./evict.js";
-import { createProxyLogWriter, type RequestLogEntry } from "./log.js";
+import {
+  evictContextSegments,
+  formatThousands,
+  isRecord,
+  type EvictionConfig,
+  type JudgeDecision,
+} from "./evict.js";
+import { callJudge, NO_REJECTIONS, validateJudgePicks, type JudgeConfig } from "./judge.js";
+import { createProxyLogWriter, type JudgeLogEntry, type RequestLogEntry } from "./log.js";
 import {
   classifyRebuild,
   describeRebuild,
@@ -22,6 +29,8 @@ export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
   quiet?: boolean;
   /** When set, every transformable request body is written here pre-eviction — debugging only. */
   dumpDir?: string;
+  /** Absent means no judge: the proxy evicts by the rules alone, exactly as it did before. */
+  judge?: JudgeConfig;
 }
 
 // Deliberately low (code averages ~3.2–3.5): over-estimating tokens before the first
@@ -102,6 +111,16 @@ export function createProxyServer(config: ProxyConfig): http.Server {
 
   const logWriter = createProxyLogWriter(config.logFilePath);
   const evictedSegmentIds = new Set<string>();
+  // Deliberately narrower than `evictedSegmentIds`, not a parallel copy of it: this holds only
+  // the judge's picks on the user's own text, which are the only ids that carry anything back
+  // into the stub. Every other judge pick needs nothing beyond membership of the set above.
+  const judgeDecisionById = new Map<string, JudgeDecision>();
+  // One judge at a time — a second would read a conversation the first is about to shrink.
+  let judgeRunning = false;
+  // What went upstream on the most recent transformable request. The judge's verdict is
+  // validated against this, not against the snapshot it read: a file re-read since then is
+  // young again, and the protected window has to be measured against what is going out now.
+  let lastSentMessages: unknown[] = [];
   // Live chars-per-token ratio, calibrated from the API's reported usage on each response so
   // the trip threshold is denominated in real tokens rather than a fixed chars ÷ 4 guess.
   let charsPerToken = FALLBACK_CHARS_PER_TOKEN;
@@ -135,6 +154,71 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     readUsage: boolean;
     /** Null for anything that is not a /v1/messages request; only those are classified. */
     rebuildContext: RebuildContext | null;
+  }
+
+  /** Every judge record starts here, so the outcomes cannot drift apart field by field. */
+  function newJudgeLogEntry(model: string, durationMs: number): JudgeLogEntry {
+    return {
+      kind: "judge",
+      timestamp: new Date().toISOString(),
+      model,
+      durationMs,
+      proposed: 0,
+      accepted: 0,
+      rejected: { ...NO_REJECTIONS },
+      charsRemovedEstimate: 0,
+    };
+  }
+
+  /**
+   * Runs alongside the request that tripped, never in front of it. The verdict lands in the
+   * shared evicted-id set, so the agent's next request — trip or not — carries the stubs.
+   * Owns the one-at-a-time guard: a second judge would be reading a conversation the first is
+   * about to shrink.
+   */
+  async function maybeRunJudge(judge: JudgeConfig, messagesAtTrip: unknown[]): Promise<void> {
+    if (judgeRunning) {
+      logWriter.append({ ...newJudgeLogEntry(judge.model, 0), skipped: true });
+      return;
+    }
+    judgeRunning = true;
+    const startedAt = Date.now();
+    let entry: JudgeLogEntry;
+    try {
+      const result = await callJudge(messagesAtTrip, { upstreamUrl: config.upstreamUrl, judge });
+      entry = { ...newJudgeLogEntry(judge.model, Date.now() - startedAt), ...result.usage };
+      if (result.picks === null) {
+        entry.error = result.error ?? "judge call failed";
+      } else {
+        const verdict = validateJudgePicks(
+          result.picks,
+          lastSentMessages,
+          config.protectLastAssistantTurns,
+          config.minSegmentChars,
+        );
+        for (const pick of verdict.accepted) {
+          evictedSegmentIds.add(pick.id);
+          if (pick.kind === "user_text") {
+            judgeDecisionById.set(pick.id, { keep: pick.keep, note: pick.note });
+          }
+        }
+        entry.proposed = result.picks.length;
+        entry.accepted = verdict.accepted.length;
+        entry.rejected = verdict.rejected;
+        entry.charsRemovedEstimate = verdict.charsRemovedEstimate;
+      }
+    } finally {
+      judgeRunning = false;
+    }
+    logWriter.append(entry);
+    if (config.quiet !== true) {
+      console.log(
+        entry.error !== undefined
+          ? `[onepass] JUDGE failed after ${formatDuration(entry.durationMs)}: ${entry.error} — nothing extra evicted`
+          : `[onepass] JUDGE: ${entry.accepted}/${entry.proposed} picks accepted, ` +
+              `~${formatThousands(entry.charsRemovedEstimate)} chars will come out (${formatDuration(entry.durationMs)})`,
+      );
+    }
   }
 
   function forward(
@@ -288,6 +372,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     }
     let forwardBody = rawBody;
     let evictionMeta: EvictionRequestMeta | null = null;
+    let tripped = false;
     try {
       const parsedBody: unknown = JSON.parse(rawBody.toString("utf8"));
       const requestCharsPerToken = Math.round(charsPerToken * 100) / 100;
@@ -297,7 +382,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         minSegmentChars: config.minSegmentChars,
         tripThresholdTokens: config.tripThresholdTokens,
         charsPerToken: requestCharsPerToken,
-      });
+      }, judgeDecisionById);
       for (const id of outcome.newlyEvictedIds) evictedSegmentIds.add(id);
       if (outcome.newlyEvictedIds.length > 0) {
         logWriter.append({
@@ -319,6 +404,9 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         }
       }
       if (outcome.bodyChanged) forwardBody = Buffer.from(JSON.stringify(outcome.body), "utf8");
+      tripped = outcome.tripped;
+      const sentBody = outcome.body;
+      if (isRecord(sentBody) && Array.isArray(sentBody.messages)) lastSentMessages = sentBody.messages;
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
@@ -350,6 +438,20 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       readUsage: evictionMeta !== null,
       rebuildContext,
     });
+
+    // count_tokens carries the same conversation, so judging it too would only double the bill.
+    if (config.judge !== undefined && tripped && pathname === "/v1/messages") {
+      // A rejection here would take the whole proxy down with it; the judge is never worth that.
+      maybeRunJudge(config.judge, lastSentMessages).catch((err: unknown) => {
+        logWriter.append({
+          kind: "proxy_error",
+          timestamp: new Date().toISOString(),
+          method: "POST",
+          path: "/v1/messages (judge)",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   }
 
   const server = http.createServer((clientRequest, clientResponse) => {

@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { evictContextSegments, measureContentChars, STUB_PREFIX, type EvictionConfig } from "./evict.js";
+import {
+  evictContextSegments,
+  measureContentChars,
+  STUB_PREFIX,
+  textSegmentId,
+  type EvictionConfig,
+} from "./evict.js";
 
 // tripThresholdTokens: 0 makes every request trip — the step-2 "deliberately dumb" behavior.
 const ALWAYS_TRIP: EvictionConfig = {
@@ -632,4 +638,78 @@ test("a call and its result are both charged to charsRemoved, each by its own si
   // A call is charged the JSON length of its replacement input (1,000 → 202), a result the
   // length of its stub string (4,000 → 163). Both stubs are pinned byte-exact above.
   assert.equal(outcome.charsRemoved, 1000 - 202 + (4000 - 163));
+});
+
+// A judge-selected user block: 3,000 chars, an instruction followed by a paste.
+const PASTED_USER_TEXT = "Use tabs, not spaces. Here is the log:\n" + "L".repeat(2961);
+const PASTED_USER_TEXT_ID = textSegmentId(PASTED_USER_TEXT);
+
+const pointerWith = (summary: string): string =>
+  `[onepass: evicted 3,000 chars of user text.${summary} ` +
+  `recall_search("Use tabs, not spaces. Here is the log:") for the original]`;
+
+const NOTE = "build log from the failing auth test";
+const SUMMARY = ` onepass's summary: ${NOTE}.`;
+
+for (const { name, decision, expected } of [
+  {
+    name: "the quote above a pointer when only a quote was kept",
+    decision: { keep: "Use tabs, not spaces.", note: "" },
+    expected: `Use tabs, not spaces.\n${pointerWith("")}`,
+  },
+  {
+    name: "an attributed summary alone when the block was a pure paste",
+    decision: { keep: "", note: NOTE },
+    expected: pointerWith(SUMMARY),
+  },
+  {
+    name: "the quote above an attributed summary when the judge gave both",
+    decision: { keep: "Use tabs, not spaces.", note: NOTE },
+    expected: `Use tabs, not spaces.\n${pointerWith(SUMMARY)}`,
+  },
+]) {
+  test(`stubs a judge-selected user block as ${name}, with no trip`, () => {
+    const body = requestBody([
+      { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+      ...filler(3),
+    ]);
+
+    const outcome = evictContextSegments(
+      body,
+      new Set([PASTED_USER_TEXT_ID]),
+      NEVER_TRIP,
+      new Map([[PASTED_USER_TEXT_ID, decision]]),
+    );
+
+    assert.equal(outcome.tripped, false, "a verdict applies on the next request whether or not it trips");
+    assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, expected);
+  });
+}
+
+// The note is the judge's own words, unverifiable by construction. A cap is the only thing
+// standing between a malfunctioning judge and paragraphs of invented text in the context.
+test("truncates a judge note that runs past the cap", () => {
+  const body = requestBody([
+    { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+    ...filler(3),
+  ]);
+
+  const outcome = evictContextSegments(
+    body,
+    new Set([PASTED_USER_TEXT_ID]),
+    NEVER_TRIP,
+    new Map([[PASTED_USER_TEXT_ID, { keep: "", note: "N".repeat(500) }]]),
+  );
+
+  const stub = String((blockAt(outcome.body, 0) as { text?: unknown }).text);
+  assert.ok(stub.includes(`onepass's summary: ${"N".repeat(200)}\u2026.`), stub.slice(0, 120));
+});
+
+test("leaves a user block alone when the judge never selected it", () => {
+  const body = requestBody([
+    { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, new Set([PASTED_USER_TEXT_ID]), ALWAYS_TRIP);
+  assert.equal(outcome.bodyChanged, false, "only judge-selected user text is evictable");
 });

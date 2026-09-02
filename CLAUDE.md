@@ -45,6 +45,11 @@ proxy/             eviction proxy: sits between Claude Code and the API, stubs o
                    whitelisted segments (tool results, tool_use inputs, attached-file
                    injections, task notifications) out of /v1/messages requests. Installed locally
                    (bins: onepass-proxy, onepass-report), not published to npm.
+                   proxy/src/judge.ts adds an optional second layer on top of those rules: at
+                   each /v1/messages trip a second model reads the conversation as it went
+                   upstream (stubs included) in the background and names blocks that are
+                   superseded or belong to a finished sub-task. Off unless
+                   ONEPASS_JUDGE_API_KEY is set. Unmeasured — no findings.md section yet.
                    See proxy/README.md.
 .github/           CI (build + tests, Node 20/22/24). A tag-push publish workflow exists
                    but is unused — the package is not published to npm.
@@ -71,6 +76,18 @@ build. Nothing routes through it by default; opt in per session with the `claude
 The flag is load-bearing: without it Claude Code caps native-1M models at 200k behind a
 non-`api.anthropic.com` host (proxy/README.md). Not published to npm. Proxy logs live at
 `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
+
+The judge is opt-in per proxy run: set `ONEPASS_JUDGE_API_KEY` (the user's own API key —
+never `ANTHROPIC_API_KEY`, which would bill Claude Code to it) in the proxy's terminal, and
+optionally `ONEPASS_JUDGE_MODEL` (default `claude-sonnet-5`). Judge calls cost money on that
+key. The key lives in `~/.zshrc` as an `export ONEPASS_JUDGE_API_KEY=` line, so an interactive
+terminal already has it; a non-interactive shell does not, and picks it up with
+`eval "$(grep '^export ONEPASS_JUDGE_API_KEY=' ~/.zshrc)"`. Never print or copy the value.
+It may evict user text, but only the block it names and only down to what it leaves
+behind — a quote it copies verbatim, a one-line note in its own words (attributed in the stub,
+capped at 200 chars), or both; naming a block with neither leaves it untouched. Harness-injected
+user text and already-stubbed blocks are never offered to it. Assistant text and thinking are
+never touched.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

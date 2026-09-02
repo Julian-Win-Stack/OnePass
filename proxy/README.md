@@ -3,8 +3,8 @@
 A local HTTP proxy between Claude Code and the Anthropic API. Claude Code resends the entire
 conversation on every turn; the proxy replaces old, large, recoverable context segments with
 short deterministic stubs before forwarding, so the context the model sees — and the `usage`
-numbers Claude Code bases its auto-compact decision on — stop growing. Four segment kinds,
-a fixed whitelist (measured against real sessions in docs/findings.md §13 — tool results
+numbers Claude Code bases its auto-compact decision on — stop growing. Four segment kinds by
+rule, a fixed whitelist (measured against real sessions in docs/findings.md §13 — tool results
 alone are only ~6% of a real request body):
 
 - `tool_result` blocks
@@ -15,10 +15,13 @@ alone are only ~6% of a real request body):
 - **task notifications** (`<task-notification>` user messages carrying background-task output)
 
 Everything else is protected by omission: CLAUDE.md instructions, skill/agent listings,
-compaction summaries, thinking blocks (the client already manages those via the API's
-`context_management` thinking-clearing), and anything the user typed. Evicted content is
-never lost: the original transcript on disk is untouched, and the recall MCP server in
-`spike/` can fetch any of it back verbatim.
+compaction summaries, and thinking blocks (the client already manages those via the API's
+`context_management` thinking-clearing). Text the user typed is off-limits to the rules and
+has exactly one exception — the optional judge below may evict a block it names, and then only
+down to what it leaves behind: a verbatim quote of the user's own words, a one-line note in the
+judge's own words (attributed as such in the stub), or both. Assistant text and thinking have no
+exception at all. Evicted content is never lost: the original transcript on disk is untouched,
+and the recall MCP server in `spike/` can fetch any of it back verbatim.
 
 Stubs are pointers, never summaries. The stub names the file, command, or task and says how
 to get the content back (`Read the file …, or recall_search("…")`). A stubbed `tool_use`
@@ -74,7 +77,9 @@ Code interactions".
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
 | `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
 | `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing. A larger segment is also skipped when its finished stub would not be smaller |
-| `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every request body is written to this directory before eviction. Bodies contain the full conversation — never leave it on |
+| `ONEPASS_JUDGE_API_KEY` | unset | Your own Anthropic API key. Unset means **no judge**: the proxy evicts by the rules alone, exactly as it did before. Never set `ANTHROPIC_API_KEY` for this — a `claudep` launched from the same shell would then bill Claude Code to the key instead of your subscription. Judge calls are billed to this key |
+| `ONEPASS_JUDGE_MODEL` | `claude-sonnet-5` | Model the judge runs on |
+| `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every `/v1/messages` and `/v1/messages/count_tokens` body is written to this directory before eviction — other paths are never dumped. Bodies contain the full conversation — never leave it on |
 
 ## How eviction behaves
 
@@ -84,13 +89,14 @@ Code interactions".
   verbatim. Responses stream straight through (SSE included), never buffered.
 - Eviction replaces only the content of whitelisted segments: a `tool_result` block's
   `content`, a `tool_use` block's `input`, an attached-file text block's `text`, or a
-  task-notification user message's string content. Block structure, `tool_use_id`, a call's
-  `id`/`name`/`type`, `is_error`, assistant text, thinking blocks, system prompt, and tool
-  definitions are never touched — and injected text is
-  matched by exact prefix, so CLAUDE.md/skill-listing `<system-reminder>` blocks (same
-  envelope, different prefix) are never candidates. `is_error` results are evicted like any
-  other. Attached-file stubs name the original file path, recovered from the paired
-  `Called the Read tool` reminder; task-notification stubs name the task id and output file.
+  task-notification user message's string content — plus, when the judge is on, a block of the
+  user's own text that the judge named. Block structure, `tool_use_id`, a call's `id`/`name`/`type`,
+  `is_error`, assistant text, thinking blocks, system prompt, and tool definitions are never
+  touched — and injected text is matched by exact prefix, so CLAUDE.md/skill-listing
+  `<system-reminder>` blocks (same envelope, different prefix) are never candidates.
+  `is_error` results are evicted like any other. Attached-file stubs name the original file
+  path, recovered from the paired `Called the Read tool` reminder; task-notification stubs
+  name the task id and output file.
 - Eviction is **monotonic and batched** to protect prompt caching: the proxy keeps an
   in-memory set of evicted segment ids (`tool_use_id` for results, `call:<tool_use_id>` for
   calls — a distinct id, so stubbing a big call never drags its small result along — and a
@@ -113,6 +119,55 @@ Code interactions".
   chunked file sweep outruns the age gate and the client compacts anyway.
 - Malformed or non-JSON bodies are forwarded byte-for-byte untouched. A parse failure never
   fails a request.
+
+## The judge (off unless `ONEPASS_JUDGE_API_KEY` is set)
+
+The rules above evict by age and size: they cannot tell a file read the agent has moved past
+from one it is about to use. The judge can. At each trip on `/v1/messages` the proxy sends the
+conversation to a second model and asks it to name blocks that are **superseded** or belong to
+a **finished sub-task**. It is never given a size target. A trip on `count_tokens` does not run
+it — the same conversation for twice the bill.
+
+What it is sent is the conversation **as it went upstream**, existing stubs and all, not the raw
+history. The judge never sees the original of anything the rules already replaced, so it can
+only add to what is evicted, never restore.
+
+**Not yet measured.** Every number under "Verification" below was recorded before the judge
+existed, and `docs/findings.md` has no section on it. The judge has unit tests and no
+real-session evidence.
+
+- **Never in the request path.** The tripping request goes upstream as the rules left it, and
+  the agent never waits on the judge. The judge runs alongside it; its verdict is applied by adding the ids it named to
+  the same evicted-id set the rules use, so the stubs appear on the agent's *next* request —
+  trip or not. One judge runs at a time; a trip that arrives while one is running is skipped and
+  logged.
+- **What it may name**: a `tool_result`, a `tool_use` input, or a block of the user's own text.
+  Only those carry an id it can name. Assistant text is shown untagged — the judge needs it to
+  tell what work is finished — and thinking blocks are dropped from its view entirely.
+- **User text is the one case where the judge decides what stays.** It names the block and
+  fills in at least one of two fields: `keep`, a verbatim quote accepted only if it is a
+  character-for-character substring of the block, and `note`, one line in the judge's own words
+  saying what the removed material was. A pure paste with no instructions in it is the `note`-only
+  case. Both empty is a malfunction, not a decision, and the block survives untouched. The note is
+  unverifiable by construction, so the stub attributes it (`onepass's summary: …`) and caps it at
+  200 characters — the agent must never read it as something the user wrote.
+- **What it is never offered**: harness-injected user text (attached-file content, task
+  notifications, `Called the Read tool` markers) and any block already replaced by a stub carry
+  no id at all. The rules own those; a pick on one would be silently dropped or would overwrite
+  the judge's own note, so the judge never sees a handle for them.
+- **The guards it cannot override**, all evaluated against the request being rewritten now, not
+  the snapshot it read: an id the request does not contain; a block inside the protected last-K
+  window, where K is floored at 1 so the newest assistant turn is off-limits even at
+  `ONEPASS_PROTECT_LAST_TURNS=0`; a block below `ONEPASS_MIN_SEGMENT_CHARS`; a quote that is not
+  an exact substring; a user block with neither quote nor note; assistant text; and a quote or
+  note on a block that is not the user's own text. Each has its own counter in the log and the
+  report, so a systematic mismatch is diagnosable rather than lumped together.
+- **Fails open.** A timeout, a non-2xx, or an unparseable answer is retried once and then
+  recorded as an error — nothing extra is evicted, and the rule pass is unaffected.
+- **Its own credentials only.** The judge call carries `x-api-key` from `ONEPASS_JUDGE_API_KEY`
+  and nothing else; Claude Code's own `authorization` header is never copied onto it.
+- **Never logged**: the prompt and the verdict bodies. The log records counts, sizes, and
+  timings only, like every other record.
 
 ## Known Claude Code interactions (measured against 2.1.241)
 
@@ -201,7 +256,8 @@ Reads the session transcript (read-only) plus the proxy log and prints: compacti
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
 evicted:recalled ratio (the product metric — 100:1 is a real product), a speed summary
 (rebuilds by cause, median and max `proxyMs`, median first-byte on cached requests versus
-rebuilt ones), and a per-request table carrying those numbers next to the estimated tokens
+rebuilt ones), a judge summary when the log holds any judge runs (picks proposed and accepted,
+drops per counter, token spend, and runs that failed or were skipped), and a per-request table carrying those numbers next to the estimated tokens
 sent over time (flat is good). The proxy log path defaults to the newest `proxy.log.*.jsonl`
 under `~/.onepass/`.
 
@@ -214,7 +270,11 @@ forwarding of non-messages paths, byte-identical `/v1/messages` bodies when noth
 stubbed, stubbing + monotonic re-stub across requests with a single trip logged,
 `count_tokens` evicted identically, chars-per-token calibration from response usage,
 malformed bodies passed through, SSE streamed without buffering (the test deadlocks if the
-proxy buffers), and a 502 API-shaped error when the upstream is unreachable.
+proxy buffers), and a 502 API-shaped error when the upstream is unreachable. For the judge:
+the conversation rendered with every evictable block tagged and thinking dropped entirely,
+verdict parsing, each guard dropping its own entry, a trip firing the judge and
+its verdict stubbing a paste on the next request, a failing judge retried once and then
+evicting nothing, and no judge call at all when no key is configured.
 
 ### Verified against the real API (cloud container, claude 2.1.241, OAuth auth)
 
