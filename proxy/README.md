@@ -129,9 +129,53 @@ Code interactions".
 
 `~/.onepass/proxy.log.<start-time>.jsonl` — one file per proxy run, so reports never mix
 metrics from unrelated runs. One JSON object per line: per-request entries
-(path, status, sizes, estimated tokens before/after eviction) and per-trip entries (ids
-added, chars removed). **Request and response bodies are never logged** — sizes, ids, and
-URL paths only. Human-readable mirror lines go to stdout.
+(path, status, sizes, timings, estimated tokens before/after eviction) and per-trip entries
+(ids added, chars removed). **Request and response bodies are never logged** — sizes, ids,
+and URL paths only. Human-readable mirror lines go to stdout.
+
+### The speed gauge
+
+The proxy can only make a session slower in two ways: its own per-request work, and cache
+rebuilds it causes. Four numbers per request show both, in the log and on the stdout line:
+
+| field | what it measures |
+|---|---|
+| `proxyMs` | the proxy's own work — request body fully read to upstream request sent. Parse + evict + serialize. |
+| `upstreamFirstByteMs` | upstream request sent to its first response byte: the wait on Anthropic. Not the headers event — for SSE the headers arrive before `message_start`. |
+| `cacheReadInputTokens` | context Anthropic served from cache (from the response `usage`). |
+| `cacheCreationInputTokens` | context Anthropic had to process fresh (from the response `usage`). |
+
+`durationMs` is request received to upstream response ended — the whole time the client
+waited. (It used to be measured from *after* the eviction work to the response *headers*, so
+it under-reported both ends.) `inputTokens` is the uncached remainder, usually small.
+
+A **rebuild** is a request where more than 20% of the context was `cache_creation`: Anthropic
+re-read the conversation instead of serving it from cache, costing a few seconds on that one
+turn. `rebuild` is set only on those, and says why:
+
+| value | expected? |
+|---|---|
+| `first` | yes — the session's first request; nothing was cached yet |
+| `after-trip` | yes — the proxy swapped segments for stubs, so the conversation changed. One rebuild per trip, by design |
+| `after-idle` | yes — over 5 minutes since the previous request, so the cache entry expired |
+| `unexpected` | **no** — something is changing the request every turn. A bug in the proxy or the client |
+
+Stdout, one line per request — expected rebuilds are noted in lower case, the unexpected one
+shouts:
+
+```
+[onepass] 12:01:03 POST /v1/messages 200 | proxy 41ms | first-byte 1.8s | total 9.2s | cache read 141.2k / new 2.1k | est 140k -> 96k tok, 12 stubbed (0 new)
+[onepass] 12:01:31 POST /v1/messages 200 | proxy 45ms | first-byte 19.2s | total 27.0s | cache read 0 / new 143.0k | est 140k -> 96k tok, 12 stubbed (0 new)  <- REBUILD (unexpected)
+```
+
+Only `/v1/messages` requests over **20,000 estimated tokens** are classified. Claude Code
+makes several kinds of call on that path — the conversation itself, plus small side calls
+(title generation, warm-ups) that carry their own separate cache prefix. Counting those made
+the session's real first request look like an unexplained rebuild, and a rebuild that small
+costs no measurable time. `count_tokens` is timed but never classified — it carries no cache
+numbers worth reading — though a trip on one is still counted as the cause of the
+`/v1/messages` rebuild that follows it. Every request is still timed and logged; the floor
+only decides what gets a rebuild verdict.
 
 ## Report
 
@@ -143,9 +187,11 @@ npm run report -- ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-
 
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
-evicted:recalled ratio (the product metric — 100:1 is a real product), and estimated tokens
-sent per request over time (flat is good). The proxy log path defaults to the newest
-`proxy.log.*.jsonl` under `~/.onepass/`.
+evicted:recalled ratio (the product metric — 100:1 is a real product), a speed summary
+(rebuilds by cause, median and max `proxyMs`, median first-byte on cached requests versus
+rebuilt ones), and a per-request table carrying those numbers next to the estimated tokens
+sent over time (flat is good). The proxy log path defaults to the newest `proxy.log.*.jsonl`
+under `~/.onepass/`.
 
 ## Verification
 

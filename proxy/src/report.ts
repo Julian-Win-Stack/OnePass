@@ -9,8 +9,11 @@ import { createInterface } from "node:readline";
 import { basename } from "node:path";
 import { formatThousands, measureContentChars } from "./evict.js";
 import { latestProxyLogPath, proxyLogDir, type ProxyLogEntry, type RequestLogEntry, type TripLogEntry } from "./log.js";
+import { describeRebuild, formatDuration, GAUGE_MIN_ESTIMATED_TOKENS, type RebuildKind } from "./speed.js";
 
 const RECALL_TOOL_NAME = /(^|__)recall_(search|get)$/;
+const REBUILD_KINDS: RebuildKind[] = ["first", "after-trip", "after-idle", "unexpected"];
+const BAR_WIDTH = 24;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -118,6 +121,61 @@ function timeOfDay(isoTimestamp: string): string {
   return timePart === undefined ? isoTimestamp : timePart.slice(0, 8);
 }
 
+function collectDefined(requests: RequestLogEntry[], pick: (request: RequestLogEntry) => number | undefined): number[] {
+  return requests.map(pick).filter((value): value is number => value !== undefined);
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
+}
+
+function formatMedian(values: number[]): string {
+  const middle = median(values);
+  return middle === null ? "n/a" : formatDuration(middle);
+}
+
+function formatMedianAndMax(values: number[]): string {
+  const middle = median(values);
+  return middle === null ? "n/a" : `median ${formatDuration(middle)}, max ${formatDuration(Math.max(...values))}`;
+}
+
+/**
+ * A rebuild means Anthropic re-read the conversation instead of serving it from cache — a few
+ * extra seconds on that turn. It is normal on the session's first request, on the request
+ * where the proxy tripped, and after the cache expires. Anything else is a bug.
+ */
+function printSpeedSummary(requests: RequestLogEntry[]): void {
+  // Same floor the proxy applies: small side calls have their own cache prefix, so mixing them
+  // into the cached-versus-rebuilt comparison compares two different conversations.
+  const conversation = requests.filter(
+    (request) => (request.estimatedTokensSent ?? 0) >= GAUGE_MIN_ESTIMATED_TOKENS,
+  );
+  const rebuilt = conversation.filter((request) => request.rebuild !== undefined);
+  const cached = conversation.filter((request) => request.rebuild === undefined);
+  const byKind = REBUILD_KINDS.map(
+    (kind) => `${conversation.filter((request) => request.rebuild === kind).length} ${describeRebuild(kind)}`,
+  );
+
+  console.log("Speed:");
+  console.log(
+    `  proxy's own time per request: ${formatMedianAndMax(collectDefined(requests, (r) => r.proxyMs))} ` +
+      `(over all ${requests.length} requests)`,
+  );
+  console.log(
+    `  conversation requests, over ${formatThousands(GAUGE_MIN_ESTIMATED_TOKENS)} tokens ` +
+      `(smaller side calls are not gauged): ${conversation.length}`,
+  );
+  console.log(`    rebuilds: ${rebuilt.length} — ${byKind.join(", ")} (goal: 0 unexpected)`);
+  console.log(
+    `    wait for the first byte: ${formatMedian(collectDefined(cached, (r) => r.upstreamFirstByteMs))} cached, ` +
+      `${formatMedian(collectDefined(rebuilt, (r) => r.upstreamFirstByteMs))} rebuilt`,
+  );
+  console.log("");
+}
+
 function ratioLine(tokensEvicted: number, tokensRecalled: number): string {
   if (tokensEvicted === 0) return "n/a — nothing evicted";
   if (tokensRecalled === 0) return `${formatThousands(tokensEvicted)} : 0 — nothing recalled yet`;
@@ -191,16 +249,35 @@ async function main(): Promise<void> {
   console.log("");
 
   if (requests.length === 0) return;
-  console.log("Estimated tokens sent per /v1/messages request (flat is good; unproxied it climbs):");
+  printSpeedSummary(requests);
+
+  console.log("Per /v1/messages request (chart = estimated tokens sent; flat is good, unproxied it climbs):");
+  console.log(
+    `  ${"#".padStart(4)}  ${"time".padEnd(8)}  ${"sent tok".padStart(9)}  ${"proxy".padStart(7)}  ` +
+      `${"1st byte".padStart(8)}  ${"cached".padStart(9)}  ${"new".padStart(7)}  chart`,
+  );
   const maxSent = Math.max(...requests.map((request) => request.estimatedTokensSent ?? 0), 1);
+  const column = (value: number | undefined, format: (value: number) => string, width: number): string =>
+    (value === undefined ? "-" : format(value)).padStart(width);
+
   requests.forEach((request, index) => {
     const sent = request.estimatedTokensSent ?? 0;
     const before = request.estimatedTokensBefore ?? sent;
-    const bar = "#".repeat(Math.max(sent > 0 ? 1 : 0, Math.round((sent / maxSent) * 40)));
-    const tripMark = (request.newlyEvictedCount ?? 0) > 0 ? "  <- trip" : "";
+    const bar = "#".repeat(Math.max(sent > 0 ? 1 : 0, Math.round((sent / maxSent) * BAR_WIDTH)));
+    const marks: string[] = [];
+    if ((request.newlyEvictedCount ?? 0) > 0) marks.push("trip");
+    if (request.rebuild !== undefined) {
+      marks.push(
+        request.rebuild === "unexpected" ? "REBUILD (unexpected)" : `rebuild (${describeRebuild(request.rebuild)})`,
+      );
+    }
     console.log(
-      `  ${String(index + 1).padStart(4)}  ${timeOfDay(request.timestamp)}  ` +
-        `${formatThousands(sent).padStart(9)}  ${bar}${before !== sent ? `  (raw ${formatThousands(before)})` : ""}${tripMark}`,
+      `  ${String(index + 1).padStart(4)}  ${timeOfDay(request.timestamp)}  ${formatThousands(sent).padStart(9)}  ` +
+        `${column(request.proxyMs, formatDuration, 7)}  ${column(request.upstreamFirstByteMs, formatDuration, 8)}  ` +
+        `${column(request.cacheReadInputTokens, formatThousands, 9)}  ` +
+        `${column(request.cacheCreationInputTokens, formatThousands, 7)}  ` +
+        `${bar}${before !== sent ? `  (raw ${formatThousands(before)})` : ""}` +
+        `${marks.length === 0 ? "" : `  <- ${marks.join(", ")}`}`,
     );
   });
 }

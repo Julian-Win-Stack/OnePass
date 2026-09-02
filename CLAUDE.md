@@ -59,7 +59,7 @@ No root package yet. In `proxy/`:
 - `npm run build` — compile (strict tsc)
 - `npm test` — build, then unit + integration tests (recorded stub upstream, no network)
 - `npm start` — run the proxy (build first)
-- `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall report
+- `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall / speed report
 
 Deploy (local): `npm i -g .` from `proxy/` symlinks the global bins to the working
 tree, so a rebuild is the whole deploy. The proxy is not a background service — start

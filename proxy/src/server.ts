@@ -4,6 +4,15 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evictContextSegments, formatThousands, type EvictionConfig } from "./evict.js";
 import { createProxyLogWriter, type RequestLogEntry } from "./log.js";
+import {
+  classifyRebuild,
+  describeRebuild,
+  extractUsage,
+  GAUGE_MIN_ESTIMATED_TOKENS,
+  formatDuration,
+  totalContextTokens,
+  type ResponseUsage,
+} from "./speed.js";
 
 /** charsPerToken is calibrated live from API responses, not configured. */
 export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
@@ -20,36 +29,6 @@ export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
 export const FALLBACK_CHARS_PER_TOKEN = 3.2;
 const CALIBRATION_MIN_TOKENS = 1000;
 const USAGE_SCAN_LIMIT_CHARS = 262_144;
-
-/**
- * Pull the real input-token total out of an Anthropic response — the first `usage` object in
- * the body (message_start for SSE, top level for JSON). Brace-matched rather than regexed
- * whole: usage contains nested objects (`cache_creation`, `server_tool_use`).
- */
-export function extractRealInputTokens(responseText: string): number | null {
-  const keyIndex = responseText.indexOf('"usage"');
-  if (keyIndex === -1) return null;
-  const openIndex = responseText.indexOf("{", keyIndex);
-  if (openIndex === -1) return null;
-  let depth = 0;
-  let closeIndex = -1;
-  for (let i = openIndex; i < responseText.length; i++) {
-    const ch = responseText[i];
-    if (ch === "{") depth++;
-    else if (ch === "}" && --depth === 0) {
-      closeIndex = i;
-      break;
-    }
-  }
-  if (closeIndex === -1) return null;
-  const usageSlice = responseText.slice(openIndex, closeIndex + 1);
-  const field = (name: string): number => {
-    const match = new RegExp(`"${name}"\\s*:\\s*(\\d+)`).exec(usageSlice);
-    return match === null ? 0 : Number(match[1]);
-  };
-  const total = field("input_tokens") + field("cache_creation_input_tokens") + field("cache_read_input_tokens");
-  return total > 0 ? total : null;
-}
 
 const DROPPED_REQUEST_HEADERS = new Set([
   "host",
@@ -87,6 +66,33 @@ function formatTokensShort(tokens: number): string {
   return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
 }
 
+/** The line the user watches while a session runs. Same numbers the JSONL log records. */
+function formatLiveLine(entry: RequestLogEntry): string {
+  const parts = [`[onepass] ${entry.timestamp.slice(11, 19)} ${entry.method} ${entry.path} ${entry.status}`];
+  if (entry.proxyMs !== undefined) parts.push(`proxy ${formatDuration(entry.proxyMs)}`);
+  if (entry.upstreamFirstByteMs !== undefined) parts.push(`first-byte ${formatDuration(entry.upstreamFirstByteMs)}`);
+  parts.push(`total ${formatDuration(entry.durationMs)}`);
+  if (entry.cacheReadInputTokens !== undefined && entry.cacheCreationInputTokens !== undefined) {
+    parts.push(
+      `cache read ${formatTokensShort(entry.cacheReadInputTokens)} / ` +
+        `new ${formatTokensShort(entry.cacheCreationInputTokens)}`,
+    );
+  }
+  if (entry.estimatedTokensBefore !== undefined && entry.estimatedTokensSent !== undefined) {
+    parts.push(
+      `est ${formatTokensShort(entry.estimatedTokensBefore)} -> ${formatTokensShort(entry.estimatedTokensSent)} tok, ` +
+        `${entry.stubbedResultCount ?? 0} stubbed (${entry.newlyEvictedCount ?? 0} new)`,
+    );
+  }
+  const rebuildNote =
+    entry.rebuild === undefined
+      ? ""
+      : entry.rebuild === "unexpected"
+        ? "  <- REBUILD (unexpected)"
+        : `  <- rebuild (${describeRebuild(entry.rebuild)})`;
+  return parts.join(" | ") + rebuildNote;
+}
+
 export function createProxyServer(config: ProxyConfig): http.Server {
   const upstream = new URL(config.upstreamUrl);
   const upstreamIsHttps = upstream.protocol === "https:";
@@ -99,6 +105,10 @@ export function createProxyServer(config: ProxyConfig): http.Server {
   // Live chars-per-token ratio, calibrated from the API's reported usage on each response so
   // the trip threshold is denominated in real tokens rather than a fixed chars ÷ 4 guess.
   let charsPerToken = FALLBACK_CHARS_PER_TOKEN;
+  // Speed-gauge bookkeeping. Only /v1/messages requests are classified, but a trip on a
+  // count_tokens request changes the prefix for the /v1/messages request that follows it.
+  let previousMessagesRequestAt: number | null = null;
+  let trippedSinceLastMessagesRequest = false;
 
   interface EvictionRequestMeta {
     estimatedTokensBefore: number;
@@ -108,49 +118,72 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     charsPerToken: number;
   }
 
+  /** What the rebuild rule needs to know about this request's place in the session. */
+  interface RebuildContext {
+    firstMessagesRequest: boolean;
+    tripped: boolean;
+    secondsSincePrevious: number | null;
+  }
+
+  interface ForwardOptions {
+    /** The evicted body to send, or null to stream the client's bytes through untouched. */
+    bufferedBody: Buffer | null;
+    evictionMeta: EvictionRequestMeta | null;
+    /** When the request body was fully read — the start of everything the client waits for. */
+    receivedAt: number;
+    /** Scan the response for `usage`: calibrates chars-per-token and feeds the speed gauge. */
+    readUsage: boolean;
+    /** Null for anything that is not a /v1/messages request; only those are classified. */
+    rebuildContext: RebuildContext | null;
+  }
+
   function forward(
     clientRequest: http.IncomingMessage,
     clientResponse: http.ServerResponse,
-    bufferedBody: Buffer | null,
-    evictionMeta: EvictionRequestMeta | null,
-    calibrate = false,
+    options: ForwardOptions,
   ): void {
-    const startedAt = Date.now();
-    const timestamp = new Date(startedAt).toISOString();
+    const { bufferedBody, evictionMeta, receivedAt, readUsage, rebuildContext } = options;
+    const timestamp = new Date(receivedAt).toISOString();
     const method = clientRequest.method ?? "GET";
     const path = clientRequest.url ?? "/";
 
     const headers = filterHeaders(clientRequest.headers, DROPPED_REQUEST_HEADERS);
     if (bufferedBody !== null) headers["content-length"] = bufferedBody.byteLength;
     // The usage scan reads the response as plain text, so ask the upstream not to compress.
-    if (calibrate) delete headers["accept-encoding"];
+    if (readUsage) delete headers["accept-encoding"];
 
     let requestBodyBytes = bufferedBody?.byteLength ?? 0;
+    let forwardedAt: number | null = null;
+    let firstByteAt: number | null = null;
     let logged = false;
-    const logRequest = (status: number): void => {
+    const logRequest = (status: number, usage: ResponseUsage | null): void => {
       if (logged) return;
       logged = true;
+      const rebuild =
+        usage === null || rebuildContext === null
+          ? null
+          : classifyRebuild({
+              ...rebuildContext,
+              cacheCreationInputTokens: usage.cacheCreationInputTokens,
+              contextTotal: totalContextTokens(usage),
+            });
       const entry: RequestLogEntry = {
         kind: "request",
         timestamp,
         method,
         path,
         status,
-        durationMs: Date.now() - startedAt,
+        durationMs: Date.now() - receivedAt,
+        ...(forwardedAt !== null ? { proxyMs: forwardedAt - receivedAt } : {}),
+        ...(forwardedAt !== null && firstByteAt !== null ? { upstreamFirstByteMs: firstByteAt - forwardedAt } : {}),
         requestBodyBytes,
         sentBodyBytes: bufferedBody?.byteLength ?? requestBodyBytes,
+        ...(usage ?? {}),
+        ...(rebuild !== null ? { rebuild } : {}),
         ...(evictionMeta ?? {}),
       };
       logWriter.append(entry);
-      if (config.quiet !== true) {
-        const evictionNote =
-          evictionMeta === null
-            ? ""
-            : ` | est ${formatTokensShort(evictionMeta.estimatedTokensBefore)} -> ${formatTokensShort(
-                evictionMeta.estimatedTokensSent,
-              )} tok, ${evictionMeta.stubbedResultCount} stubbed (${evictionMeta.newlyEvictedCount} new)`;
-        console.log(`[onepass] ${timestamp} ${method} ${path} ${status} ${entry.durationMs}ms${evictionNote}`);
-      }
+      if (config.quiet !== true) console.log(formatLiveLine(entry));
     };
 
     const upstreamRequest = requestModule.request({
@@ -165,21 +198,26 @@ export function createProxyServer(config: ProxyConfig): http.Server {
 
     upstreamRequest.on("response", (upstreamResponse) => {
       const status = upstreamResponse.statusCode ?? 502;
-      if (calibrate && status === 200 && bufferedBody !== null) {
-        let responseHead = "";
-        upstreamResponse.on("data", (chunk: Buffer) => {
-          if (responseHead.length <= USAGE_SCAN_LIMIT_CHARS) responseHead += chunk.toString("utf8");
-        });
-        upstreamResponse.on("end", () => {
-          const realInputTokens = extractRealInputTokens(responseHead);
-          if (realInputTokens !== null && realInputTokens >= CALIBRATION_MIN_TOKENS) {
+      const scanUsage = readUsage && status === 200;
+      let responseHead = "";
+      upstreamResponse.on("data", (chunk: Buffer) => {
+        firstByteAt ??= Date.now();
+        if (scanUsage && responseHead.length <= USAGE_SCAN_LIMIT_CHARS) responseHead += chunk.toString("utf8");
+      });
+      upstreamResponse.on("end", () => {
+        const usage = scanUsage ? extractUsage(responseHead) : null;
+        if (usage !== null && bufferedBody !== null) {
+          const realInputTokens = totalContextTokens(usage);
+          if (realInputTokens >= CALIBRATION_MIN_TOKENS) {
             charsPerToken = Math.min(8, Math.max(2, bufferedBody.byteLength / realInputTokens));
           }
-        });
-      }
+        }
+        logRequest(status, usage);
+      });
+      // A client that hangs up mid-stream never fires `end`, but `close` always fires.
+      upstreamResponse.on("close", () => logRequest(status, null));
       clientResponse.writeHead(status, filterHeaders(upstreamResponse.headers, DROPPED_RESPONSE_HEADERS));
       upstreamResponse.pipe(clientResponse);
-      logRequest(status);
     });
 
     upstreamRequest.on("error", (err: Error) => {
@@ -192,7 +230,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
             error: { type: "api_error", message: `onepass proxy: upstream request failed (${err.message})` },
           }),
         );
-        logRequest(502);
+        logRequest(502, null);
       } else {
         clientResponse.destroy();
       }
@@ -204,11 +242,13 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     });
 
     if (bufferedBody !== null) {
+      forwardedAt = Date.now();
       upstreamRequest.end(bufferedBody);
     } else {
       clientRequest.on("data", (chunk: Buffer) => {
         requestBodyBytes += chunk.length;
       });
+      forwardedAt = Date.now();
       clientRequest.pipe(upstreamRequest);
     }
   }
@@ -225,11 +265,18 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       clientRequest.headers["content-encoding"] === undefined;
 
     if (!transformable) {
-      forward(clientRequest, clientResponse, null, null);
+      forward(clientRequest, clientResponse, {
+        bufferedBody: null,
+        evictionMeta: null,
+        receivedAt: Date.now(),
+        readUsage: false,
+        rebuildContext: null,
+      });
       return;
     }
 
     const rawBody = await readEntireBody(clientRequest);
+    const receivedAt = Date.now();
     if (config.dumpDir !== undefined) {
       try {
         mkdirSync(config.dumpDir, { recursive: true });
@@ -282,7 +329,27 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     } catch {
       // Unparseable body: forward the original bytes untouched. Never fail a request.
     }
-    forward(clientRequest, clientResponse, forwardBody, evictionMeta, evictionMeta !== null);
+
+    if (evictionMeta !== null && evictionMeta.newlyEvictedCount > 0) trippedSinceLastMessagesRequest = true;
+    let rebuildContext: RebuildContext | null = null;
+    if (pathname === "/v1/messages" && (evictionMeta?.estimatedTokensSent ?? 0) >= GAUGE_MIN_ESTIMATED_TOKENS) {
+      rebuildContext = {
+        firstMessagesRequest: previousMessagesRequestAt === null,
+        tripped: trippedSinceLastMessagesRequest,
+        secondsSincePrevious:
+          previousMessagesRequestAt === null ? null : (receivedAt - previousMessagesRequestAt) / 1000,
+      };
+      previousMessagesRequestAt = receivedAt;
+      trippedSinceLastMessagesRequest = false;
+    }
+
+    forward(clientRequest, clientResponse, {
+      bufferedBody: forwardBody,
+      evictionMeta,
+      receivedAt,
+      readUsage: evictionMeta !== null,
+      rebuildContext,
+    });
   }
 
   const server = http.createServer((clientRequest, clientResponse) => {

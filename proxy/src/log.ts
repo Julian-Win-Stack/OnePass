@@ -1,6 +1,7 @@
 import { createWriteStream, mkdirSync, readdirSync, type WriteStream } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import type { RebuildKind } from "./speed.js";
 
 // One JSON object per line. Never any request or response body — sizes, ids, and paths only.
 
@@ -10,9 +11,20 @@ export interface RequestLogEntry {
   method: string;
   path: string;
   status: number;
+  /** Request received to upstream response ended — the whole time the client waited. */
   durationMs: number;
+  /** The proxy's own work: body read to upstream request sent. Parse + evict + serialize. */
+  proxyMs?: number;
+  /** Upstream request sent to its first response byte. Absent when no byte ever arrived. */
+  upstreamFirstByteMs?: number;
   requestBodyBytes: number;
   sentBodyBytes: number;
+  /** From the response `usage`. Absent when the response carried none (errors, non-messages paths). */
+  inputTokens?: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  /** Set only when Anthropic re-read the conversation instead of serving it from cache. */
+  rebuild?: RebuildKind;
   estimatedTokensBefore?: number;
   estimatedTokensSent?: number;
   stubbedResultCount?: number;

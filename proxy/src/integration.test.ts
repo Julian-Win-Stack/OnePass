@@ -23,6 +23,24 @@ const recorded: RecordedRequest[] = [];
 let openSseGate: () => void = () => {};
 let sseGate: Promise<void> = Promise.resolve();
 
+const STREAMED_USAGE = { input_tokens: 7, cache_creation_input_tokens: 11, cache_read_input_tokens: 400 };
+
+/**
+ * The stub reports usage at 2 chars per token so calibration is observable, split across the
+ * three fields the speed gauge reads. Cache creation stays a small share, so a plain request
+ * is not classified as a rebuild.
+ */
+function stubUsage(requestBytes: number): Record<string, number> {
+  const total = Math.round(requestBytes / 2);
+  const cacheRead = Math.round(total * 0.8);
+  const cacheCreation = Math.round(total * 0.15);
+  return {
+    input_tokens: total - cacheRead - cacheCreation,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+  };
+}
+
 const upstream = http.createServer((request, response) => {
   const chunks: Buffer[] = [];
   request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -31,7 +49,14 @@ const upstream = http.createServer((request, response) => {
     recorded.push({ method: request.method ?? "", url: request.url ?? "", headers: request.headers, body });
     if (request.url === "/v1/messages" && body.toString("utf8").includes('"stream":true')) {
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      // Under the calibration minimum on purpose: the streaming path is here to prove usage is
+      // read out of message_start, not to move the chars-per-token ratio.
+      response.write(
+        `event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: { usage: STREAMED_USAGE },
+        })}\n\n`,
+      );
       void sseGate.then(() => {
         response.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
         response.end();
@@ -39,18 +64,9 @@ const upstream = http.createServer((request, response) => {
     } else {
       const isMessages = (request.url ?? "").split("?")[0] === "/v1/messages";
       response.writeHead(200, { "content-type": "application/json", "x-upstream": "stub" });
-      // /v1/messages responses report usage at 2 chars per token so calibration is observable.
       response.end(
         isMessages
-          ? JSON.stringify({
-              ok: true,
-              echoPath: request.url,
-              usage: {
-                input_tokens: Math.round(body.byteLength / 2),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-              },
-            })
+          ? JSON.stringify({ ok: true, echoPath: request.url, usage: stubUsage(body.byteLength) })
           : JSON.stringify({ ok: true, echoPath: request.url }),
       );
     }
@@ -120,6 +136,22 @@ function lastRecorded(): RecordedRequest {
   const entry = recorded[recorded.length - 1];
   assert.ok(entry, "the stub upstream recorded no request");
   return entry;
+}
+
+function loggedEntries(): ProxyLogEntry[] {
+  return readFileSync(logFilePath, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as ProxyLogEntry);
+}
+
+function lastLoggedRequest(path: string): RequestLogEntry {
+  const requests = loggedEntries().filter(
+    (entry): entry is RequestLogEntry => entry.kind === "request" && entry.path === path,
+  );
+  const last = requests[requests.length - 1];
+  assert.ok(last, `the proxy log has no ${path} request`);
+  return last;
 }
 
 /** An aged conversation: the big Read result has 2 assistant turns after it (N=2, K=1). */
@@ -199,15 +231,9 @@ test("stubs old large tool results and keeps them stubbed on later requests", as
   };
   assert.equal(secondSeen.messages[1]?.content[0]?.content, firstStub);
 
-  const logEntries = readFileSync(logFilePath, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as ProxyLogEntry);
-  const trips = logEntries.filter((entry) => entry.kind === "trip");
+  const trips = loggedEntries().filter((entry) => entry.kind === "trip");
   assert.equal(trips.length, 1, "the second identical request must not log a second trip");
   assert.deepEqual(trips[0]?.addedToolUseIds, ["toolu_big"]);
-  const messageRequests = logEntries.filter((entry) => entry.kind === "request" && entry.path === "/v1/messages");
-  assert.ok(messageRequests.length >= 2);
 });
 
 test("count_tokens is evicted identically so counts describe the real request", async () => {
@@ -245,14 +271,39 @@ test("calibrates chars-per-token from the API's reported usage", async () => {
     headers: { "content-type": "application/json" },
     body: second,
   });
-  const requests = readFileSync(logFilePath, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as ProxyLogEntry)
-    .filter((entry): entry is RequestLogEntry => entry.kind === "request" && entry.path === "/v1/messages");
-  const last = requests[requests.length - 1];
-  assert.ok(last?.charsPerToken !== undefined, "request log entry should record charsPerToken");
+  const last = lastLoggedRequest("/v1/messages");
+  assert.ok(last.charsPerToken !== undefined, "request log entry should record charsPerToken");
   assert.ok(Math.abs(last.charsPerToken - 2) < 0.1, `expected ~2 chars/token, got ${last.charsPerToken}`);
+});
+
+test("logs the speed gauge: proxy time, first byte, and the cache numbers from usage", async () => {
+  const body = JSON.stringify({
+    model: "claude-test",
+    max_tokens: 100,
+    messages: [{ role: "user", content: "how fast was that" }],
+  });
+  await sendRequest(proxyOrigin, "/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+
+  const entry = lastLoggedRequest("/v1/messages");
+  // The stub's three counts differ in size, so a swapped or dropped field shows up here.
+  const reported = stubUsage(lastRecorded().body.byteLength);
+  assert.equal(entry.inputTokens, reported.input_tokens);
+  assert.equal(entry.cacheCreationInputTokens, reported.cache_creation_input_tokens);
+  assert.equal(entry.cacheReadInputTokens, reported.cache_read_input_tokens);
+  assert.ok(entry.proxyMs !== undefined && entry.proxyMs >= 0, `proxyMs missing: ${String(entry.proxyMs)}`);
+  assert.ok(
+    entry.upstreamFirstByteMs !== undefined && entry.upstreamFirstByteMs >= 0,
+    `upstreamFirstByteMs missing: ${String(entry.upstreamFirstByteMs)}`,
+  );
+  assert.ok(
+    entry.durationMs >= entry.upstreamFirstByteMs,
+    "the total must span the wait for the first byte, not stop at the headers",
+  );
+  assert.equal(entry.rebuild, undefined, "a request served from cache is not a rebuild");
 });
 
 test("forwards malformed /v1/messages bodies unchanged", async () => {
@@ -266,7 +317,7 @@ test("forwards malformed /v1/messages bodies unchanged", async () => {
   assert.equal(lastRecorded().body.toString("utf8"), body);
 });
 
-test("streams SSE responses without buffering", async () => {
+test("streams SSE responses without buffering, and gauges them from message_start", async () => {
   sseGate = new Promise<void>((resolve) => {
     openSseGate = resolve;
   });
@@ -308,6 +359,17 @@ test("streams SSE responses without buffering", async () => {
   assert.ok(fullStream.includes("message_start"));
   assert.ok(fullStream.includes("message_stop"));
   assert.ok(received.length >= 2, "expected the SSE stream to arrive in more than one chunk");
+
+  const entry = lastLoggedRequest("/v1/messages");
+  assert.equal(
+    entry.cacheReadInputTokens,
+    STREAMED_USAGE.cache_read_input_tokens,
+    "usage must be read out of the streamed message_start, not only from JSON bodies",
+  );
+  // The gate held message_stop until the client had the first chunk, so the first byte was
+  // timed while the stream was still open — the total spans the rest of it.
+  assert.ok(entry.upstreamFirstByteMs !== undefined, "upstreamFirstByteMs missing on the streaming path");
+  assert.ok(entry.durationMs >= entry.upstreamFirstByteMs);
 });
 
 test("answers 502 with an API-shaped error when the upstream is unreachable", async () => {
