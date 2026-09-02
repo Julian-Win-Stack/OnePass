@@ -1,6 +1,8 @@
 // Pure transform over an Anthropic POST /v1/messages request body: replaces old, large,
-// recoverable context segments with short deterministic stubs. Three segment kinds:
+// recoverable context segments with short deterministic stubs. Four segment kinds:
 //   - tool_result blocks (recover: re-run the tool / re-read the file, or recall)
+//   - tool_use inputs — the calls themselves (recover: the edit already landed on disk and the
+//     command already ran, so read the file or re-run it, or recall)
 //   - attached file content the harness injects as "<system-reminder>\nResult of calling the
 //     Read tool:" user text (recover: read the file from disk, or recall)
 //   - "<task-notification>" user text (recover: read the task's output file, or recall)
@@ -147,6 +149,30 @@ function buildToolResultStub(info: ToolUseInfo | undefined, originalChars: numbe
   return `[onepass: evicted ${resultLabel}${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
 }
 
+function buildToolUseStub(info: ToolUseInfo | undefined, originalChars: number): string {
+  const callLabel = info?.name !== undefined ? `${info.name} input` : "tool input";
+  const target = info?.target;
+  const forPart =
+    target === undefined ? "" : info?.targetKind === "command" ? ` for \`${sanitizeForStub(target)}\`` : ` for ${target}`;
+  const query = sanitizeForStub(target ?? info?.name ?? "tool input");
+  const hint =
+    info?.targetKind === "file"
+      ? `Read the file for current content, or recall_search("${query}") for the call as it was.`
+      : info?.targetKind === "command"
+        ? `Re-run it for current output, or recall_search("${query}") for the call as it was.`
+        : `Use recall_search("${query}") for the call as it was.`;
+  return `[onepass: evicted ${callLabel}${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
+}
+
+// The API rejects a tool_use whose `input` is not an object, so the stub is an object too.
+// The path or command stays so the model can still tell which file or command the call was.
+function buildToolUseStubInput(info: ToolUseInfo | undefined, stubText: string): Record<string, unknown> {
+  if (info?.target === undefined) return { evicted: stubText };
+  return info.targetKind === "command"
+    ? { command: info.target, evicted: stubText }
+    : { file_path: info.target, evicted: stubText };
+}
+
 function buildAttachedFileStub(filePath: string | undefined, originalChars: number): string {
   if (filePath === undefined) {
     return (
@@ -175,7 +201,10 @@ function buildTaskNotificationStub(text: string, originalChars: number): string 
 }
 
 interface Segment {
-  /** tool_use_id for tool results; "sha1:<hex of the text>" for injected text segments. */
+  /**
+   * tool_use_id for tool results; "call:<tool_use_id>" for tool_use inputs (a distinct id, so
+   * stubbing a big call never drags its small result along); "sha1:<hex>" for text segments.
+   */
   id: string;
   messageIndex: number;
   /** Block position for array content; null when the segment is the message's whole string content. */
@@ -184,6 +213,13 @@ interface Segment {
   assistantTurnsAfter: number;
   alreadyStubShaped: boolean;
   stubText: string;
+  /** Replacement `input` object for tool_use segments; the other kinds stub with `stubText`. */
+  stubInput?: Record<string, unknown>;
+}
+
+/** Chars the segment costs once stubbed — the replacement input for calls, the stub string otherwise. */
+function stubbedChars(segment: Segment): number {
+  return segment.stubInput === undefined ? segment.stubText.length : measureContentChars(segment.stubInput);
 }
 
 function textSegmentId(text: string): string {
@@ -243,7 +279,31 @@ function collectSegments(messages: unknown[]): Segment[] {
   };
 
   messages.forEach((message, messageIndex) => {
-    if (!isRecord(message) || message.role !== "user") return;
+    if (!isRecord(message)) return;
+    if (message.role === "assistant") {
+      // `position` is deliberately not advanced here: it only orders user-side text segments.
+      if (!Array.isArray(message.content)) return;
+      message.content.forEach((block, blockIndex) => {
+        if (!isRecord(block) || block.type !== "tool_use" || typeof block.id !== "string") return;
+        const input = block.input;
+        if (!isRecord(input)) return;
+        const contentChars = measureContentChars(input);
+        const info = toolUseInfoById.get(block.id);
+        const stubText = buildToolUseStub(info, contentChars);
+        segments.push({
+          id: `call:${block.id}`,
+          messageIndex,
+          blockIndex,
+          contentChars,
+          assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
+          alreadyStubShaped: typeof input.evicted === "string" && input.evicted.startsWith(STUB_PREFIX),
+          stubText,
+          stubInput: buildToolUseStubInput(info, stubText),
+        });
+      });
+      return;
+    }
+    if (message.role !== "user") return;
     const content = message.content;
     if (typeof content === "string") {
       classifyText(content, messageIndex, null);
@@ -300,7 +360,7 @@ function applyStubs(messages: unknown[], targets: Segment[]): StubApplication {
 
     const wholeString = forMessage.find((target) => target.blockIndex === null);
     if (wholeString !== undefined && typeof message.content === "string") {
-      charsRemoved += Math.max(0, wholeString.contentChars - wholeString.stubText.length);
+      charsRemoved += wholeString.contentChars - stubbedChars(wholeString);
       stubbedIds.push(wholeString.id);
       return { ...message, content: wholeString.stubText };
     }
@@ -313,9 +373,11 @@ function applyStubs(messages: unknown[], targets: Segment[]): StubApplication {
     const nextContent = message.content.map((block, blockIndex) => {
       const target = targetByBlock.get(blockIndex);
       if (target === undefined || !isRecord(block)) return block;
-      charsRemoved += Math.max(0, target.contentChars - target.stubText.length);
       stubbedIds.push(target.id);
-      // tool_result blocks carry the stub in `content`; text blocks carry it in `text`.
+      charsRemoved += target.contentChars - stubbedChars(target);
+      // tool_result blocks carry the stub in `content`; tool_use blocks in a replacement `input`
+      // object; text blocks in `text`.
+      if (target.stubInput !== undefined) return { ...block, input: target.stubInput };
       return block.type === "tool_result" ? { ...block, content: target.stubText } : { ...block, text: target.stubText };
     });
     return { ...message, content: nextContent };
@@ -345,7 +407,12 @@ export function evictContextSegments(
   if (!isRecord(body) || !Array.isArray(body.messages)) return passthrough;
 
   const messages = body.messages;
-  const candidates = collectSegments(messages).filter((segment) => !segment.alreadyStubShaped);
+  // A stub no smaller than what it replaces would grow the request, and monotonic eviction
+  // would re-pay that every request after. A long path can do it: a call stub names the path
+  // three times. Dropping the segment here keeps its id out of the evicted set entirely.
+  const candidates = collectSegments(messages).filter(
+    (segment) => !segment.alreadyStubShaped && stubbedChars(segment) < segment.contentChars,
+  );
 
   // Monotonic: an id evicted on any earlier request is stubbed again on every request.
   // The protected-window guard matters for text segments only: content re-attached after a

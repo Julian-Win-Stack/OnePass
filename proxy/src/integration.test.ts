@@ -393,3 +393,63 @@ test("answers 502 with an API-shaped error when the upstream is unreachable", as
     await new Promise<void>((resolve) => deadUpstreamProxy.close(() => resolve()));
   }
 });
+
+/** The same shape one turn later: a big Edit call whose result is a short confirmation. */
+function agedCallConversation(): string {
+  return JSON.stringify({
+    model: "claude-test",
+    max_tokens: 1000,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_call",
+            name: "Edit",
+            input: { file_path: "/repo/x.ts", old_string: "a", new_string: "x".repeat(937) },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_call", content: "The file /repo/x.ts has been updated." }] },
+      { role: "assistant", content: [{ type: "text", text: "edited" }] },
+      { role: "user", content: "and then?" },
+      { role: "assistant", content: [{ type: "text", text: "then this" }] },
+      { role: "user", content: "go on" },
+    ],
+  });
+}
+
+interface ForwardedCallBody {
+  messages: { content: { input?: unknown; content?: unknown }[] }[];
+}
+
+test("stubs an old large tool_use input, leaves its small result, and keeps both that way", async () => {
+  const send = (): Promise<unknown> =>
+    sendRequest(proxyOrigin, "/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: agedCallConversation(),
+    });
+
+  await send();
+  const first = JSON.parse(lastRecorded().body.toString("utf8")) as ForwardedCallBody;
+  const firstInput = first.messages[0]?.content[0]?.input as Record<string, unknown> | undefined;
+  assert.ok(firstInput, "the forwarded call has no input object");
+  assert.equal(firstInput.file_path, "/repo/x.ts");
+  assert.ok(
+    typeof firstInput.evicted === "string" && firstInput.evicted.startsWith("[onepass: evicted Edit input for /repo/x.ts ("),
+    `unexpected call stub: ${JSON.stringify(firstInput.evicted)}`,
+  );
+  assert.ok(!lastRecorded().body.toString("utf8").includes("x".repeat(937)), "the edit text still reached upstream");
+  assert.equal(first.messages[1]?.content[0]?.content, "The file /repo/x.ts has been updated.");
+
+  await send();
+  const second = JSON.parse(lastRecorded().body.toString("utf8")) as ForwardedCallBody;
+  assert.deepEqual(second.messages[0]?.content[0]?.input, firstInput);
+
+  const callTrips = loggedEntries().filter(
+    (entry) => entry.kind === "trip" && (entry.addedToolUseIds ?? []).includes("call:toolu_call"),
+  );
+  assert.equal(callTrips.length, 1, "the call must be added exactly once");
+});

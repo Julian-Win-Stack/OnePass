@@ -303,6 +303,7 @@ test("the transform is deterministic", () => {
     requestBody([
       assistantToolUse("toolu_1", "Read", { file_path: "/tmp/big.ts" }),
       userToolResult("toolu_1", "x".repeat(5000)),
+      assistantToolUse("toolu_edit", "Edit", editInput()),
       ...filler(3),
     ]);
   const first = evictContextSegments(build(), NO_EVICTED_IDS, ALWAYS_TRIP);
@@ -461,4 +462,174 @@ test("re-reading an evicted file leaves the fresh identical copy live until it a
   );
   assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text?.toString().startsWith(STUB_PREFIX), true);
   assert.equal((blockAt(outcome.body, 7) as { text?: unknown }).text, attachment);
+});
+
+// --- tool_use inputs (the calls themselves) ---
+
+/** An Edit input whose JSON is exactly 1,000 chars, so the stub's char count is a literal. */
+function editInput(): Record<string, unknown> {
+  return { file_path: "/repo/src/x.ts", old_string: "a", new_string: "x".repeat(937) };
+}
+
+function inputAt(body: unknown, messageIndex: number, blockIndex = 0): Record<string, unknown> {
+  const block = blockAt(body, messageIndex, blockIndex) as { input?: unknown };
+  assert.ok(block.input !== null && typeof block.input === "object", "block has no object input");
+  return block.input as Record<string, unknown>;
+}
+
+test("stubs an old large tool_use input with the exact deterministic stub text", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_edit", "Edit", editInput()),
+    userToolResult("toolu_edit", "The file /repo/src/x.ts has been updated."),
+    ...filler(3),
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+
+  assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit"]);
+  assert.deepEqual(inputAt(outcome.body, 0), {
+    file_path: "/repo/src/x.ts",
+    evicted:
+      '[onepass: evicted Edit input for /repo/src/x.ts (1,000 chars). Read the file for current content, or recall_search("/repo/src/x.ts") for the call as it was.]',
+  });
+
+  // Everything the API validates the block by must survive the input swap.
+  const block = blockAt(outcome.body, 0) as { type?: unknown; id?: unknown; name?: unknown };
+  assert.deepEqual([block.type, block.id, block.name], ["tool_use", "toolu_edit", "Edit"]);
+});
+
+test("calls smaller than minSegmentChars are never stubbed", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_read", "Read", { file_path: "/a.ts" }),
+    userToolResult("toolu_read", "r".repeat(5000)),
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_read"]);
+  assert.deepEqual(inputAt(outcome.body, 0), { file_path: "/a.ts" });
+});
+
+test("a call whose stub would be bigger than the input it replaces is left alone", () => {
+  // The call stub writes the path three times — the kept `file_path`, the prose, and the
+  // recall_search query — so a modest input under a deep path stubs to 761 chars from 550.
+  const body = requestBody([
+    assistantToolUse("toolu_deep", "Edit", {
+      file_path: `/repo/${"d".repeat(190)}/x.ts`,
+      old_string: "a",
+      new_string: "x".repeat(300),
+    }),
+    ...filler(3),
+  ]);
+
+  // Pin the scenario: the input is well over minSegmentChars, so the floor is not what skips
+  // it. Without this the fixture could drift under the floor and the test would pass blind.
+  assert.ok(measureContentChars(inputAt(body, 0)) > ALWAYS_TRIP.minSegmentChars);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.equal(outcome.bodyChanged, false);
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+
+  // The re-stub pass has no size check of its own, so the guard has to sit ahead of it —
+  // otherwise one oversized stub is re-paid on every later request for the rest of the session.
+  const later = evictContextSegments(body, new Set(["call:toolu_deep"]), NEVER_TRIP);
+  assert.equal(later.bodyChanged, false);
+});
+
+test("stubbing a big call leaves its small result alone, on this request and the next", () => {
+  const confirmation = "The file /repo/src/x.ts has been updated.";
+  const build = (): Record<string, unknown> =>
+    requestBody([
+      assistantToolUse("toolu_edit", "Edit", editInput()),
+      userToolResult("toolu_edit", confirmation),
+      ...filler(3),
+    ]);
+
+  const first = evictContextSegments(build(), NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(first.newlyEvictedIds, ["call:toolu_edit"]);
+  assert.equal(blockAt(first.body, 1).content, confirmation);
+
+  // The re-stub pass has no size check, so a shared id would stub the tiny result forever.
+  const second = evictContextSegments(build(), new Set(["call:toolu_edit"]), NEVER_TRIP);
+  assert.equal(second.tripped, false);
+  assert.deepEqual(second.stubbedIds, ["call:toolu_edit"]);
+  assert.deepEqual(second.newlyEvictedIds, []);
+  assert.equal(blockAt(second.body, 1).content, confirmation);
+  assert.deepEqual(inputAt(second.body, 0), inputAt(first.body, 0));
+});
+
+test("calls inside the last K assistant turns are protected regardless of size", () => {
+  const config: EvictionConfig = { ...ALWAYS_TRIP, evictAfterAssistantTurns: 0, protectLastAssistantTurns: 2 };
+  const body = requestBody([
+    assistantToolUse("toolu_old", "Edit", editInput()),
+    ...filler(2),
+    assistantToolUse("toolu_recent", "Edit", editInput()),
+    ...filler(1),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, config);
+  assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_old"]);
+  assert.deepEqual(inputAt(outcome.body, 5), editInput());
+});
+
+test("an already-stub-shaped call input is left alone rather than re-stubbed", () => {
+  const stubbed = {
+    file_path: "/repo/src/x.ts",
+    evicted: `${STUB_PREFIX} Edit input for /repo/src/x.ts (1,000 chars). Read the file for current content.]`,
+  };
+  const body = requestBody([assistantToolUse("toolu_edit", "Edit", stubbed), ...filler(3)]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.equal(outcome.bodyChanged, false);
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+});
+
+test("a call whose input is not an object is passed through, however large", () => {
+  const body = requestBody([
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_odd", name: "Odd", input: "s".repeat(9000) }] },
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.equal(outcome.bodyChanged, false);
+  assert.equal((blockAt(outcome.body, 0) as { input?: unknown }).input, "s".repeat(9000));
+});
+
+test("a stubbed Bash call keeps its command, truncated to 80 chars", () => {
+  const longCommand = `grep -rn needle ${"z".repeat(600)}`;
+  const body = requestBody([
+    assistantToolUse("toolu_bash", "Bash", { command: longCommand, description: "search" }),
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  const input = inputAt(outcome.body, 0);
+  assert.equal(input.command, `${longCommand.slice(0, 80)}…`);
+  assert.equal(
+    input.evicted,
+    `[onepass: evicted Bash input for \`${longCommand.slice(0, 80)}…\` (653 chars). ` +
+      `Re-run it for current output, or recall_search("${longCommand.slice(0, 80)}…") for the call as it was.]`,
+  );
+  assert.ok(!JSON.stringify(outcome.body).includes(longCommand));
+});
+
+test("a call with neither path nor command gets the generic stub and a bare input", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_web", "WebFetch", { url: "https://example.com", prompt: "p".repeat(500) }),
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(inputAt(outcome.body, 0), {
+    evicted:
+      '[onepass: evicted WebFetch input (541 chars). Use recall_search("WebFetch") for the call as it was.]',
+  });
+});
+
+test("a call and its result are both charged to charsRemoved, each by its own size", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_edit", "Edit", editInput()),
+    userToolResult("toolu_edit", "R".repeat(4000)),
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit", "toolu_edit"]);
+
+  // A call is charged the JSON length of its replacement input (1,000 → 202), a result the
+  // length of its stub string (4,000 → 163). Both stubs are pinned byte-exact above.
+  assert.equal(outcome.charsRemoved, 1000 - 202 + (4000 - 163));
 });

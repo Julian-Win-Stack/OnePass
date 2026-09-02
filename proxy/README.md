@@ -3,11 +3,13 @@
 A local HTTP proxy between Claude Code and the Anthropic API. Claude Code resends the entire
 conversation on every turn; the proxy replaces old, large, recoverable context segments with
 short deterministic stubs before forwarding, so the context the model sees — and the `usage`
-numbers Claude Code bases its auto-compact decision on — stop growing. Three segment kinds,
+numbers Claude Code bases its auto-compact decision on — stop growing. Four segment kinds,
 a fixed whitelist (measured against real sessions in docs/findings.md §13 — tool results
 alone are only ~6% of a real request body):
 
 - `tool_result` blocks
+- **`tool_use` inputs** — the calls themselves. `Edit` and `Write` carry the whole text they
+  wrote; the edit already landed on disk, so the input is as recoverable as the result
 - **attached file content** Claude Code injects as `<system-reminder>` user text after a Read
   — the biggest single mass in real sessions (~20%)
 - **task notifications** (`<task-notification>` user messages carrying background-task output)
@@ -19,7 +21,15 @@ never lost: the original transcript on disk is untouched, and the recall MCP ser
 `spike/` can fetch any of it back verbatim.
 
 Stubs are pointers, never summaries. The stub names the file, command, or task and says how
-to get the content back (`Read the file …, or recall_search("…")`).
+to get the content back (`Read the file …, or recall_search("…")`). A stubbed `tool_use`
+keeps its `id`, `name` and `type`, and its `input` becomes `{ file_path | command, evicted }`
+— off the tool's own schema, but still the object the API requires, and the kept path or
+command tells the model which call it was.
+
+A stub is only applied when it is genuinely smaller than what it replaces. Size is checked on
+the finished stub, not the raw segment, so a segment that stubs to more chars than it holds is
+left alone and never enters the evicted-id set. A call under a very deep path is the case that
+needs this: the call stub names the path three times.
 
 Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
 `ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
@@ -63,7 +73,7 @@ Code interactions".
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
 | `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
-| `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing |
+| `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing. A larger segment is also skipped when its finished stub would not be smaller |
 | `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every request body is written to this directory before eviction. Bodies contain the full conversation — never leave it on |
 
 ## How eviction behaves
@@ -73,16 +83,18 @@ Code interactions".
   request that will actually be sent, not the raw conversation. Everything else is forwarded
   verbatim. Responses stream straight through (SSE included), never buffered.
 - Eviction replaces only the content of whitelisted segments: a `tool_result` block's
-  `content`, an attached-file text block's `text`, or a task-notification user message's
-  string content. Block structure, `tool_use_id`, `is_error`, assistant text, thinking
-  blocks, system prompt, and tool definitions are never touched — and injected text is
+  `content`, a `tool_use` block's `input`, an attached-file text block's `text`, or a
+  task-notification user message's string content. Block structure, `tool_use_id`, a call's
+  `id`/`name`/`type`, `is_error`, assistant text, thinking blocks, system prompt, and tool
+  definitions are never touched — and injected text is
   matched by exact prefix, so CLAUDE.md/skill-listing `<system-reminder>` blocks (same
   envelope, different prefix) are never candidates. `is_error` results are evicted like any
   other. Attached-file stubs name the original file path, recovered from the paired
   `Called the Read tool` reminder; task-notification stubs name the task id and output file.
 - Eviction is **monotonic and batched** to protect prompt caching: the proxy keeps an
-  in-memory set of evicted segment ids (`tool_use_id` for results, a sha1 content hash for
-  text — the client resends originals every request, so hashes re-match), re-stubs those on
+  in-memory set of evicted segment ids (`tool_use_id` for results, `call:<tool_use_id>` for
+  calls — a distinct id, so stubbing a big call never drags its small result along — and a
+  sha1 content hash for text, which re-matches because the client resends originals), re-stubs those on
   every request (except inside the protected last-K window: content re-attached by a fresh
   Read of an evicted file has the same hash, and stubbing the young copy would break the
   stub's own recovery path), and adds new ids only when the size threshold T trips — all

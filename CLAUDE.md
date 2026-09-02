@@ -42,8 +42,8 @@ spike/             throwaway probes, not the product. MCP recall server (src/), 
                    librarian subagent (librarian.md), and the harness that measures
                    them against each other (harness/). See spike/README.md.
 proxy/             eviction proxy: sits between Claude Code and the API, stubs old
-                   whitelisted segments (tool results, attached-file injections, task
-                   notifications) out of /v1/messages requests. Installed locally
+                   whitelisted segments (tool results, tool_use inputs, attached-file
+                   injections, task notifications) out of /v1/messages requests. Installed locally
                    (bins: onepass-proxy, onepass-report), not published to npm.
                    See proxy/README.md.
 .github/           CI (build + tests, Node 20/22/24). A tag-push publish workflow exists
