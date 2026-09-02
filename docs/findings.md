@@ -240,8 +240,10 @@ the peak request (466,219-byte body ↔ 165,200 API-reported tokens, 2.82 chars/
 | tool_use inputs                     | 20,375  | 4%    |
 | other `<system-reminder>` text (claudeMd, listings)  | 18,388 | 4%   |
 
-Plus a fixed prefix no proxy can touch: a 162,269-char tools array (~50k tokens after
-caching) and ~30k chars of system prompt.
+Plus a fixed prefix no proxy can touch: on this session's Claude Code build, a 162,269-char
+tools array (~50k tokens after caching) and ~30k chars of system prompt. **Stale as of
+2.1.258:** MCP tool schemas are now deferred behind ToolSearch and the whole fixed prefix
+measures 42,284 tokens exact — see §15.
 
 **Wire formats, measured from captured request bodies** (a `ONEPASS_DUMP_DIR` mode now
 records them): an attached file is a user text block starting `<system-reminder>\nResult
@@ -305,9 +307,75 @@ consequences: `recall_get` must return extracted text, never a raw line, or one 
 costs 4× what it should; and any chars÷4 estimate over raw transcript bytes overstates
 readable content by the same factor.
 
+## 15. The peak request, measured exactly: half of it is the model's own replies
+
+The proxied arm of the A/B run (mastra#18877, session `0865d8fc`, claude-opus-5, Claude Code
+2.1.258, 2026-09-02, 263 requests) peaked at **196,163 tokens** per API `usage` (input +
+cache read + cache creation). Transcript char counts ÷ 2.95 explained ~71k of it and left
+~125k (64%) as an unmeasured residual. This section replaces the residual.
+
+Method, cheap-first. (a) The fixed prefix is identical on every request, so a one-turn `-p`
+session in the same cwd with the same flags ("reply OK, call no tools") measures it exactly
+from `usage`; the body was dumped with `ONEPASS_DUMP_DIR` for the char breakdown. (b) Every
+assistant reply is resent on every later request, and the transcript records each reply's
+exact `output_tokens`, so the replayed-output row is a sum, not an estimate. (c) Tool-result
+tokens use a rate measured from `usage` deltas between consecutive requests that had no
+trip and nothing but tool results in between (184 such steps: 446,830 bytes → 198,403 tokens,
+**2.252 bytes/token**; 71 results under 300 bytes cost a mean 64 tokens each — the
+per-`tool_result` envelope floor). Total probe cost ≈ $0.80.
+
+| part of the 196,163-token peak                          | tokens  | how known |
+|---------------------------------------------------------|---------|-----------|
+| fixed prefix (tool schemas, system prompt, CLAUDE.md reminder, skills/agents listing) | 42,284 | exact, probe `usage` |
+| model output replayed (thinking + text + tool_use, 248 replies) | 99,141 | exact, Σ `output_tokens` |
+| — of which thinking (76 replies)                        | ~25,000 | estimate: remainder after 2.243 bytes/token calibrated on the 172 no-thinking replies |
+| — of which text + tool_use (166,194 bytes)              | ~74,000 | same calibration |
+| tool_result kept (156 results, 51,538 bytes)            | ~22,900 | bytes ÷ 2.252 |
+| eviction stubs (134, ~180 tokens each incl. ~64 envelope) | ~24,000 | estimate ±3k |
+| user prompt                                             | ~100    | — |
+| unexplained                                             | ~7,500 (3.8%) | prefix drift between run and probe; request-time `<system-reminder>` text the transcript does not record |
+
+Three corrections to the old table. The `tool_use` + `text` rows were ~42k; they are ~74k.
+Thinking is ~25k, not the 55k predicted beforehand. And the prefix is 42k, not 60k.
+
+**Replayed thinking is billed at its generated count; signatures are free.** Two-turn probe:
+a reply with thinking, then one more request. Predicted input growth ≈ 260 (that reply's
+`output_tokens` + envelope); measured +262. The 115,764 bytes of signatures in the peak body
+cannot be billed — at any plausible rate they would push the sum past the peak. Since
+Claude Code sends `thinking: {type: "adaptive", display: "omitted"}`, the request body never
+contains thinking text at all, only signatures; the transcript's empty `thinking` fields
+are not stripping, the text was never sent back.
+
+**The prefix, char by char** (121,448-byte body): tools 68,357 (15 schemas), system-role
+message 27,711 (deferred-tool names + skills/agents listing), system 13,307 (4 blocks, cache
+breakpoints on the last two), CLAUDE.md `<system-reminder>` 11,638. Three configuration facts
+fall out of it:
+
+- **MCP servers are not a lever.** With `--strict-mcp-config` and an empty config the prefix
+  is 41,703 — every connected MCP server together costs **581 tokens**. Claude Code 2.1.x
+  sends one 214-char `DeferredToolPlaceholder` schema plus a names list and loads real
+  schemas through ToolSearch on demand. "Trim MCP servers" saves nothing.
+- **`--allowedTools` does not shrink the schema list.** It is a permission list. 10 of the 15
+  schemas sent (57,902 chars) were for tools the run could not call; Artifact alone is 37,365
+  chars.
+- **`--tools "Read,Edit,Write,Glob,Grep,Bash"` cuts the prefix to 19,834 tokens** (exact,
+  −22,450 per request, no code). Side effects: Skill, Agent, ToolSearch and the skills listing
+  go with it, and without ToolSearch the MCP schemas are inlined (21 schemas, 30,610 chars,
+  already inside the 19,834).
+
+**Stubs are 12% of the peak.** 134 stubs at ~180 tokens each, ~64 of which is the
+unavoidable `tool_result` envelope. The stub text is the proxy's own and can be shortened.
+
+Cross-check on the control arm (same task, no proxy): the same method gives thinking ≈ 30k
+and tool results of 473,755 bytes dominating — consistent with §4's raw-content picture and
+with §13's claim that after eviction, tool results are a small share.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
+- §15 is the exception: its prefix and replayed-output rows are API-reported `usage`, and its
+  tool-result rows use a bytes/token rate measured from `usage` deltas. Its thinking / text
+  split and stub rows are still estimates and are labelled as such.
 - §12 is n=1 on synthetic noise content. Its 1.79× estimate ratio is content-dependent
   (digit-heavy logs tokenize badly); real code sits lower (§11 measured 25–40%).
 - §6 is a single session. Verify across more before relying on the 55% figure.
@@ -323,3 +391,8 @@ Scripts are ad-hoc. Each figure above was produced by walking the `.jsonl` files
 message content blocks; `compactMetadata` supplies §2 and the recursion test in §1.
 
 §§9-10 are reproducible: see [spike/harness/README.md](../spike/harness/README.md).
+
+§15: start the proxy with `ONEPASS_DUMP_DIR`, run `claude -p` once in the target cwd with the
+run's flags, and read `usage` from the `--output-format json` reply; the replayed-output row
+is the sum of `message.usage.output_tokens` over the transcript's assistant entries before the
+peak (dedupe by `message.id`).
