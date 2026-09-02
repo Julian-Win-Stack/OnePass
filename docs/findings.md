@@ -370,6 +370,72 @@ Cross-check on the control arm (same task, no proxy): the same method gives thin
 and tool results of 473,755 bytes dominating — consistent with §4's raw-content picture and
 with §13's claim that after eviction, tool results are a small share.
 
+## 16. Evicting the calls too: 196k -> 144k peak on the same task, quality unchanged
+
+The proxy evicted three segment kinds and stalled about 15 minutes into a real task, having
+consumed ~87% of what it was allowed to touch. `tool_use` inputs — the calls themselves —
+were the largest untapped pool: an `Edit` carries the whole text it wrote, a `Bash` call the
+whole command, and both are recoverable exactly as results are (the edit landed on disk, the
+command ran). Adding them as a fourth kind is the change measured here.
+
+**The A/B.** Same mastra task (#18877), same `opus[1m]` / `--effort xhigh` /
+`--permission-mode acceptEdits`, same `--allowedTools`, same base commit `a14c2436bc`, same
+byte-identical prompt. Run 2 is the three-kind proxy; run 3 the four-kind proxy on defaults
+(N=8, K=4, T=110,000, floor 500). Only the proxy code differs.
+
+| | Run 2 (3 kinds) | Run 3 (4 kinds) |
+|---|---|---|
+| Peak context (API `usage`) | 196,163 | **143,882** |
+| Assistant turns above 150k | 112 | **0** |
+| Median context | 114,983 | 105,101 |
+| p90 context | 182,189 | 133,520 |
+| Compactions | 0 | 0 |
+| Assistant turns | 425 | 424 |
+| Ground-truth tests | 63 / 65 | 63 / 65 |
+| Trips / segments / chars removed | 64 / 134 / 474,021 | 74 / 197 / 608,528 |
+| Unexpected rebuilds | 2 | 0 |
+| Proxy time per request | 9ms median, 65ms max | 8ms median, 28ms max |
+
+**The written-down prediction was 34k too conservative, and the reason is the finding.**
+Predicted peak ~178,200, from a static calculation over run 2's own transcript: 48 of its 290
+calls clear the 500-char floor, 77,278 chars of input stubbing to 19,804, net 57,474 chars
+(~17,961 tokens at 3.2 chars/token). Measured peak was 143,882. The gap is compounding —
+run 3 evicted 197 segments to run 2's 134, of which only **50 were the new kind**; the other
+147 were results and text, 13 more than run 2 managed. Freeing headroom lets the proxy do
+more of what it already did. A static per-segment sum is a floor on the win, not an estimate
+of it.
+
+**Smaller, not flat.** The goal is small *and* flat, and this delivers only the first half.
+Early-quarter to late-quarter median went 96,428 -> 162,483 in run 2 (1.69x) and
+82,874 -> 132,269 in run 3 (1.60x). The curve moved down, it did not lie down. Context still
+roughly doubles across a 28-minute session, and the un-evictable skeleton named in §11
+(assistant text, thinking signatures, sub-floor results) is what remains under it — §15
+measures that skeleton exactly.
+
+**No sign of quality cost, at n=1 per arm.** Both runs score 63/65 against the ground-truth
+tests from the human fix `faee052a3c`, and both fail the *same* two: the `supportsChannelState`
+capability fallback (35/36 core, also failed by the unproxied control) and the composite
+`by_owner_key` index shape (28/29 convex). Two identical scores are a tie, not evidence of
+safety; §9's variance note applies.
+
+**The stub can cost more than it saves, and the log used to hide it.** A call stub names the
+file path three times — the kept `file_path`, the prose, and the `recall_search` query — so a
+modest input under a deep path stubs to *more* chars than it replaces, and monotonic eviction
+re-pays that on every later request. The proxy now applies a stub only when the finished stub
+is smaller than what it replaces, across all four kinds, and reports the difference honestly
+rather than clamping it to zero. It costs nothing on real traffic: 0 of run 2's 48 over-floor
+calls are skipped by the guard. Break-even depends on how big the input is, and for an input
+near the floor (~540 chars) it needs a path of ~121 chars, where the longest path among run 2's
+48 over-floor calls is 97.
+
+**The API accepts an off-schema `input`.** This was the one place the design could have
+failed. A stubbed `tool_use` keeps `id`, `name` and `type` and carries
+`{ file_path | command, evicted }` — not the tool's own schema. Across a scripted probe (8
+requests) and run 3 (279 requests) there were no 4xx. In the probe the agent answered a
+question about a file whose `Write` and `Edit` calls had both been stubbed out of its
+context, reading the still-present `cat` output instead of confabulating — §8 and §12's
+disk-first behaviour again, this time with the call gone rather than the result.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -384,6 +450,10 @@ with §13's claim that after eviction, tool results are a small share.
 - A transcript records what happened, not precisely what was sent to the API on each request.
   §2 and §7 use server-reported `usage`, which is exact; §4–§6 infer from transcript content.
 - §9 is n=1 per arm. The direction is large enough to act on; the magnitudes are not settled.
+- §16 is n=1 per arm and the agent is nondeterministic: the two runs did similar but not
+  identical work (425 vs 424 assistant turns, 263 vs 279 requests). Peak context is
+  arithmetic and survives that; the wall-clock difference (26 vs 28.5 min) does not, and
+  is not quoted above.
 
 ## Reproducing
 
@@ -396,3 +466,19 @@ message content blocks; `compactMetadata` supplies §2 and the recursion test in
 run's flags, and read `usage` from the `--output-format json` reply; the replayed-output row
 is the sum of `message.usage.output_tokens` over the transcript's assistant entries before the
 peak (dedupe by `message.id`).
+
+§16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
+ad-hoc script:
+
+```
+cd proxy && npm run report -- <transcript> <proxy log>
+```
+
+| | transcript | proxy log |
+|---|---|---|
+| run 2 | `-private-tmp-onepass-eval-mastra-18877/0865d8fc-….jsonl` | `proxy.log.2026-09-02T05-44-05-988Z.jsonl` |
+| run 3 | `-private-tmp-onepass-eval-mastra-toolcall/648d49d5-….jsonl` | `proxy.log.2026-09-02T19-45-10-198Z.jsonl` |
+
+Median/p90 and the quarter-medians are not reporter output; they sum `input_tokens +
+cache_read_input_tokens + cache_creation_input_tokens` per assistant entry. Validate any such
+script by checking its max equals the reporter's peak before trusting its other percentiles.
