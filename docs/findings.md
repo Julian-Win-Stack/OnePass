@@ -171,7 +171,14 @@ now calibrates the ratio from each response's `usage` and denominates its thresh
 tokens. Two client behaviors force sibling fixes: responses arrive compressed unless
 `accept-encoding` is stripped, and `count_tokens` requests must be evicted identically or
 they describe a conversation that will never be sent. One more: pointing the client at a
-localhost base URL silently drops sonnet's 1M window to 200k.
+base URL whose host is not `api.anthropic.com` silently drops native-1M models to 200k.
+Read out of the 2.1.252 binary and confirmed live: the window is decided client-side — 1M
+if the model name ends in `[1m]`, else 1M only for a native-1M model on a first-party host,
+else 200k. `opus` through `localhost:3777` reports 200,000; `opus[1m]` reports 1,000,000;
+`opus` plus `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` reports 1,000,000. The Aug 25–26
+dogfood sessions ran plain `opus` (a `/model` pick of "Opus 5" on Aug 25 persisted it), so
+their compactions were this 200k window at work; unproxied they would have had 1M and never
+compacted. The flag now lives in the `claudep` alias.
 
 **The long run.** A 3.3MB / four-file audit sweep (68,617 lines of TypeScript lib
 definitions), default proxy config, clean environment, one session:
@@ -265,6 +272,38 @@ pressure pass — an attachment burst is always younger than N, exactly the §11
 Both recovery paths fired unprompted: a probe about the first (evicted) file was answered
 correctly via `recall_search`, and re-attaching that file showed live content, not an
 instant re-stub — the protected-window guard on hash re-matching doing its job.
+
+## 14. A single paste is unevictable and can outweigh the whole session
+
+Onepass dogfood session `c5fe03c4` (this repo, 2026-09-01): context per API call held at
+65–83k across eleven turns of file reads and jq, then jumped to **338k in one turn** and
+stayed there. The turn was a user message containing a pasted session transcript.
+
+| source                                    | chars   |
+|-------------------------------------------|---------|
+| that one pasted user message              | 482,247 |
+| every tool result in the session combined | 16,190  |
+| every other user message                  | < 2,000 each |
+
+The paste is a `user` text block. It is not a tool result, not an attached-file injection,
+not a task notification — none of the §13 whitelist matches it, so the proxy will resend
+it on every request for the life of the session. ~250k tokens, permanent. The 65k floor
+before any turn is the system prompt (CLAUDE.md files, skill listing, tool schemas) and
+is likewise untouchable.
+
+Open question, not decided: whether large user-authored text blocks belong on the
+whitelist. They are not "still-valid data that can be re-fetched" in the §6 sense — the
+user typed them — but they are recoverable from the transcript via recall like anything
+else.
+
+**The transcript format is ~4× its readable content.** The pasted session
+(`60c36691`, 483,181 bytes) contains 125,666 chars of user/assistant text and tool-result
+content — 26%. Of the rest, thinking-block `signature` fields alone are 72,471 bytes
+(15%), `toolUseResult` duplicates each tool output once more (13,321), and the remainder
+is envelope: uuids, `usage` objects, hook summaries, listing attachments. Two
+consequences: `recall_get` must return extracted text, never a raw line, or one recall
+costs 4× what it should; and any chars÷4 estimate over raw transcript bytes overstates
+readable content by the same factor.
 
 ## Caveats
 

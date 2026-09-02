@@ -13,9 +13,9 @@
 >   110,000 **real** tokens, live-calibrated from API `usage`; chars ÷ 4 under-counts by
 >   25–79%. A pressure pass, not in this brief, relaxes the age gate when a burst of large
 >   reads outruns it.
-> - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. All three
->   happened: the proxy ships as the `onepass-proxy` package, and `spike/` gained the
->   retrieval harness.
+> - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. Two of the
+>   three happened: the proxy ships as the `onepass-proxy` package, installed locally and
+>   deliberately **not** published to npm, and `spike/` gained the retrieval harness.
 
 Written for a Claude session with **zero prior context**. Everything you need is in this
 file. Read it top to bottom before writing any code.

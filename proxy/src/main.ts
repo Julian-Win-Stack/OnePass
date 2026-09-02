@@ -50,5 +50,9 @@ server.listen(port, () => {
       `min segment size ${config.minSegmentChars} chars`,
   );
   console.log(`[onepass] log: ${config.logFilePath}`);
-  console.log(`[onepass] point Claude Code at it:  ANTHROPIC_BASE_URL=http://localhost:${port} claude`);
+  // The flag keeps native-1M models at 1M: Claude Code caps them at 200k behind a non-api.anthropic.com host.
+  console.log(
+    `[onepass] point Claude Code at it:  ` +
+      `ANTHROPIC_BASE_URL=http://localhost:${port} _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`,
+  );
 });

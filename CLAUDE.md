@@ -4,15 +4,8 @@
 
 Onepass is a context-management layer for coding agents. The goal is to let a user work a single long task from start to finish in one session — no session hopping, no waiting on compaction, no degradation as the session runs long.
 
-Two halves:
-- **Runtime** — keeps what the agent sees small and useful.
-- **Eval** — measures whether a context strategy actually works, since there is currently no accepted way to compare them.
-
 ## Approach
 
-Compaction is recursive — measured at 85% of second-and-later compactions — so detail loss
-compounds. But the fix is not better summarization: the conversation is under 10% of context
-volume, and most of the rest is still-valid data that cannot be dropped safely.
 
 Two parts, built in this order:
 
@@ -40,7 +33,6 @@ see proxy/README.md).
 ## Stack
 
 - TypeScript (strict), Node
-- Both halves are TypeScript. No Python.
 
 ## Structure
 
@@ -73,8 +65,10 @@ Deploy (local): `npm i -g .` from `proxy/` symlinks the global bins to the worki
 tree, so a rebuild is the whole deploy. The proxy is not a background service — start
 `onepass-proxy` in a terminal when you want it, and restart it after a rebuild. Nothing
 routes through it by default; opt in per session with the `claudep` shell alias
-(`ANTHROPIC_BASE_URL=http://localhost:3777 claude`). Not published to npm. Proxy logs
-live at `~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
+(`ANTHROPIC_BASE_URL=http://localhost:3777 _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`).
+The flag is load-bearing: without it Claude Code caps native-1M models at 200k behind a
+non-`api.anthropic.com` host (proxy/README.md). Not published to npm. Proxy logs live at
+`~/.onepass/proxy.log.<start-time>.jsonl`, one file per run.
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

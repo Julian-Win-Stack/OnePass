@@ -45,8 +45,14 @@ Auth passes straight through: `ANTHROPIC_API_KEY` and subscription OAuth both wo
 `ANTHROPIC_BASE_URL`, whatever the docs say):
 
 ```
-ANTHROPIC_BASE_URL=http://localhost:3777 claude
+ANTHROPIC_BASE_URL=http://localhost:3777 _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude
 ```
+
+The second variable is load-bearing. Claude Code decides the context window client-side, and
+a base URL whose host is not `api.anthropic.com` makes it cap native-1M models (`opus`,
+`fable`) at 200k unless the model name ends in `[1m]`. The flag says the upstream really is
+first-party — it is, the proxy forwards to `api.anthropic.com`. Details under "Known Claude
+Code interactions".
 
 ## Configuration (env vars — this is all of it)
 
@@ -56,7 +62,7 @@ ANTHROPIC_BASE_URL=http://localhost:3777 claude
 | `ONEPASS_UPSTREAM` | `https://api.anthropic.com` | Where requests are forwarded |
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
-| `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`) |
+| `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
 | `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing |
 | `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every request body is written to this directory before eviction. Bodies contain the full conversation — never leave it on |
 
@@ -103,10 +109,14 @@ ANTHROPIC_BASE_URL=http://localhost:3777 claude
   from the last assistant message crosses `effective_window − 13,000` (or
   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE % × window` when set). Shrinking the request shrinks that
   number; nothing client-side re-measures the original conversation.
-- **A localhost base URL downgrades the 1M window.** Pointed directly at
-  `api.anthropic.com`, sonnet-class models get a 1,000,000-token window; pointed at
-  `ANTHROPIC_BASE_URL=http://localhost:…` the same session reports 200,000. Through the
-  proxy, plan for a 200k window (threshold ≈ 187k). The 110k default keeps clear of it.
+- **A non-`api.anthropic.com` base URL downgrades the 1M window** (measured on
+  2.1.250–2.1.252). The window is decided client-side: 1M if the model name ends in `[1m]`;
+  else 1M only if the model is natively 1M *and* the base URL host is exactly
+  `api.anthropic.com` or `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` is set; else 200k. So
+  `opus` through `localhost:3777` reports 200,000 while `opus[1m]` reports 1,000,000. Keep the
+  flag in the launch command so the window does not depend on which `/model` entry was last
+  picked — choosing "Opus 5" there persists plain `opus`. `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+  does not help; it is ignored for known model names.
 - **Gzipped request bodies bypass eviction.** With `CLAUDE_CODE_GZIP_REQUEST_BODIES=1` the
   client compresses `/v1/messages` bodies and the proxy forwards `content-encoding` bodies
   untouched by design. Unset it for proxied sessions (local desktop sessions don't set it).
