@@ -62,9 +62,11 @@ No root package yet. In `proxy/`:
 - `npm run report -- <session-jsonl> [proxy-log]` — compaction / eviction / recall / speed report
 
 Deploy (local): `npm i -g .` from `proxy/` symlinks the global bins to the working
-tree, so a rebuild is the whole deploy. The proxy is not a background service — start
-`onepass-proxy` in a terminal when you want it, and restart it after a rebuild. Nothing
-routes through it by default; opt in per session with the `claudep` shell alias
+tree's `dist/`, so the whole deploy is `npm test` (build + tests) then restarting the
+proxy. It runs compiled `dist/`, not `src/`, and it reads no git — uncommitted edits go
+live once built, and switching branches changes what runs. The proxy is not a background
+service — start `onepass-proxy` in a terminal when you want it, and restart it after a
+build. Nothing routes through it by default; opt in per session with the `claudep` shell alias
 (`ANTHROPIC_BASE_URL=http://localhost:3777 _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`).
 The flag is load-bearing: without it Claude Code caps native-1M models at 200k behind a
 non-`api.anthropic.com` host (proxy/README.md). Not published to npm. Proxy logs live at
@@ -107,4 +109,6 @@ proposing a context strategy; several obvious approaches are already ruled out t
 - No commit or push without explicit instruction.
 - No code changes without explicit instruction — investigate and report first.
 - Business-logic decisions get a clarifying question, never a default.
+- A change under `proxy/src/` is not live until it is deployed. Finish every such change by
+  running `npm test` in `proxy/` and restarting `onepass-proxy`.
 - Keep this file current: new module, dependency, command, or project-wide rule → edit it in the same change.
