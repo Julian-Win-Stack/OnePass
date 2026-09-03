@@ -15,6 +15,7 @@ import {
   isRuleOwnedText,
   measureContentChars,
   STUB_PREFIX,
+  stubbedCharsFor,
   textSegmentId,
 } from "./evict.js";
 
@@ -109,19 +110,26 @@ function isJudgeableUserText(role: unknown, text: string): boolean {
 }
 
 /**
- * The conversation as the judge reads it: every evictable block tagged with the very id the
- * eviction pass uses, so a verdict needs no mapping table. Thinking blocks are dropped rather
- * than tagged — they are never evictable, and offering them invites a pick we would only
- * reject. Assistant text is shown (the judge needs it to tell what is finished) but untagged.
+ * The conversation as the judge reads it: every block it may evict tagged with the very id the
+ * eviction pass uses, so a verdict needs no mapping table. `offerableIds` decides what carries
+ * one, so the menu cannot drift from the guards. Everything else is still shown — the judge
+ * needs assistant text and recent turns to tell what is finished — but untagged, and thinking
+ * is dropped outright.
  */
-export function renderConversationForJudge(messages: unknown[]): RenderedMessage[] {
+export function renderConversationForJudge(
+  messages: unknown[],
+  protectLastAssistantTurns: number,
+  minSavedChars: number,
+): RenderedMessage[] {
+  const offerable = offerableIds(messages, protectLastAssistantTurns, minSavedChars);
   const rendered: RenderedMessage[] = [];
   for (const message of messages) {
     if (!isRecord(message) || typeof message.role !== "string") continue;
     const content = message.content;
     if (typeof content === "string") {
       const block: RenderedBlock = { type: "text", text: content };
-      if (isJudgeableUserText(message.role, content)) block.onepass_id = textSegmentId(content);
+      const id = textSegmentId(content);
+      if (offerable.has(id)) block.onepass_id = id;
       rendered.push({ role: message.role, content: [block] });
       continue;
     }
@@ -132,7 +140,8 @@ export function renderConversationForJudge(messages: unknown[]): RenderedMessage
       if (block.type === "thinking" || block.type === "redacted_thinking") continue;
       if (block.type === "text" && typeof block.text === "string") {
         const out: RenderedBlock = { type: "text", text: block.text };
-        if (isJudgeableUserText(message.role, block.text)) out.onepass_id = textSegmentId(block.text);
+        const id = textSegmentId(block.text);
+        if (offerable.has(id)) out.onepass_id = id;
         blocks.push(out);
       } else if (block.type === "tool_use" && typeof block.id === "string") {
         const out: RenderedBlock = {
@@ -140,11 +149,12 @@ export function renderConversationForJudge(messages: unknown[]): RenderedMessage
           ...(typeof block.name === "string" ? { name: block.name } : {}),
           input: block.input,
         };
-        if (!isAlreadyStubbed(block)) out.onepass_id = callSegmentId(block.id);
+        const id = callSegmentId(block.id);
+        if (offerable.has(id)) out.onepass_id = id;
         blocks.push(out);
       } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
         const out: RenderedBlock = { type: "tool_result", content: block.content };
-        if (!isAlreadyStubbed(block)) out.onepass_id = block.tool_use_id;
+        if (offerable.has(block.tool_use_id)) out.onepass_id = block.tool_use_id;
         blocks.push(out);
       } else {
         blocks.push({ type: block.type });
@@ -155,13 +165,19 @@ export function renderConversationForJudge(messages: unknown[]): RenderedMessage
   return rendered;
 }
 
-export function buildJudgeRequest(messages: unknown[], model: string): Record<string, unknown> {
+export function buildJudgeRequest(
+  messages: unknown[],
+  model: string,
+  protectLastAssistantTurns: number,
+  minSavedChars: number,
+): Record<string, unknown> {
+  const conversation = renderConversationForJudge(messages, protectLastAssistantTurns, minSavedChars);
   return {
     model,
     max_tokens: JUDGE_MAX_TOKENS,
     system: JUDGE_BRIEF,
     output_config: { format: { type: "json_schema", schema: VERDICT_SCHEMA } },
-    messages: [{ role: "user", content: JSON.stringify(renderConversationForJudge(messages)) }],
+    messages: [{ role: "user", content: JSON.stringify(conversation) }],
   };
 }
 
@@ -236,6 +252,8 @@ interface IndexedBlock {
   contentChars: number;
   /** The exact text of a user_text block — what a `keep` quote must be a substring of. */
   text?: string;
+  /** Chars the stub would cost. Left 0 for user_text, whose stub size depends on the pick. */
+  stubbedChars: number;
   assistantTurnsAfter: number;
 }
 
@@ -268,6 +286,7 @@ function indexJudgeBlocks(messages: unknown[]): JudgeBlockIndex {
         kind: "user_text",
         contentChars: content.length,
         text: content,
+        stubbedChars: 0,
         assistantTurnsAfter,
       });
       return;
@@ -282,6 +301,7 @@ function indexJudgeBlocks(messages: unknown[]): JudgeBlockIndex {
             kind: "user_text",
             contentChars: block.text.length,
             text: block.text,
+            stubbedChars: 0,
             assistantTurnsAfter,
           });
         }
@@ -289,12 +309,14 @@ function indexJudgeBlocks(messages: unknown[]): JudgeBlockIndex {
         record(callSegmentId(block.id), {
           kind: "tool_use",
           contentChars: measureContentChars(block.input),
+          stubbedChars: stubbedCharsFor({ kind: "tool_use", input: block.input }),
           assistantTurnsAfter,
         });
       } else if (block.type === "tool_result" && typeof block.tool_use_id === "string" && !isAlreadyStubbed(block)) {
         record(block.tool_use_id, {
           kind: "tool_result",
           contentChars: measureContentChars(block.content),
+          stubbedChars: stubbedCharsFor({ kind: "tool_result", content: block.content }),
           assistantTurnsAfter,
         });
       }
@@ -303,13 +325,34 @@ function indexJudgeBlocks(messages: unknown[]): JudgeBlockIndex {
   return { blocksById, assistantTextIds };
 }
 
+/**
+ * The ids worth showing the judge: every indexed block that clears the guards
+ * `validateJudgePicks` applies on age and size. Anything else can only produce a rejected pick.
+ *
+ * A user_text block is indexed with `stubbedChars` 0, because its stub is only as big as the
+ * quote and note the judge chooses — unknown until it answers. Zero makes this the loosest
+ * honest test: a block that cannot clear the saving even against a free stub never will.
+ */
+function offerableIds(messages: unknown[], protectLastAssistantTurns: number, minSavedChars: number): Set<string> {
+  const { blocksById, assistantTextIds } = indexJudgeBlocks(messages);
+  const protectedTurns = Math.max(protectLastAssistantTurns, 1);
+  const offerable = new Set<string>();
+  for (const [id, block] of blocksById) {
+    if (assistantTextIds.has(id)) continue;
+    if (block.assistantTurnsAfter < protectedTurns) continue;
+    if (block.contentChars - block.stubbedChars < minSavedChars) continue;
+    offerable.add(id);
+  }
+  return offerable;
+}
+
 /** Why picks were thrown away. Each counter is a distinct diagnosis, not a severity. */
 export interface JudgeRejectionCounts {
   /** Named a block this request does not contain, or one the judge was never offered. */
   unknownId: number;
   /** Named a block inside the last K assistant turns — measured now, not when the judge read it. */
   protectedWindow: number;
-  /** The block is below the size floor, so stubbing it would save nothing. */
+  /** The stub replacing the block would not be enough smaller than it to be worth sending. */
   tooSmall: number;
   /** The `keep` quote is not a character-for-character substring of the block. */
   keepMismatch: number;
@@ -339,7 +382,7 @@ export interface AcceptedPick extends JudgePick {
 export interface ValidatedVerdict {
   accepted: AcceptedPick[];
   rejected: JudgeRejectionCounts;
-  /** Chars the accepted blocks are carrying today; each stub that replaces one costs ~150. */
+  /** Chars the accepted blocks would actually shed — each block's size less the stub replacing it. */
   charsRemovedEstimate: number;
 }
 
@@ -352,7 +395,7 @@ export function validateJudgePicks(
   picks: readonly JudgePick[],
   messages: unknown[],
   protectLastAssistantTurns: number,
-  minSegmentChars: number,
+  minSavedChars: number,
 ): ValidatedVerdict {
   const { blocksById, assistantTextIds } = indexJudgeBlocks(messages);
   const accepted: AcceptedPick[] = [];
@@ -378,10 +421,6 @@ export function validateJudgePicks(
       rejected.protectedWindow++;
       continue;
     }
-    if (block.contentChars < minSegmentChars) {
-      rejected.tooSmall++;
-      continue;
-    }
     if (block.kind === "user_text") {
       if (pick.keep === "" && pick.note === "") {
         rejected.noKeepOrNote++;
@@ -395,8 +434,19 @@ export function validateJudgePicks(
       rejected.keepOnNonUserBlock++;
       continue;
     }
+    // Measured last, because a user_text stub is only as big as the quote and note this pick
+    // leaves behind, and both have just been checked.
+    const stubbedChars =
+      block.kind === "user_text"
+        ? stubbedCharsFor({ kind: "user_text", text: block.text ?? "", decision: { keep: pick.keep, note: pick.note } })
+        : block.stubbedChars;
+    const saved = block.contentChars - stubbedChars;
+    if (saved < minSavedChars) {
+      rejected.tooSmall++;
+      continue;
+    }
     accepted.push({ ...pick, kind: block.kind });
-    charsRemovedEstimate += block.contentChars - pick.keep.length;
+    charsRemovedEstimate += saved;
   }
   return { accepted, rejected, charsRemovedEstimate };
 }
@@ -458,9 +508,21 @@ function postToMessagesApi(
  */
 export async function callJudge(
   messages: unknown[],
-  options: { upstreamUrl: string; judge: JudgeConfig; timeoutMs?: number },
+  options: {
+    upstreamUrl: string;
+    judge: JudgeConfig;
+    protectLastAssistantTurns: number;
+    minSavedChars: number;
+    timeoutMs?: number;
+  },
 ): Promise<JudgeCallResult> {
-  const body = JSON.stringify(buildJudgeRequest(messages, options.judge.model));
+  const request = buildJudgeRequest(
+    messages,
+    options.judge.model,
+    options.protectLastAssistantTurns,
+    options.minSavedChars,
+  );
+  const body = JSON.stringify(request);
   const headers = {
     "content-type": "application/json",
     "x-api-key": options.judge.apiKey,

@@ -89,7 +89,7 @@ threshold is never reached. (Verify this behavior during real-work measurement, 
 |---|---|
 | `CLAUDE.md` | project instructions and rules |
 | `docs/findings.md` | the measured findings cited above |
-| `spike/src/server.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it.** |
+| `spike/src/server.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it. Amended 2026-09-02:** its tool *descriptions* may change. The server is registered in every session via `.mcp.json`, so its description is where the legend for the proxy's stubs lives — that is what lets a stub stop repeating the recovery hint in every block. The retrieval code itself is still off-limits. |
 | `.mcp.json` | registers that server with Claude Code |
 
 The proxy is new. Put it in `proxy/` at the repo root: own `package.json` (mirror
@@ -147,6 +147,14 @@ current content, or recall_search("...") for the output as it was.]
 
 Include the file path when the originating `tool_use` input had one (`file_path`,
 `path`, `command` — truncate a command to its first 80 chars).
+
+**Amended:** the stub above is no longer what ships. Naming the target and repeating the
+recovery hint in every stub made stubs 12% of the measured peak request (findings.md §15),
+so the stub now names nothing — `[onepass: evicted 41,200 chars]` — and the recovery
+sentence lives once in the recall tool's description, where it is prompt-cached. A stubbed
+`tool_use` keeps its own path or command, since the API needs an object there anyway. The
+minimum size above is also gone: what decides is the *saving* on the finished stub
+(`ONEPASS_MIN_SAVED_CHARS`, default 50), not how much the segment holds.
 
 **Implement the transform as a pure function** `(body: unknown) => {body, evictedIds,
 charsRemoved}` with no I/O, so it is unit-testable without a server. Test it on
@@ -211,7 +219,10 @@ that reads a session transcript plus the proxy log and prints:
 - No embeddings, no semantic search. Keyword recall is proven sufficient.
 - No OAuth/subscription auth work. API key only.
 - No UI, no packaging, no npm publishing.
-- No changes to `spike/`.
+- No changes to `spike/`. **Amended 2026-09-02:** the recall server's tool descriptions may
+  change — it is registered in every session and is the half that makes eviction safe, so it is
+  not throwaway. The stub legend lives in `recall_search`'s description. Its retrieval logic,
+  and the rest of `spike/`, stay out of scope.
 - No eviction of assistant text or thinking blocks, ever. **Amended:** user text is evictable,
   but only where the judge names that exact block, and only down to what the judge leaves
   behind: a verbatim excerpt of the user's own words, a one-line note in the judge's own words,
@@ -227,3 +238,20 @@ that reads a session transcript plus the proxy log and prints:
 4. `proxy/README.md` documents: how to start it, the env vars, and the exact local
    verification steps the user runs on their machine (steps 1 and 4 checks).
 5. `CLAUDE.md` Structure/Commands sections updated for `proxy/`.
+
+## 9. Parked — do later, not now
+
+**Remove whole call-and-result pairs instead of stubbing each block.** After stubbing, an old
+tool call and its result still sit in the request as two blocks, each with its header: the
+block type, the tool name, and the 30-char `tool_use` id. At trip 60 of the control transcript
+that is 444 tool blocks, and the headers alone are roughly a tenth of the request body. No stub
+design touches them. The idea is to delete both blocks of an old pair and leave one short text
+line in the assistant turn naming the tool and its target (`evicted: Edit on file X`); one line
+can stand in for every old pair in that turn.
+
+It waits because it changes the shape of the conversation, not just the text inside a block:
+the API requires a call and its result to go together, an assistant turn made only of calls
+would become empty and need a replacement block, and the determinism and prompt-cache
+guarantees would need re-proving. Do the stub-cost work first — name the target once, one
+recovery hint, a minimum-savings rule instead of the fixed floor — then measure, and reach for
+this only if the request is still over target.

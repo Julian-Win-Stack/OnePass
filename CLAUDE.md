@@ -38,9 +38,13 @@ see proxy/README.md).
 
 ```
 docs/findings.md   baseline measurements — the evidence base
-spike/             throwaway probes, not the product. MCP recall server (src/), the
-                   librarian subagent (librarian.md), and the harness that measures
-                   them against each other (harness/). See spike/README.md.
+docs/agents/       per-repo config the mattpocock engineering skills read
+                   (issue tracker, triage labels, domain-doc layout)
+spike/             src/ is the recall MCP server — live, not throwaway: .mcp.json registers it
+                   in every session, and it is the half that makes eviction safe. Its
+                   recall_search description carries the legend for the proxy's stubs.
+                   The throwaway parts are the librarian subagent (librarian.md) and the
+                   harness that raced them (harness/). See spike/README.md.
 proxy/             eviction proxy: sits between Claude Code and the API, stubs old
                    whitelisted segments (tool results, tool_use inputs, attached-file
                    injections, task notifications) out of /v1/messages requests. Installed locally
@@ -129,3 +133,17 @@ proposing a context strategy; several obvious approaches are already ruled out t
 - A change under `proxy/src/` is not live until it is deployed. Finish every such change by
   running `npm test` in `proxy/` and restarting `onepass-proxy`.
 - Keep this file current: new module, dependency, command, or project-wide rule → edit it in the same change.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on Julian-Win-Stack/OnePass, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default labels, unchanged: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root plus `docs/adr/`. Neither exists yet; skills create them lazily. See `docs/agents/domain.md`.

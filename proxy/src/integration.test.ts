@@ -105,7 +105,7 @@ before(async () => {
     upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
     evictAfterAssistantTurns: 2,
     protectLastAssistantTurns: 1,
-    minSegmentChars: 100,
+    minSavedChars: 50,
     tripThresholdTokens: 0,
     logFilePath,
     quiet: true,
@@ -230,10 +230,7 @@ test("stubs old large tool results and keeps them stubbed on later requests", as
   };
   const firstStub = firstSeen.messages[1]?.content[0]?.content;
   assert.ok(typeof firstStub === "string");
-  assert.ok(
-    firstStub.startsWith("[onepass: evicted Read result for /big.ts (5,000 chars)."),
-    `unexpected stub: ${firstStub}`,
-  );
+  assert.equal(firstStub, "[onepass: evicted 5,000 chars]");
 
   // Claude Code resends the original conversation every turn; the proxy must re-stub it.
   await sendRequest(proxyOrigin, "/v1/messages", {
@@ -262,10 +259,7 @@ test("count_tokens is evicted identically so counts describe the real request", 
     messages: { content: { content?: unknown }[] }[];
   };
   const stub = seen.messages[1]?.content[0]?.content;
-  assert.ok(
-    typeof stub === "string" && stub.startsWith("[onepass: evicted Read result for /big.ts"),
-    `count_tokens body was not evicted: ${String(stub).slice(0, 80)}`,
-  );
+  assert.equal(stub, "[onepass: evicted 5,000 chars]", `count_tokens body was not evicted: ${String(stub).slice(0, 80)}`);
 });
 
 test("calibrates chars-per-token from the API's reported usage", async () => {
@@ -392,7 +386,7 @@ test("answers 502 with an API-shaped error when the upstream is unreachable", as
     upstreamUrl: "http://127.0.0.1:9",
     evictAfterAssistantTurns: 2,
     protectLastAssistantTurns: 1,
-    minSegmentChars: 100,
+    minSavedChars: 50,
     tripThresholdTokens: 0,
     logFilePath: join(mkdtempSync(join(tmpdir(), "onepass-proxy-test-")), "proxy.log.jsonl"),
     quiet: true,
@@ -452,10 +446,7 @@ test("stubs an old large tool_use input, leaves its small result, and keeps both
   const firstInput = first.messages[0]?.content[0]?.input as Record<string, unknown> | undefined;
   assert.ok(firstInput, "the forwarded call has no input object");
   assert.equal(firstInput.file_path, "/repo/x.ts");
-  assert.ok(
-    typeof firstInput.evicted === "string" && firstInput.evicted.startsWith("[onepass: evicted Edit input for /repo/x.ts ("),
-    `unexpected call stub: ${JSON.stringify(firstInput.evicted)}`,
-  );
+  assert.equal(firstInput.evicted, "[onepass: evicted 996 chars]", `unexpected call stub: ${JSON.stringify(firstInput.evicted)}`);
   assert.ok(!lastRecorded().body.toString("utf8").includes("x".repeat(937)), "the edit text still reached upstream");
   assert.equal(first.messages[1]?.content[0]?.content, "The file /repo/x.ts has been updated.");
 
@@ -511,7 +502,7 @@ async function startJudgeProxy(judge: { apiKey: string; model: string } | undefi
     upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
     evictAfterAssistantTurns: 2,
     protectLastAssistantTurns: 1,
-    minSegmentChars: 100,
+    minSavedChars: 50,
     tripThresholdTokens: 0,
     logFilePath: logPath,
     quiet: true,
@@ -588,8 +579,8 @@ test("a trip runs the judge, and its verdict stubs the user's paste on the next 
     });
     assert.equal(record?.inputTokens, 4321);
     assert.equal(record?.outputTokens, 77);
-    // 3,000 chars of paste less the 21-char quote that stays behind.
-    assert.equal(record?.charsRemovedEstimate, 2979);
+    // 3,000 chars of paste less the whole 187-char stub asserted below — quote, note and all.
+    assert.equal(record?.charsRemovedEstimate, 2813);
 
     // Anthropic's terms forbid routing anything but Claude Code against a subscription login,
     // so what the judge call does *not* carry matters as much as what it does.

@@ -23,16 +23,25 @@ judge's own words (attributed as such in the stub), or both. Assistant text and 
 exception at all. Evicted content is never lost: the original transcript on disk is untouched,
 and the recall MCP server in `spike/` can fetch any of it back verbatim.
 
-Stubs are pointers, never summaries. The stub names the file, command, or task and says how
-to get the content back (`Read the file …, or recall_search("…")`). A stubbed `tool_use`
-keeps its `id`, `name` and `type`, and its `input` becomes `{ file_path | command, evicted }`
-— off the tool's own schema, but still the object the API requires, and the kept path or
-command tells the model which call it was.
+Stubs are pointers, never summaries — and they name the target once, not three times. A tool
+block stubs to `[onepass: evicted 1,481 chars]` and nothing else: what the block was is
+already beside it in the request. A stubbed `tool_use` keeps its `id`, `name` and `type`, and
+its `input` becomes `{ file_path | command, evicted }` — off the tool's own schema, but still
+the object the API requires, and that kept path or command tells the model which call it was,
+and stands for the result underneath it too. An attached file stubs to `[onepass: evicted
+attached file, N chars]`, its path left in the `Called the Read tool` reminder next to it,
+which is never evicted. Only a task notification still names its target (`[onepass: evicted
+task notification abc123, N chars; output at /tmp/out/task.log]`), because nothing else in
+the request carries the task id or its output path. How to get any of it back is one
+paragraph in the recall tool's own description, where it is prompt-cached and costs nothing
+per turn — so it is not repeated in every stub. Naming the target in every stub is what made
+stubs 12% of the measured peak request (docs/findings.md §15). A result now stubs to about 30
+chars whatever it held; a call costs that plus the path or command it keeps.
 
-A stub is only applied when it is genuinely smaller than what it replaces. Size is checked on
-the finished stub, not the raw segment, so a segment that stubs to more chars than it holds is
-left alone and never enters the evicted-id set. A call under a very deep path is the case that
-needs this: the call stub names the path three times.
+A stub is only applied when it saves at least `ONEPASS_MIN_SAVED_CHARS`. The saving is
+measured on the finished stub, not the raw segment, so a segment that stubs to no less than
+it holds is left alone and never enters the evicted-id set. A `Read` call is the case that
+needs this: its input is nothing but the path the stub would keep anyway.
 
 Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
 `ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
@@ -76,7 +85,7 @@ Code interactions".
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
 | `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
-| `ONEPASS_MIN_SEGMENT_CHARS` | `500` | Segments smaller than this are never stubbed — stubbing them saves nothing. A larger segment is also skipped when its finished stub would not be smaller |
+| `ONEPASS_MIN_SAVED_CHARS` | `50` | A segment is stubbed only when its finished stub is at least this many chars smaller than the content. The stub's own cost decides, so no fixed size floor is needed |
 | `ONEPASS_JUDGE_API_KEY` | unset | Your own Anthropic API key. Unset means **no judge**: the proxy evicts by the rules alone, exactly as it did before. Never set `ANTHROPIC_API_KEY` for this — a `claudep` launched from the same shell would then bill Claude Code to the key instead of your subscription. Judge calls are billed to this key |
 | `ONEPASS_JUDGE_MODEL` | `claude-sonnet-5` | Model the judge runs on |
 | `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every `/v1/messages` and `/v1/messages/count_tokens` body is written to this directory before eviction — other paths are never dumped. Bodies contain the full conversation — never leave it on |
@@ -94,9 +103,9 @@ Code interactions".
   `is_error`, assistant text, thinking blocks, system prompt, and tool definitions are never
   touched — and injected text is matched by exact prefix, so CLAUDE.md/skill-listing
   `<system-reminder>` blocks (same envelope, different prefix) are never candidates.
-  `is_error` results are evicted like any other. Attached-file stubs name the original file
-  path, recovered from the paired `Called the Read tool` reminder; task-notification stubs
-  name the task id and output file.
+  `is_error` results are evicted like any other. An attached-file stub names no path — the
+  `Called the Read tool` reminder beside it does, and that reminder is never a candidate;
+  task-notification stubs name the task id and output file, which nothing else carries.
 - Eviction is **monotonic and batched** to protect prompt caching: the proxy keeps an
   in-memory set of evicted segment ids (`tool_use_id` for results, `call:<tool_use_id>` for
   calls — a distinct id, so stubbing a big call never drags its small result along — and a
@@ -132,9 +141,10 @@ What it is sent is the conversation **as it went upstream**, existing stubs and 
 history. The judge never sees the original of anything the rules already replaced, so it can
 only add to what is evicted, never restore.
 
-**Not yet measured.** Every number under "Verification" below was recorded before the judge
-existed, and `docs/findings.md` has no section on it. The judge has unit tests and no
-real-session evidence.
+**Not yet measured, and bounded.** Every number under "Verification" below was recorded before
+the judge existed, and `docs/findings.md` has no section on it: the judge has unit tests and no
+real-session evidence. Its headroom is bounded by the rules, too — it is only ever offered what
+the rules declined, which on the control transcript is 0–3 admissible blocks per trip.
 
 - **Never in the request path.** The tripping request goes upstream as the rules left it, and
   the agent never waits on the judge. The judge runs alongside it; its verdict is applied by adding the ids it named to
@@ -158,7 +168,7 @@ real-session evidence.
 - **The guards it cannot override**, all evaluated against the request being rewritten now, not
   the snapshot it read: an id the request does not contain; a block inside the protected last-K
   window, where K is floored at 1 so the newest assistant turn is off-limits even at
-  `ONEPASS_PROTECT_LAST_TURNS=0`; a block below `ONEPASS_MIN_SEGMENT_CHARS`; a quote that is not
+  `ONEPASS_PROTECT_LAST_TURNS=0`; a block below `ONEPASS_MIN_SAVED_CHARS`; a quote that is not
   an exact substring; a user block with neither quote nor note; assistant text; and a quote or
   note on a block that is not the user's own text. Each has its own counter in the log and the
   report, so a systematic mismatch is diagnosable rather than lumped together.

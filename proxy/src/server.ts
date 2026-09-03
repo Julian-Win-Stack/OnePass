@@ -185,7 +185,12 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     const startedAt = Date.now();
     let entry: JudgeLogEntry;
     try {
-      const result = await callJudge(messagesAtTrip, { upstreamUrl: config.upstreamUrl, judge });
+      const result = await callJudge(messagesAtTrip, {
+        upstreamUrl: config.upstreamUrl,
+        judge,
+        protectLastAssistantTurns: config.protectLastAssistantTurns,
+        minSavedChars: config.minSavedChars,
+      });
       entry = { ...newJudgeLogEntry(judge.model, Date.now() - startedAt), ...result.usage };
       if (result.picks === null) {
         entry.error = result.error ?? "judge call failed";
@@ -194,7 +199,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
           result.picks,
           lastSentMessages,
           config.protectLastAssistantTurns,
-          config.minSegmentChars,
+          config.minSavedChars,
         );
         for (const pick of verdict.accepted) {
           evictedSegmentIds.add(pick.id);
@@ -379,7 +384,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       const outcome = evictContextSegments(parsedBody, evictedSegmentIds, {
         evictAfterAssistantTurns: config.evictAfterAssistantTurns,
         protectLastAssistantTurns: config.protectLastAssistantTurns,
-        minSegmentChars: config.minSegmentChars,
+        minSavedChars: config.minSavedChars,
         tripThresholdTokens: config.tripThresholdTokens,
         charsPerToken: requestCharsPerToken,
       }, judgeDecisionById);

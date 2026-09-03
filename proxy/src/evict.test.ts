@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   evictContextSegments,
   measureContentChars,
@@ -12,7 +13,7 @@ import {
 const ALWAYS_TRIP: EvictionConfig = {
   evictAfterAssistantTurns: 3,
   protectLastAssistantTurns: 2,
-  minSegmentChars: 100,
+  minSavedChars: 50,
   tripThresholdTokens: 0,
   charsPerToken: 4,
 };
@@ -71,12 +72,8 @@ test("stubs an old large tool result with the exact deterministic stub text", ()
   assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
   assert.deepEqual(outcome.stubbedIds, ["toolu_1"]);
 
-  const stub = blockAt(outcome.body, 2).content;
-  assert.equal(
-    stub,
-    '[onepass: evicted Read result for /tmp/big.ts (5,000 chars). Re-read the file for current content, or recall_search("/tmp/big.ts") for the output as it was.]',
-  );
-  assert.equal(outcome.charsRemoved, 5000 - (stub as string).length);
+  assert.equal(blockAt(outcome.body, 2).content, "[onepass: evicted 5,000 chars]");
+  assert.equal(outcome.charsRemoved, 5000 - 30);
   assert.equal(outcome.newlyEvictedCharsRemoved, outcome.charsRemoved);
   assert.ok(outcome.estimatedTokensSent < outcome.estimatedTokensBefore);
 
@@ -117,14 +114,62 @@ test("results inside the last K assistant turns are protected regardless of size
   assert.equal(recent.content, "y".repeat(50_000));
 });
 
-test("results smaller than minSegmentChars are never stubbed", () => {
+test("what the stub saves decides, not what the block holds", () => {
+  // Both stub to 27 chars, so the 70-char result saves 43 — under the 50-char minimum — while
+  // the 80-char one saves 53 and is taken.
   const body = requestBody([
-    assistantToolUse("toolu_1", "Read", { file_path: "/small.ts" }),
-    userToolResult("toolu_1", "tiny"),
+    assistantToolUse("toolu_small", "Read", { file_path: "/small.ts" }),
+    userToolResult("toolu_small", "y".repeat(70)),
+    assistantToolUse("toolu_big", "Read", { file_path: "/big.ts" }),
+    userToolResult("toolu_big", "z".repeat(80)),
     ...filler(5),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_big"]);
+  assert.equal(blockAt(outcome.body, 1).content, "y".repeat(70));
+  assert.equal(blockAt(outcome.body, 3).content, "[onepass: evicted 80 chars]");
+});
+
+// The point of the whole change. At trip 60 of the control transcript almost every live tool
+// block was around this size, and the old 500-char floor refused them all because a stub that
+// named its target cost more than the block held.
+test("a small Bash result — the size the old floor refused — stubs to 28 chars", () => {
+  const gitStatus =
+    " M proxy/src/evict.ts\n M proxy/src/evict.test.ts\n M proxy/src/judge.ts\n M proxy/src/main.ts\n" +
+    " M proxy/src/server.ts\n M proxy/README.md\n M CLAUDE.md\n?? docs/agents/\n";
+  const body = requestBody([
+    assistantToolUse("toolu_status", "Bash", { command: "git status --short" }),
+    userToolResult("toolu_status", gitStatus),
+    ...filler(3),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_status"]);
+  assert.equal(blockAt(outcome.body, 1).content, "[onepass: evicted 163 chars]");
+});
+
+// The attached-file stub names no path, so this marker beside the attachment is the only thing
+// left pointing at the file. Neither its size nor a judge naming it may take it away.
+test("the marker naming an attachment's path survives even a judge pick", () => {
+  const marker = `<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/x.ts"}${"\n".repeat(9000)}`;
+  const body = requestBody([{ role: "user", content: [{ type: "text", text: marker }] }, ...filler(9)]);
+  const judged = new Map([[textSegmentId(marker), { keep: "", note: "a read marker" }]]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP, judged);
+
   assert.equal(outcome.bodyChanged, false);
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+});
+
+// The recall tool's description is where the agent is told what a stub is and how to get the
+// content back, and it quotes the format. Nothing else ties the two files together, so a
+// reworded stub would leave that legend describing a string the proxy no longer sends.
+test("the recall tool's description quotes the prefix the stubs actually carry", () => {
+  const recallServer = readFileSync(new URL("../../spike/src/server.ts", import.meta.url), "utf8");
+
+  assert.ok(
+    recallServer.includes(`\`${STUB_PREFIX} N chars]\``),
+    `spike/src/server.ts no longer quotes "${STUB_PREFIX} N chars]"`,
+  );
 });
 
 test("block-array tool_result content is measured and stubbed", () => {
@@ -135,10 +180,8 @@ test("block-array tool_result content is measured and stubbed", () => {
     ...filler(3),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const stub = blockAt(outcome.body, 1).content;
-  assert.equal(typeof stub, "string");
-  assert.ok((stub as string).startsWith("[onepass: evicted Read result for /blocks.ts"));
-  assert.ok((stub as string).includes(`(${measureContentChars(originalContent)} chars)`));
+  // 327 = the JSON length of the block array, not the 300 chars of text inside it.
+  assert.equal(blockAt(outcome.body, 1).content, "[onepass: evicted 327 chars]");
 });
 
 test("is_error results are evicted like any other and keep the flag", () => {
@@ -151,7 +194,7 @@ test("is_error results are evicted like any other and keep the flag", () => {
   const block = blockAt(outcome.body, 1);
   assert.equal(block.is_error, true);
   assert.equal(block.tool_use_id, "toolu_1");
-  assert.ok(typeof block.content === "string" && block.content.startsWith("[onepass: evicted Bash result for `npm test`"));
+  assert.equal(block.content, "[onepass: evicted 4,000 chars]");
 });
 
 test("malformed bodies pass through untouched and never throw", () => {
@@ -236,32 +279,6 @@ test("the trip threshold is measured after re-applying existing stubs", () => {
   assert.equal(blockAt(outcome.body, 3).content, "n".repeat(5000));
 });
 
-test("command targets are truncated to 80 chars in the stub", () => {
-  const longCommand = `npm run ${"x".repeat(120)}`;
-  const body = requestBody([
-    assistantToolUse("toolu_1", "Bash", { command: longCommand }),
-    userToolResult("toolu_1", "out".repeat(2000)),
-    ...filler(3),
-  ]);
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const stub = blockAt(outcome.body, 1).content as string;
-  assert.ok(stub.includes(`\`${longCommand.slice(0, 80)}…\``));
-  assert.ok(!stub.includes(longCommand));
-});
-
-test("a tool_use input with no path or command gets the generic stub", () => {
-  const body = requestBody([
-    assistantToolUse("toolu_1", "WebFetch", { url: "https://example.com" }),
-    userToolResult("toolu_1", "w".repeat(3000)),
-    ...filler(3),
-  ]);
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.equal(
-    blockAt(outcome.body, 1).content,
-    '[onepass: evicted WebFetch result (3,000 chars). Use recall_search("WebFetch") for the output as it was.]',
-  );
-});
-
 test("pressure: a burst younger than N but older than K is evicted when still over T", () => {
   const config: EvictionConfig = { ...ALWAYS_TRIP, evictAfterAssistantTurns: 8, protectLastAssistantTurns: 2 };
   const body = requestBody([
@@ -272,8 +289,7 @@ test("pressure: a burst younger than N but older than K is evicted when still ov
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, config);
   assert.equal(outcome.pressure, true);
   assert.deepEqual(outcome.newlyEvictedIds, ["toolu_burst"]);
-  const stub = blockAt(outcome.body, 1).content;
-  assert.ok(typeof stub === "string" && stub.startsWith("[onepass: evicted Read result for /burst.ts"));
+  assert.equal(blockAt(outcome.body, 1).content, "[onepass: evicted 50,000 chars]");
 });
 
 test("pressure never touches the last K turns", () => {
@@ -328,7 +344,7 @@ function userTextBlocks(...texts: string[]): unknown {
   return { role: "user", content: texts.map((text) => ({ type: "text", text })) };
 }
 
-test("evicts old attached file content and names the paired file path in the stub", () => {
+test("evicts old attached file content and leaves the Read-input marker naming its path", () => {
   const attachment = ATTACHED_FILE_TEXT("1\tconst x = 1;\n".repeat(400));
   const body = requestBody([
     { role: "user", content: READ_INPUT_TEXT("/repo/src/big.ts") },
@@ -339,49 +355,27 @@ test("evicts old attached file content and names the paired file path in the stu
 
   assert.equal(outcome.newlyEvictedIds.length, 1);
   assert.ok(outcome.newlyEvictedIds[0]?.startsWith("sha1:"));
-  const stub = (blockAt(outcome.body, 1) as { text?: unknown }).text;
   assert.equal(
-    stub,
-    `[onepass: evicted attached file /repo/src/big.ts (${attachment.length.toLocaleString("en-US")} chars). ` +
-      `Read the file for current content, or recall_search("/repo/src/big.ts") for the content as it was.]`,
+    (blockAt(outcome.body, 1) as { text?: unknown }).text,
+    `[onepass: evicted attached file, ${attachment.length.toLocaleString("en-US")} chars]`,
   );
-  // The small input-mention message and the user's own text block survive untouched.
+  // The stub names no path, so the marker that does must survive — as must the user's own text.
   const messages = (outcome.body as { messages: { content: unknown }[] }).messages;
   assert.equal(messages[0]?.content, READ_INPUT_TEXT("/repo/src/big.ts"));
   assert.equal((blockAt(outcome.body, 1, 1) as { text?: unknown }).text, "do the thing");
 });
 
-test("attached file content with no pairable input mention gets the pathless stub", () => {
-  const attachment = ATTACHED_FILE_TEXT("x".repeat(4000));
-  const body = requestBody([userTextBlocks(attachment), ...filler(3)]);
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const stub = (blockAt(outcome.body, 0) as { text?: unknown }).text;
-  assert.ok(typeof stub === "string" && stub.startsWith("[onepass: evicted attached file content ("));
-});
-
-test("each input mention is claimed once, nearest attachment first", () => {
-  const attachmentA = ATTACHED_FILE_TEXT("a".repeat(3000));
-  const attachmentB = ATTACHED_FILE_TEXT("b".repeat(3000));
-  const body = requestBody([
-    { role: "user", content: READ_INPUT_TEXT("/a.ts") },
-    userTextBlocks(attachmentA),
-    { role: "user", content: READ_INPUT_TEXT("/b.ts") },
-    userTextBlocks(attachmentB),
-    ...filler(3),
-  ]);
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.ok(String((blockAt(outcome.body, 1) as { text?: unknown }).text).includes("/a.ts"));
-  assert.ok(String((blockAt(outcome.body, 3) as { text?: unknown }).text).includes("/b.ts"));
-});
-
 test("an attachment whose file content mentions the Read-input phrase is still evicted", () => {
+  // Only the start of the text decides the kind, so a file quoting the marker is not mistaken
+  // for one.
   const trickyFileContent = `Called the Read tool with the following input: {"file_path":"/decoy.ts"} ${"x".repeat(3000)}`;
   const attachment = ATTACHED_FILE_TEXT(trickyFileContent);
   const body = requestBody([userTextBlocks(attachment), ...filler(3)]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const stub = (blockAt(outcome.body, 0) as { text?: unknown }).text;
-  assert.ok(typeof stub === "string" && stub.startsWith(STUB_PREFIX), `not evicted: ${String(stub).slice(0, 60)}`);
-  assert.ok(!String(stub).includes("/decoy.ts"));
+  assert.equal(
+    (blockAt(outcome.body, 0) as { text?: unknown }).text,
+    `[onepass: evicted attached file, ${attachment.length.toLocaleString("en-US")} chars]`,
+  );
 });
 
 test("evicts an old task notification and points at its task id and output file", () => {
@@ -392,20 +386,21 @@ test("evicts an old task notification and points at its task id and output file"
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
 
   const messages = (outcome.body as { messages: { content: unknown }[] }).messages;
-  const stub = messages[0]?.content;
   assert.equal(
-    stub,
-    `[onepass: evicted task notification for task abc123 (${notification.length.toLocaleString("en-US")} chars). ` +
-      `Read the full output on disk at /tmp/out/task.log, or recall_search("abc123") for it as it was.]`,
+    messages[0]?.content,
+    `[onepass: evicted task notification abc123, ${notification.length.toLocaleString("en-US")} chars; ` +
+      `output at /tmp/out/task.log]`,
   );
 });
 
-test("a task notification without id or output file still gets a recall hint", () => {
+test("a task notification without id or output file keeps neither in its stub", () => {
   const notification = `<task-notification>\n${"noise ".repeat(600)}</task-notification>`;
   const body = requestBody([{ role: "user", content: notification }, ...filler(3)]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const stub = (outcome.body as { messages: { content: unknown }[] }).messages[0]?.content;
-  assert.ok(typeof stub === "string" && stub.includes('recall_search("task-notification")'));
+  assert.equal(
+    (outcome.body as { messages: { content: unknown }[] }).messages[0]?.content,
+    `[onepass: evicted task notification, ${notification.length.toLocaleString("en-US")} chars]`,
+  );
 });
 
 test("non-whitelisted system-reminder text is never evicted, however old or large", () => {
@@ -495,8 +490,7 @@ test("stubs an old large tool_use input with the exact deterministic stub text",
   assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit"]);
   assert.deepEqual(inputAt(outcome.body, 0), {
     file_path: "/repo/src/x.ts",
-    evicted:
-      '[onepass: evicted Edit input for /repo/src/x.ts (1,000 chars). Read the file for current content, or recall_search("/repo/src/x.ts") for the call as it was.]',
+    evicted: "[onepass: evicted 1,000 chars]",
   });
 
   // Everything the API validates the block by must survive the input swap.
@@ -504,41 +498,25 @@ test("stubs an old large tool_use input with the exact deterministic stub text",
   assert.deepEqual([block.type, block.id, block.name], ["tool_use", "toolu_edit", "Edit"]);
 });
 
-test("calls smaller than minSegmentChars are never stubbed", () => {
-  const body = requestBody([
-    assistantToolUse("toolu_read", "Read", { file_path: "/a.ts" }),
-    userToolResult("toolu_read", "r".repeat(5000)),
-    ...filler(3),
-  ]);
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_read"]);
-  assert.deepEqual(inputAt(outcome.body, 0), { file_path: "/a.ts" });
-});
+test("a call whose stub would cost more than its input is left alone, on this request and the next", () => {
+  // A Read call is the case the guard exists for: the input is nothing but the path the stub
+  // would keep anyway, so the stub costs 61 chars against the 21 it replaces.
+  const build = (): Record<string, unknown> =>
+    requestBody([
+      assistantToolUse("toolu_read", "Read", { file_path: "/a.ts" }),
+      userToolResult("toolu_read", "r".repeat(5000)),
+      ...filler(3),
+    ]);
+  assert.equal(measureContentChars(inputAt(build(), 0)), 21);
 
-test("a call whose stub would be bigger than the input it replaces is left alone", () => {
-  // The call stub writes the path three times — the kept `file_path`, the prose, and the
-  // recall_search query — so a modest input under a deep path stubs to 761 chars from 550.
-  const body = requestBody([
-    assistantToolUse("toolu_deep", "Edit", {
-      file_path: `/repo/${"d".repeat(190)}/x.ts`,
-      old_string: "a",
-      new_string: "x".repeat(300),
-    }),
-    ...filler(3),
-  ]);
-
-  // Pin the scenario: the input is well over minSegmentChars, so the floor is not what skips
-  // it. Without this the fixture could drift under the floor and the test would pass blind.
-  assert.ok(measureContentChars(inputAt(body, 0)) > ALWAYS_TRIP.minSegmentChars);
-
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.equal(outcome.bodyChanged, false);
-  assert.deepEqual(outcome.newlyEvictedIds, []);
+  const first = evictContextSegments(build(), NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(first.newlyEvictedIds, ["toolu_read"], "its result is still worth stubbing");
+  assert.deepEqual(inputAt(first.body, 0), { file_path: "/a.ts" });
 
   // The re-stub pass has no size check of its own, so the guard has to sit ahead of it —
   // otherwise one oversized stub is re-paid on every later request for the rest of the session.
-  const later = evictContextSegments(body, new Set(["call:toolu_deep"]), NEVER_TRIP);
-  assert.equal(later.bodyChanged, false);
+  const later = evictContextSegments(build(), new Set(["call:toolu_read"]), NEVER_TRIP);
+  assert.deepEqual(inputAt(later.body, 0), { file_path: "/a.ts" });
 });
 
 test("stubbing a big call leaves its small result alone, on this request and the next", () => {
@@ -577,10 +555,7 @@ test("calls inside the last K assistant turns are protected regardless of size",
 });
 
 test("an already-stub-shaped call input is left alone rather than re-stubbed", () => {
-  const stubbed = {
-    file_path: "/repo/src/x.ts",
-    evicted: `${STUB_PREFIX} Edit input for /repo/src/x.ts (1,000 chars). Read the file for current content.]`,
-  };
+  const stubbed = { file_path: "/repo/src/x.ts", evicted: `${STUB_PREFIX} 1,000 chars]` };
   const body = requestBody([assistantToolUse("toolu_edit", "Edit", stubbed), ...filler(3)]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
   assert.equal(outcome.bodyChanged, false);
@@ -606,24 +581,17 @@ test("a stubbed Bash call keeps its command, truncated to 80 chars", () => {
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
   const input = inputAt(outcome.body, 0);
   assert.equal(input.command, `${longCommand.slice(0, 80)}…`);
-  assert.equal(
-    input.evicted,
-    `[onepass: evicted Bash input for \`${longCommand.slice(0, 80)}…\` (653 chars). ` +
-      `Re-run it for current output, or recall_search("${longCommand.slice(0, 80)}…") for the call as it was.]`,
-  );
+  assert.equal(input.evicted, "[onepass: evicted 653 chars]");
   assert.ok(!JSON.stringify(outcome.body).includes(longCommand));
 });
 
-test("a call with neither path nor command gets the generic stub and a bare input", () => {
+test("a call with neither path nor command keeps nothing but the stub in its input", () => {
   const body = requestBody([
     assistantToolUse("toolu_web", "WebFetch", { url: "https://example.com", prompt: "p".repeat(500) }),
     ...filler(3),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.deepEqual(inputAt(outcome.body, 0), {
-    evicted:
-      '[onepass: evicted WebFetch input (541 chars). Use recall_search("WebFetch") for the call as it was.]',
-  });
+  assert.deepEqual(inputAt(outcome.body, 0), { evicted: "[onepass: evicted 541 chars]" });
 });
 
 test("a call and its result are both charged to charsRemoved, each by its own size", () => {
@@ -635,9 +603,9 @@ test("a call and its result are both charged to charsRemoved, each by its own si
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
   assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit", "toolu_edit"]);
 
-  // A call is charged the JSON length of its replacement input (1,000 → 202), a result the
-  // length of its stub string (4,000 → 163). Both stubs are pinned byte-exact above.
-  assert.equal(outcome.charsRemoved, 1000 - 202 + (4000 - 163));
+  // A call is charged the JSON length of its replacement input (1,000 → 73), a result the
+  // length of its stub string (4,000 → 30). Both stubs are pinned byte-exact above.
+  assert.equal(outcome.charsRemoved, 1000 - 73 + (4000 - 30));
 });
 
 // A judge-selected user block: 3,000 chars, an instruction followed by a paste.

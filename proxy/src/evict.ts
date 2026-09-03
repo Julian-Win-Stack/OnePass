@@ -19,8 +19,12 @@ export interface EvictionConfig {
   evictAfterAssistantTurns: number;
   /** K: segments inside the last K assistant turns are never touched, regardless of size. */
   protectLastAssistantTurns: number;
-  /** Segments smaller than this many chars are never stubbed — stubbing them saves nothing. */
-  minSegmentChars: number;
+  /**
+   * A segment is stubbed only when its finished stub is at least this many chars smaller than
+   * the content. Replaces a fixed size floor: the stub's own cost decides, so a call whose
+   * input is only a path skips itself.
+   */
+  minSavedChars: number;
   /**
    * T: new ids are evicted only when the estimated request size, measured after re-applying
    * already-evicted stubs, exceeds this. Keeps the message prefix stable between trips so
@@ -65,7 +69,6 @@ const COMMAND_TRUNCATE_CHARS = 80;
 const ATTACHED_FILE_PREFIX = "<system-reminder>\nResult of calling the Read tool:";
 const TASK_NOTIFICATION_PREFIX = "<task-notification>";
 const READ_INPUT_PREFIX = "<system-reminder>\nCalled the Read tool with the following input:";
-const READ_INPUT_PATH_PATTERN = /"file_path"\s*:\s*"([^"]+)"/;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -125,98 +128,40 @@ export function measureContentChars(content: unknown): number {
   }
 }
 
-interface ToolUseInfo {
-  name?: string;
-  targetKind?: "file" | "command";
-  target?: string;
-}
-
-function collectToolUseInfo(messages: unknown[]): Map<string, ToolUseInfo> {
-  const infoById = new Map<string, ToolUseInfo>();
-  for (const message of messages) {
-    if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (!isRecord(block) || block.type !== "tool_use" || typeof block.id !== "string") continue;
-      const info: ToolUseInfo = {};
-      if (typeof block.name === "string") info.name = block.name;
-      const input = block.input;
-      if (isRecord(input)) {
-        const filePath =
-          typeof input.file_path === "string" ? input.file_path : typeof input.path === "string" ? input.path : undefined;
-        if (filePath !== undefined) {
-          info.targetKind = "file";
-          info.target = filePath;
-        } else if (typeof input.command === "string") {
-          info.targetKind = "command";
-          info.target =
-            input.command.length > COMMAND_TRUNCATE_CHARS
-              ? `${input.command.slice(0, COMMAND_TRUNCATE_CHARS)}…`
-              : input.command;
-        }
-      }
-      infoById.set(block.id, info);
-    }
-  }
-  return infoById;
-}
-
 function sanitizeForStub(text: string): string {
   return text.replace(/\s+/g, " ").replace(/"/g, "'").trim();
 }
 
 // Deterministic on purpose: the same request must always produce the same bytes, or the
 // stubs themselves would break the prompt-cache prefix they exist to protect.
-function buildToolResultStub(info: ToolUseInfo | undefined, originalChars: number): string {
-  const resultLabel = info?.name !== undefined ? `${info.name} result` : "tool result";
-  const target = info?.target;
-  const forPart =
-    target === undefined ? "" : info?.targetKind === "command" ? ` for \`${sanitizeForStub(target)}\`` : ` for ${target}`;
-  const query = sanitizeForStub(target ?? info?.name ?? "tool output");
-  const hint =
-    info?.targetKind === "file"
-      ? `Re-read the file for current content, or recall_search("${query}") for the output as it was.`
-      : info?.targetKind === "command"
-        ? `Re-run it for current output, or recall_search("${query}") for the output as it was.`
-        : `Use recall_search("${query}") for the output as it was.`;
-  return `[onepass: evicted ${resultLabel}${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
-}
-
-function buildToolUseStub(info: ToolUseInfo | undefined, originalChars: number): string {
-  const callLabel = info?.name !== undefined ? `${info.name} input` : "tool input";
-  const target = info?.target;
-  const forPart =
-    target === undefined ? "" : info?.targetKind === "command" ? ` for \`${sanitizeForStub(target)}\`` : ` for ${target}`;
-  const query = sanitizeForStub(target ?? info?.name ?? "tool input");
-  const hint =
-    info?.targetKind === "file"
-      ? `Read the file for current content, or recall_search("${query}") for the call as it was.`
-      : info?.targetKind === "command"
-        ? `Re-run it for current output, or recall_search("${query}") for the call as it was.`
-        : `Use recall_search("${query}") for the call as it was.`;
-  return `[onepass: evicted ${callLabel}${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
+//
+// The stub names nothing: what a tool block was is already in the request beside it. A result
+// is preceded by its own tool_use, which keeps its name and its path or command whether it is
+// live or stubbed, and how to get any of it back is one sentence in the recall tool's
+// description (spike/src/server.ts). Naming the target made the stubs the largest thing in the
+// request they exist to shrink: 12% of the measured peak (docs/findings.md §15).
+function buildEvictedStub(originalChars: number): string {
+  return `${STUB_PREFIX} ${formatThousands(originalChars)} chars]`;
 }
 
 // The API rejects a tool_use whose `input` is not an object, so the stub is an object too.
 // The path or command stays so the model can still tell which file or command the call was.
-function buildToolUseStubInput(info: ToolUseInfo | undefined, stubText: string): Record<string, unknown> {
-  if (info?.target === undefined) return { evicted: stubText };
-  return info.targetKind === "command"
-    ? { command: info.target, evicted: stubText }
-    : { file_path: info.target, evicted: stubText };
+function buildToolUseStubInput(input: Record<string, unknown>, stubText: string): Record<string, unknown> {
+  const filePath =
+    typeof input.file_path === "string" ? input.file_path : typeof input.path === "string" ? input.path : undefined;
+  if (filePath !== undefined) return { file_path: filePath, evicted: stubText };
+  if (typeof input.command !== "string") return { evicted: stubText };
+  const command =
+    input.command.length > COMMAND_TRUNCATE_CHARS
+      ? `${input.command.slice(0, COMMAND_TRUNCATE_CHARS)}…`
+      : input.command;
+  return { command, evicted: stubText };
 }
 
-function buildAttachedFileStub(filePath: string | undefined, originalChars: number): string {
-  if (filePath === undefined) {
-    return (
-      `[onepass: evicted attached file content (${formatThousands(originalChars)} chars). ` +
-      `Read the file for current content, or recall_search with a phrase from it for the content as it was.]`
-    );
-  }
-  const path = sanitizeForStub(filePath);
-  return (
-    `[onepass: evicted attached file ${path} (${formatThousands(originalChars)} chars). ` +
-    `Read the file for current content, or recall_search("${path}") for the content as it was.]`
-  );
+// Names no path either: the "Called the Read tool with the following input" marker beside the
+// attachment carries it, and that marker is never evicted.
+function buildAttachedFileStub(originalChars: number): string {
+  return `${STUB_PREFIX} attached file, ${formatThousands(originalChars)} chars]`;
 }
 
 /** What the judge decided to leave behind for one user-text block; at least one is non-empty. */
@@ -240,7 +185,7 @@ function buildUserTextStub(decision: JudgeDecision, originalChars: number, query
   const note = cleaned.length > NOTE_MAX_CHARS ? `${cleaned.slice(0, NOTE_MAX_CHARS)}…` : cleaned;
   const summary = note === "" ? "" : ` onepass's summary: ${note}.`;
   const pointer =
-    `[onepass: evicted ${formatThousands(originalChars)} chars of user text.${summary} ` +
+    `${STUB_PREFIX} ${formatThousands(originalChars)} chars of user text.${summary} ` +
     `recall_search("${query}") for the original]`;
   return decision.keep === "" ? pointer : `${decision.keep}\n${pointer}`;
 }
@@ -251,17 +196,14 @@ function recallQueryFromText(text: string): string {
   return sanitizeForStub(text).split(" ").slice(0, RECALL_QUERY_WORDS).join(" ");
 }
 
+// The one stub that still names its target: nothing else in the request carries the task id or
+// the path its output was written to.
 function buildTaskNotificationStub(text: string, originalChars: number): string {
   const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1];
   const outputFile = /<output-file>([^<]+)<\/output-file>/.exec(text)?.[1];
-  const forPart = taskId === undefined ? "" : ` for task ${sanitizeForStub(taskId)}`;
-  const hint =
-    outputFile === undefined
-      ? `Use recall_search("${sanitizeForStub(taskId ?? "task-notification")}") for it as it was.`
-      : `Read the full output on disk at ${sanitizeForStub(outputFile)}, or recall_search("${sanitizeForStub(
-          taskId ?? outputFile,
-        )}") for it as it was.`;
-  return `[onepass: evicted task notification${forPart} (${formatThousands(originalChars)} chars). ${hint}]`;
+  const idPart = taskId === undefined ? "" : ` ${sanitizeForStub(taskId)}`;
+  const outputPart = outputFile === undefined ? "" : `; output at ${sanitizeForStub(outputFile)}`;
+  return `${STUB_PREFIX} task notification${idPart}, ${formatThousands(originalChars)} chars${outputPart}]`;
 }
 
 interface Segment {
@@ -286,6 +228,27 @@ function stubbedChars(segment: Segment): number {
   return segment.stubInput === undefined ? segment.stubText.length : measureContentChars(segment.stubInput);
 }
 
+/** A block about to be stubbed, in whichever shape the size of its stub depends on. */
+export type StubTarget =
+  | { kind: "tool_result"; content: unknown }
+  | { kind: "tool_use"; input: unknown }
+  | { kind: "user_text"; text: string; decision: JudgeDecision };
+
+/**
+ * Chars the block will cost once stubbed. The judge gates its picks on the saving this implies,
+ * so it can never accept an id the eviction pass then refuses for saving too little.
+ */
+export function stubbedCharsFor(target: StubTarget): number {
+  if (target.kind === "user_text") {
+    return buildUserTextStub(target.decision, target.text.length, recallQueryFromText(target.text)).length;
+  }
+  if (target.kind === "tool_result") return buildEvictedStub(measureContentChars(target.content)).length;
+  const inputChars = measureContentChars(target.input);
+  // A non-object input is passed through untouched, so stubbing it would save nothing.
+  if (!isRecord(target.input)) return inputChars;
+  return measureContentChars(buildToolUseStubInput(target.input, buildEvictedStub(inputChars)));
+}
+
 /** Segment id for a text block: a content hash, so it re-matches when the client resends it. */
 export function textSegmentId(text: string): string {
   return `sha1:${createHash("sha1").update(text).digest("hex")}`;
@@ -298,35 +261,16 @@ export function callSegmentId(toolUseId: string): string {
 
 function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<string, JudgeDecision>): Segment[] {
   const assistantTurnsAfterIndex = assistantTurnsAfterByMessage(messages);
-
-  const toolUseInfoById = collectToolUseInfo(messages);
-
-  // Attached file content and the harness message naming its path arrive as separate
-  // segments, content first paired with the nearest preceding unclaimed "Called the Read
-  // tool" input. Both are collected in one ordered walk so pairing is by position.
-  const readInputPaths: { position: number; path: string; claimed: boolean }[] = [];
   const segments: Segment[] = [];
-  let position = 0;
 
   const classifyText = (text: string, messageIndex: number, blockIndex: number | null): void => {
-    if (text.startsWith(READ_INPUT_PREFIX)) {
-      const pathMatch = READ_INPUT_PATH_PATTERN.exec(text);
-      if (pathMatch?.[1] !== undefined) readInputPaths.push({ position, path: pathMatch[1], claimed: false });
-      return;
-    }
+    // Never a segment: this marker is what names the path for the attached-file stub next to
+    // it, so evicting it would take the attachment's only remaining pointer with it.
+    if (text.startsWith(READ_INPUT_PREFIX)) return;
     const id = textSegmentId(text);
     let stubText: string;
     if (text.startsWith(ATTACHED_FILE_PREFIX)) {
-      let pairedPath: string | undefined;
-      for (let i = readInputPaths.length - 1; i >= 0; i--) {
-        const candidate = readInputPaths[i];
-        if (candidate !== undefined && !candidate.claimed && candidate.position < position) {
-          candidate.claimed = true;
-          pairedPath = candidate.path;
-          break;
-        }
-      }
-      stubText = buildAttachedFileStub(pairedPath, text.length);
+      stubText = buildAttachedFileStub(text.length);
     } else if (text.startsWith(TASK_NOTIFICATION_PREFIX)) {
       stubText = buildTaskNotificationStub(text, text.length);
     } else {
@@ -350,15 +294,13 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
   messages.forEach((message, messageIndex) => {
     if (!isRecord(message)) return;
     if (message.role === "assistant") {
-      // `position` is deliberately not advanced here: it only orders user-side text segments.
       if (!Array.isArray(message.content)) return;
       message.content.forEach((block, blockIndex) => {
         if (!isRecord(block) || block.type !== "tool_use" || typeof block.id !== "string") return;
         const input = block.input;
         if (!isRecord(input)) return;
         const contentChars = measureContentChars(input);
-        const info = toolUseInfoById.get(block.id);
-        const stubText = buildToolUseStub(info, contentChars);
+        const stubText = buildEvictedStub(contentChars);
         segments.push({
           id: callSegmentId(block.id),
           messageIndex,
@@ -367,7 +309,7 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
           assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
           alreadyStubShaped: typeof input.evicted === "string" && input.evicted.startsWith(STUB_PREFIX),
           stubText,
-          stubInput: buildToolUseStubInput(info, stubText),
+          stubInput: buildToolUseStubInput(input, stubText),
         });
       });
       return;
@@ -376,15 +318,11 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
     const content = message.content;
     if (typeof content === "string") {
       classifyText(content, messageIndex, null);
-      position++;
       return;
     }
     if (!Array.isArray(content)) return;
     content.forEach((block, blockIndex) => {
-      if (!isRecord(block)) {
-        position++;
-        return;
-      }
+      if (!isRecord(block)) return;
       if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
         const contentChars = measureContentChars(block.content);
         segments.push({
@@ -394,12 +332,11 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
           contentChars,
           assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
           alreadyStubShaped: typeof block.content === "string" && block.content.startsWith(STUB_PREFIX),
-          stubText: buildToolResultStub(toolUseInfoById.get(block.tool_use_id), contentChars),
+          stubText: buildEvictedStub(contentChars),
         });
       } else if (block.type === "text" && typeof block.text === "string") {
         classifyText(block.text, messageIndex, blockIndex);
       }
-      position++;
     });
   });
   return segments;
@@ -478,11 +415,13 @@ export function evictContextSegments(
   if (!isRecord(body) || !Array.isArray(body.messages)) return passthrough;
 
   const messages = body.messages;
-  // A stub no smaller than what it replaces would grow the request, and monotonic eviction
-  // would re-pay that every request after. A long path can do it: a call stub names the path
-  // three times. Dropping the segment here keeps its id out of the evicted set entirely.
+  // A stub that saves too little is not worth the trip, and one no smaller than what it
+  // replaces would grow the request — with monotonic eviction re-paying that on every request
+  // after. A Read call is the case: its input is nothing but the path the stub keeps anyway.
+  // Dropping the segment here keeps its id out of the evicted set entirely.
   const candidates = collectSegments(messages, judgeDecisionById).filter(
-    (segment) => !segment.alreadyStubShaped && stubbedChars(segment) < segment.contentChars,
+    (segment) =>
+      !segment.alreadyStubShaped && segment.contentChars - stubbedChars(segment) >= config.minSavedChars,
   );
 
   // Monotonic: an id evicted on any earlier request is stubbed again on every request.
@@ -505,8 +444,7 @@ export function evictContextSegments(
   const isNewTarget = (segment: Segment, minAge: number): boolean =>
     !alreadyEvictedIds.has(segment.id) &&
     segment.assistantTurnsAfter >= minAge &&
-    segment.assistantTurnsAfter >= config.protectLastAssistantTurns &&
-    segment.contentChars >= config.minSegmentChars;
+    segment.assistantTurnsAfter >= config.protectLastAssistantTurns;
   const newTargets = tripped
     ? candidates.filter((segment) => isNewTarget(segment, config.evictAfterAssistantTurns))
     : [];
