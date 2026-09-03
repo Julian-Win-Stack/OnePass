@@ -436,6 +436,127 @@ question about a file whose `Write` and `Edit` calls had both been stubbed out o
 context, reading the still-present `cat` output instead of confabulating — §8 and §12's
 disk-first behaviour again, this time with the call gone rather than the result.
 
+## 17. Cheap stubs: 195k -> 140k peak, a flatter curve, and the judge's first accepted pick
+
+§15 measured the proxy's own stubs at 12% of the peak request — 134 of them at ~180 tokens
+each, the largest single thing in the request they exist to shrink. Each named its target
+three times: the kept `file_path`, the prose, and a `recall_search` query repeating the path.
+The change measured here removes all three. A result stubs to `[onepass: evicted 2,000 chars]`
+(~30 chars), the recovery instructions move once into the recall tool's own description where
+prompt caching pays for them, and — because the stub is now cheap — the fixed 500-char size
+floor becomes wrong rather than blunt. `ONEPASS_MIN_SEGMENT_CHARS` (500) is replaced by
+`ONEPASS_MIN_SAVED_CHARS` (50), measured on what the finished stub actually saves.
+
+**The A/B.** Same mastra task (#18877), same base commit `a14c2436bc`, same plan, same
+`opus[1m]` / `--effort xhigh` / `--permission-mode acceptEdits`, same `--allowedTools`, same
+byte-identical prompt. Run 4 is the verbose-stub build, run 5 the cheap-stub build. Both ran
+with the judge on. Only the proxy code differs.
+
+| | Run 4 (named stubs, floor 500) | Run 5 (cheap stubs, floor 50) |
+|---|---|---|
+| Peak context (API `usage`) | 194,659 | **140,253** |
+| Assistant turns above 150k | 96 | **0** |
+| Median context | 110,000 | 103,725 |
+| p90 context | 177,312 | **118,633** |
+| Early-quarter -> late-quarter median | 86,883 -> 171,452 (1.97x) | 80,146 -> 118,003 (**1.47x**) |
+| Compactions | 0 | 0 |
+| Assistant turns | 556 | 588 |
+| Wall clock | 38.0 min | 35.0 min |
+| Trips / segments / chars removed | 93 / 221 / 523,475 | 79 / **560** / **706,790** |
+| Ground-truth tests | 63 / 65 | 63 / 65 |
+| Unexpected rebuilds | 4 | **0** |
+| Proxy time per request | 9ms median, 25ms max | 9ms median, 17ms max |
+
+**The floor, not the stub text, is where the volume came from.** 560 segments evicted against
+221 — 2.5x — on a run that did *more* work, not less. A cheap stub is what makes a 50-char
+floor safe: under the old floor a 300-char result was not worth a 300-char stub, and under the
+new one it is worth a 30-char one. The stub text saving is real but second-order; the floor it
+unlocks is the finding, and it is the same compounding effect §16 named — freeing headroom
+lets the proxy do more of what it already did.
+
+**It moved the tail, not just the peak.** §16 reported the curve moving down without lying
+down (1.60x early-to-late). This is the first build where the tail collapses too: p90 falls
+177,312 -> 118,633 and no turn crosses 150k, against 96 turns in run 4. Peak and p90 converge
+to within 22k of each other, which is what "flat" looks like when it starts to arrive.
+
+**Quality is unchanged, at 63/65 for the third proxied run running.** Runs 3, 4 and 5 all
+score 63/65 against the ground-truth tests from the human fix `faee052a3c`, all failing the
+same two: the `supportsChannelState` capability fallback (35/36 core — also failed by the
+unproxied control) and the composite index shape (28/29 convex). The control scored 64/65.
+Three identical scores across three different stub designs is a tie, not proof of safety.
+
+**The anonymous stub told the agent enough.** This was the bet the change rested on, and the
+three ways it could have failed did not. (a) Of 398 tool calls, 397 keep a `file_path` or a
+`command` in the stub — only one `Skill` call stubs to its name alone. (b) No attachment goes
+anonymous: the `Called the Read tool` marker is excluded from `collectSegments` by
+construction, so the path always survives beside the stub. (c) The agent never once mentioned
+eviction, missing context, or recall in 588 turns — no confusion, and no confabulation. It
+also re-read *less*: 18 redundant reads against run 4's 50 and run 3's 25.
+
+**The one real cost: the agent copies the stub's shape into its own calls.** A stubbed
+`tool_use` carries `{ file_path, evicted }` — deliberately off the tool's schema (§16). The
+model sometimes imitates that shape when writing its *next* call, sending `evicted` in place of
+`old_string`/`new_string`, and the harness rejects it with an `InputValidationError`. This is
+caused by evicting calls at all, not by the stub text:
+
+| | Imitations | `InputValidationError`s | Assistant turns |
+|---|---|---|---|
+| Control (no proxy) | **0** | **0** | 387 |
+| Run 3 (call eviction, named stubs) | 3 | 3 | 424 |
+| Run 4 (named stubs) | 9 | 10 | 556 |
+| Run 5 (cheap stubs) | 11 | 11 | 588 |
+
+Zero in the control is what makes it causal. The cost is about one turn each — 9 of run 5's 11
+were followed immediately by a valid call — so 11 wasted turns in 588 (1.9%). Per *stubbed
+call* the rate improved (2.0% against run 4's 4.1%); per turn it did not. Nothing here is
+fatal, and it is the only measured way the proxy has made the agent worse.
+
+**Recall was never called — in any run, including the control's zero-stub baseline.** Runs 3,
+4 and 5 all show 0 `recall_search`/`recall_get` calls, so evicted:recalled stays at
+178,594 : 0. Run 4's stubs contained an explicit `recall_search("<path>")` hint in every stub
+and were still never followed. Moving the instructions into the tool description therefore
+gave up nothing that was working — but it also means the recovery path remains unexercised on
+this workload, and §12 (a probe that deliberately asked for evicted content) is still the only
+evidence that it works. This is the weakest part of the picture.
+
+### The judge, measured live for the first time
+
+`proxy/README.md` called the judge unmeasured. Two runs now measure it, and it is the same
+answer twice.
+
+| | Run 4 (floor 500) | Run 5 (floor 50) |
+|---|---|---|
+| Trips that could have fired it | 93 | 79 |
+| Calls answered / failed / skipped (one already running) | 12 / 1 / 158 | 18 / 0 / 65 |
+| Picks proposed | 533 | 18 |
+| Picks **accepted** | **0** | **1** |
+| Chars it removed | 0 | **7,585** |
+| Judge tokens (in / out) | 1,107,712 / 95,773 | 1,142,391 / 90,496 |
+| Cost on the user's key (Sonnet 5, $2/$10 per MTok) | ~$3.17 | ~$3.19 |
+
+The old failure was the floor: 326 of run 4's 533 picks bounced as `tooSmall` against a
+500-char rule the judge was never told about. That is fixed — run 5 records zero `tooSmall`.
+What replaced it is not a bug but an absence. With the menu corrected to offer only what the
+guards could accept, the judge was offered so little that it proposed **18 picks across 18
+answered calls** and got one through, worth 7,585 chars — **1.1% of the 706,790 the rules
+removed on the same run**. Of the 17 rejections, 12 were `keepOnNonUserBlock` (a quote or note
+attached to a tool block, which is the judge misusing its own contract) and 5 were
+`unknownId` — a pick the request no longer contained, because the conversation moved on during
+the 26–132s the call took (median 70s).
+
+**The judge costs money, not time.** It is never in the request path; the 65 skipped trips and
+the 70s median cost the session nothing in wall clock (run 5 was the *fastest* proxied run at
+35 min). The whole bill is ~$3.19 per session on the operator's own key, for 1.1% of the
+eviction. On this evidence the rules do essentially all the work and the judge is not worth
+turning on.
+
+**The 456s outlier from run 4 was not a timeout failure.** `JUDGE_TIMEOUT_MS` (300,000) is
+enforced per *attempt*, and `callJudge` retries once; the logged `durationMs` covers both. The
+455,941ms entry carries `error: "judge response was not a verdict"`, i.e. two ~228s attempts
+that each parsed as garbage. The timeout works; there is no overall deadline, so the true worst
+case is 2 x 300s. Node's `request.setTimeout` is also an idle-socket timer rather than a
+wall-clock one, so a slow trickle of bytes would not trip it at all.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -454,6 +575,12 @@ disk-first behaviour again, this time with the call gone rather than the result.
   identical work (425 vs 424 assistant turns, 263 vs 279 requests). Peak context is
   arithmetic and survives that; the wall-clock difference (26 vs 28.5 min) does not, and
   is not quoted above.
+- §17 is n=1 per arm, with the same nondeterminism: run 5 did more work than run 4 (588 vs
+  556 turns) and went further into the task (clickhouse, cloudflare, docs, changesets). Peak,
+  p90 and the eviction counts are arithmetic over what was actually sent and survive that;
+  the wall-clock ordering (35.0 vs 38.0 min) does not, and neither does the imitation count,
+  which scales with how many calls got stubbed. The judge's two runs differ in build as well
+  as in luck — treat "1 accepted pick" as the order of magnitude, not the number.
 
 ## Reproducing
 
@@ -466,6 +593,11 @@ message content blocks; `compactMetadata` supplies §2 and the recursion test in
 run's flags, and read `usage` from the `--output-format json` reply; the replayed-output row
 is the sum of `message.usage.output_tokens` over the transcript's assistant entries before the
 peak (dedupe by `message.id`).
+
+§17 is reproducible the same way, from `/private/tmp/onepass-eval/run{4,5}.report.txt` and
+the two transcripts; the imitation count is a scan for `tool_use` blocks whose `input` carries
+an `evicted` key, and the ground-truth score is the two test files from mastra `faee052a3c`
+copied over the agent's own (`/private/tmp/onepass-eval/score5.sh`).
 
 §16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
 ad-hoc script:

@@ -53,7 +53,9 @@ proxy/             eviction proxy: sits between Claude Code and the API, stubs o
                    each /v1/messages trip a second model reads the conversation as it went
                    upstream (stubs included) in the background and names blocks that are
                    superseded or belong to a finished sub-task. Off unless
-                   ONEPASS_JUDGE_API_KEY is set. Unmeasured — no findings.md section yet.
+                   ONEPASS_JUDGE_API_KEY is set. Measured in findings.md §17: one accepted
+                   pick across two live runs, ~1% of the rules' eviction. Off is the default
+                   for a reason.
                    See proxy/README.md.
 .github/           CI (build + tests, Node 20/22/24). A tag-push publish workflow exists
                    but is unused — the package is not published to npm.

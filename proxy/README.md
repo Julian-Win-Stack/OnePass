@@ -141,10 +141,13 @@ What it is sent is the conversation **as it went upstream**, existing stubs and 
 history. The judge never sees the original of anything the rules already replaced, so it can
 only add to what is evicted, never restore.
 
-**Not yet measured, and bounded.** Every number under "Verification" below was recorded before
-the judge existed, and `docs/findings.md` has no section on it: the judge has unit tests and no
-real-session evidence. Its headroom is bounded by the rules, too — it is only ever offered what
-the rules declined, which on the control transcript is 0–3 admissible blocks per trip.
+**Measured, and it does almost nothing — leave it off unless you are working on it.**
+`docs/findings.md` §17 records two live runs. Across 79 trips the judge answered 18 calls,
+proposed 18 picks and got **one** accepted, worth 7,585 chars — 1.1% of what the rules removed
+on the same run — for ~$3.19 on the operator's key. The run before it accepted zero. It is
+never in the request path, so the cost is money rather than wall clock. Its headroom is bounded
+by the rules by construction: it is only ever offered what the rules declined, and the better
+the rules get, the less is left.
 
 - **Never in the request path.** The tripping request goes upstream as the rules left it, and
   the agent never waits on the judge. The judge runs alongside it; its verdict is applied by adding the ids it named to
