@@ -84,7 +84,7 @@ Code interactions".
 | `ONEPASS_UPSTREAM` | `https://api.anthropic.com` | Where requests are forwarded |
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
-| `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~15–20k over T; over hundreds of turns the un-evictable floor (system + last-K turns + small results) adds more — measured peak 146,947 at 289 heavy turns. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
+| `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~30k over T at the default — measured peak 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
 | `ONEPASS_MIN_SAVED_CHARS` | `50` | A segment is stubbed only when its finished stub is at least this many chars smaller than the content. The stub's own cost decides, so no fixed size floor is needed |
 | `ONEPASS_JUDGE_API_KEY` | unset | Your own Anthropic API key. Unset means **no judge**: the proxy evicts by the rules alone, exactly as it did before. Never set `ANTHROPIC_API_KEY` for this — a `claudep` launched from the same shell would then bill Claude Code to the key instead of your subscription. Judge calls are billed to this key |
 | `ONEPASS_JUDGE_MODEL` | `claude-sonnet-5` | Model the judge runs on |
@@ -118,16 +118,24 @@ Code interactions".
   breaks.
 - T is denominated in **real tokens**, not chars ÷ 4. The proxy reads the `usage` object out
   of every API response it forwards (stripping `accept-encoding` on those requests so the
-  body is scannable) and calibrates a live chars-per-token ratio. Real code runs ~2.5–3.5
-  chars per token, so a fixed ÷ 4 under-counts by 25–30% — enough to cross Claude Code's
-  compaction threshold while the estimate still looks safe. Until the first sample the
-  fallback is a deliberately conservative 3.2.
+  body is scannable) and calibrates a live chars-per-token ratio. Measured on real traffic:
+  2.1–2.7 chars per token for `.d.ts`-heavy content and ~3.2 for mixed code, so a fixed ÷ 4
+  under-counts by 25–40% — enough to cross Claude Code's compaction threshold while the
+  estimate still looks safe. Until the first sample the fallback is a deliberately
+  conservative 3.2.
 - **Pressure pass**: a burst of large reads in quick succession is younger than N and
   normally un-evictable. If the normal pass leaves the request over T, the age gate relaxes
   down to K for that trip — only the last K turns are ever untouchable. Without this, a
   chunked file sweep outruns the age gate and the client compacts anyway.
 - Malformed or non-JSON bodies are forwarded byte-for-byte untouched. A parse failure never
   fails a request.
+- **The one measured cost.** A stubbed `tool_use` input is deliberately off the tool's own
+  schema (`{ file_path, evicted }`), and the model sometimes imitates that shape in its *next*
+  call — sending `evicted` where `old_string`/`new_string` belong, which the harness rejects
+  with an `InputValidationError`. Measured at 11 occurrences in 588 turns (1.9%, about one
+  wasted turn each) against **zero** in an unproxied control, so the cause is evicting calls at
+  all rather than the stub text (docs/findings.md §17). It is the only way the proxy has been
+  measured to make the agent worse.
 
 ## The judge (off unless `ONEPASS_JUDGE_API_KEY` is set)
 
@@ -182,7 +190,7 @@ the rules get, the less is left.
 - **Never logged**: the prompt and the verdict bodies. The log records counts, sizes, and
   timings only, like every other record.
 
-## Known Claude Code interactions (measured against 2.1.241)
+## Known Claude Code interactions (measured against 2.1.241–2.1.258)
 
 - **Compaction really does key off API-reported usage.** From the shipped binary: auto-compact
   fires when `input_tokens + cache_creation_input_tokens + cache_read_input_tokens (+ output)`
@@ -267,12 +275,14 @@ npm run report -- ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-
 
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
-evicted:recalled ratio (the product metric — 100:1 is a real product), a speed summary
-(rebuilds by cause, median and max `proxyMs`, median first-byte on cached requests versus
-rebuilt ones), a judge summary when the log holds any judge runs (picks proposed and accepted,
-drops per counter, token spend, and runs that failed or were skipped), and a per-request table carrying those numbers next to the estimated tokens
-sent over time (flat is good). The proxy log path defaults to the newest `proxy.log.*.jsonl`
-under `~/.onepass/`.
+evicted:recalled ratio (read it as how much the agent had to pay back for eviction, not as
+proof recall is carrying the session — on real workloads it is rarely called at all, see
+Verification), a speed summary (rebuilds by cause, median and max `proxyMs`, median first-byte
+on cached requests versus rebuilt ones), a judge summary when the log holds any judge runs
+(picks proposed and accepted, drops per counter, token spend, and runs that failed or were
+skipped), and a per-request table carrying those numbers next to the estimated tokens sent over
+time (flat is good). The proxy log path defaults to the newest `proxy.log.*.jsonl` under
+`~/.onepass/`.
 
 ## Verification
 
@@ -289,19 +299,35 @@ verdict parsing, each guard dropping its own entry, a trip firing the judge and
 its verdict stubbing a paste on the next request, a failing judge retried once and then
 evicting nothing, and no judge call at all when no key is configured.
 
-### Verified against the real API (cloud container, claude 2.1.241, OAuth auth)
+### Verified against the real API
 
-- **Real debugging session through the proxy**: two planted bugs in a copy of this codebase,
-  fixed character-exact with 22/22 tests green while the proxy evicted the session's early
-  context mid-task. The agent re-read files instead of trusting stubs; no confabulation.
+Newest evidence first; full numbers in `docs/findings.md`.
+
+- **The A/B run against an unproxied control** (§17, CLI 2.1.258, `opus[1m]`, same task, same
+  base commit, byte-identical prompt). The current build peaked at **140,253 tokens** over
+  **588 assistant turns** with **zero compactions, zero turns above 150k, and zero unexpected
+  rebuilds**; p90 context 118,633, and the median climbed only 1.47× from the session's first
+  quarter to its last. The previous stub design, same task: 194,659 peak and 96 turns above
+  150k. Proxy overhead 9ms median, 17ms max. **Quality held** — 63/65 against the ground-truth
+  tests for the third proxied run running, versus 64/65 for the unproxied control.
+- **The long run** (§11, cloud container, CLI 2.1.241, OAuth): a 3.3MB four-file
+  TypeScript-declaration audit. Raw conversation reached **~1.49M tokens**; sent requests
+  peaked at **146,947**; **289 assistant turns, zero compactions**; the audit completed
+  correctly. An unproxied 200k-window session hard-stops near 187k — this is ~8× that in one
+  sitting, with the client's own context gauge staying flat. §11 also has the ~130–150
+  tokens/turn growth of the un-evictable floor that eventually bounds session length.
+- **Real debugging session through the proxy** (§11): two planted bugs in a copy of this
+  codebase, fixed character-exact with 22/22 tests green while the proxy evicted the session's
+  early context mid-task. The agent re-read files instead of trusting stubs; no confabulation.
   OAuth/subscription auth passes through untouched — an API key is not required after all.
-- **The long run** (default config, one session): a 3.3MB four-file TypeScript-declaration
-  audit. Raw conversation reached **~1.49M tokens**; sent requests peaked at **146,947**;
-  **289 assistant turns, zero compactions, zero turns above 150k**; 75 results evicted; the
-  audit completed correctly. An unproxied 200k-window session hard-stops near 187k — this is
-  ~8× that in one sitting, with the client's own context gauge staying flat.
-  `docs/findings.md` §11 has the full numbers, including the ~130–150 tokens/turn growth of
-  the un-evictable floor that eventually bounds session length.
+
+**What is still unproven: the recovery path.** Across the three real proxied runs the agent
+called `recall_search`/`recall_get` **zero** times — evicted:recalled is 178,594 : 0. It never
+needed to: it re-read from disk instead, and never once mentioned eviction, missing context, or
+recall. The earlier build put an explicit `recall_search("<path>")` hint in every stub and it
+was still never followed. So the eviction half is measured on real work and the recall half is
+not; §12's deliberate probe — an unannounced question answerable only from evicted content,
+answered exactly — remains the only direct evidence that recall works.
 
 If the repo (or `~/.claude/settings.json`) pins `autoCompactWindow`, remember the proxy
 makes that stopgap unnecessary for proxied sessions — a low window like 160k puts the
