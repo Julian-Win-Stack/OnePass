@@ -1,11 +1,11 @@
-import { readFileSync, readdirSync, statSync, appendFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const CALL_LOG = join(process.cwd(), "spike", "recall-calls.log");
+const CALL_LOG = join(homedir(), ".onepass", "recall-calls.log");
 const MAX_RESULT_CHARS = 8000;
 
 type Entry = {
@@ -114,6 +114,7 @@ function truncate(text: string): string {
 function logCall(tool: string, args: unknown, outcome: string): void {
   const line = JSON.stringify({ at: new Date().toISOString(), tool, args, outcome });
   try {
+    mkdirSync(dirname(CALL_LOG), { recursive: true });
     appendFileSync(CALL_LOG, `${line}\n`);
   } catch {
     // the log is spike instrumentation; never fail a recall because it could not be written
@@ -138,7 +139,12 @@ server.registerTool(
       "Use this whenever you are about to state something about earlier work that you cannot actually see anymore: a file's contents, a command's output, a decision, or something that was tried and failed. " +
       "The query is split on whitespace and each term matched separately — an entry matching only some terms is still returned, ranked below entries matching more. " +
       "So throw several words at it rather than guessing one exact phrase. " +
-      "Returns matching entries with a `ref` — pass that ref to recall_get for the full content.",
+      "Returns matching entries with a `ref` — pass that ref to recall_get for the full content. " +
+      "Blocks marked `[onepass: evicted N chars]` were removed from your context by the Onepass proxy; the original is on disk and this tool finds it. " +
+      "For a tool call or result, search the file path or command kept in the call. " +
+      "For an attached file, search the path from the `Called the Read tool` line beside it. " +
+      "For a task notification, search the task id. " +
+      "When you need the current state rather than what it was, read the file or re-run the command instead.",
     inputSchema: {
       query: z.string().describe("Words to look for, e.g. a filename, error message, or function name. Multiple words are matched independently, not as a phrase."),
       limit: z.number().int().min(1).max(50).default(10).describe("Maximum matches to return"),
