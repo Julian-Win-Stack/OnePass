@@ -557,6 +557,99 @@ that each parsed as garbage. The timeout works; there is no overall deadline, so
 case is 2 x 300s. Node's `request.setTimeout` is also an idle-socket timer rather than a
 wall-clock one, so a slow trickle of bytes would not trip it at all.
 
+## 18. The agent was copying the stub: 11 imitations -> 3, at 1.7x the dose
+
+§17 measured the proxy's one cost — 11 tool calls in 588 turns where the model sent the stub's
+own shape instead of real arguments, each rejected with `InputValidationError`, each worth about
+one wasted turn. It recorded the count and left the cause open. This section closes it, and
+measures the fix.
+
+**The agent was not misusing an unknown parameter. It was reproducing the proxy's own
+transformation on a call it intended to make.** Four pieces of evidence, all from run 5's
+transcript:
+
+- **The 80-char cut.** Every one of the 7 Bash imitations truncated its command at exactly 80
+  characters and appended the same ellipsis. `COMMAND_TRUNCATE_CHARS = 80` existed only inside
+  `proxy/src/evict.ts`. Nothing in the model's training or the harness's schemas names it.
+- **The command was new.** At turn 524 the rejected call declared "234 chars" and cut at 80; the
+  retry two turns later carried the real command at ~236 chars. That command appears exactly
+  twice in the whole transcript — the rejected call and its retry. It was not copied from
+  earlier context; the model wrote it, then rendered it the way the proxy renders one.
+- **The wording is irrelevant.** Run 4 ran verbose stubs and produced verbose imitations; run 5
+  ran cheap stubs and produced cheap ones. The imitation tracks the *shape*, not the text.
+- **Recency does not explain it.** Controlled for how far into the run a turn was (turn >= 427),
+  the median time since the last eviction trip was 3.6s before an imitation and 4.7s before a
+  non-imitation. Imitations do not cluster after trips.
+
+**What predicts it is dose — the share of the agent's own visible tool calls that have been
+blanked.** Run 5 produced none in its first 400 turns and 8 per 100 turns by its last quarter,
+rising monotonically with that share.
+
+**The asymmetry names the mechanism.** On run 5 the proxy stubbed 371 tool *results* and 189
+tool *calls*, with the identical `[onepass: evicted N chars]` marker in both. Every one of the
+11 imitations came from the call side; the results were copied zero times. A `tool_result` is
+written by the harness, a `tool_use` by the agent — so the marker was copyable precisely because
+it sat in the agent's own turn. (The model cannot emit a `tool_result` at all, so this is partly
+guaranteed by the wire protocol rather than by voice alone. The practical implication is the
+same: nothing the rules put in an assistant block is inert.)
+
+**The fix.** A stubbed `tool_use` input becomes `{}`. The path the call named moves into the stub
+of its paired `tool_result` (`[onepass: evicted 4,000 chars; call evicted, /repo/x.ts]`), a block
+the model never authors. A command is not carried over at all — a truncated one is no better a
+recall key than the paths and error text already in the request, and it is the artifact being
+copied. Because `{}` is far cheaper than the shape it replaces, the `ONEPASS_MIN_SAVED_CHARS`
+floor now admits many more calls, so the dose rises as a side effect.
+
+**The A/B.** Same mastra task (#18877), same base commit `a14c2436bc`, same plan, same
+`opus[1m]` / `--effort xhigh` / `--permission-mode acceptEdits`, same `--allowedTools`, same
+byte-identical prompt. Only the stub shape differs.
+
+| | Run 5 (`{ path \| command, evicted }`) | Run 6 (`{}`) |
+|---|---|---|
+| Imitations / `InputValidationError`s | 11 / 11 | **3 / 3** |
+| Imitations per 100 assistant turns | 1.87 | **0.54** |
+| Tool calls stubbed, of all tool calls | 189 / 398 (47.5%) | **312 / 396 (78.8%)** |
+| Imitation shapes | 7 truncated Bash commands, 4 `evicted` keys | 3 empty `Bash {}` |
+| Peak context (API `usage`) | 140,253 | **113,157** |
+| Assistant turns above 150k | 0 | 0 |
+| Compactions | 0 | 0 |
+| Assistant turns | 588 | 557 |
+| Wall clock | 35.0 min | **32.3 min** |
+| Trips / segments / chars removed | 79 / 560 / 706,790 | 13 / **651** / **808,414** |
+| Ground-truth tests | 63 / 65 | **64 / 65** |
+| Unexpected rebuilds | 0 | 1 |
+| Proxy time per request | 9ms median, 17ms max | 9ms median, 20ms max |
+| `recall_search` / `recall_get` calls | 0 | 0 |
+| Judge | on | off |
+
+**Emptiness is copied too.** The prediction that `{}` leaves nothing to imitate was wrong: all
+three run 6 incidents are a literal `Bash {}`, emitted immediately before the same real command
+the model then issued correctly. Turn 512 announces a verification pass, 513 sends `Bash {}`,
+514 sends `pnpm turbo build --filter ...`. Whatever occupies that slot gets copied, including
+nothing.
+
+**What did hold is that the copy can no longer be valid.** Every tool the agent uses has a
+required parameter, so an imitated `{}` is rejected on the spot: 3 turns of 557, ~0.5% of wall
+clock, against 1.7% on run 5. Run 5's 7 truncated Bash commands were the dangerous class — a
+syntactically valid command with its tail silently removed, which the harness would have run.
+Run 6 has none. The remaining defect is loud, self-correcting, and costs one turn.
+
+**Read against dose, the reduction is larger than the raw counts show.** Run 6 blanked 78.8% of
+the agent's own calls against run 5's 47.5% — past the point where run 5 was already producing 8
+imitations per 100 turns — and produced 0.54 per 100. Per unit of dose that is a 5.8x reduction.
+
+**Two caveats.** Run 5 ran with the judge on and run 6 with it off, because the operator's key
+was removed between them; §17 measured the judge at 1.1% of eviction, and its absence removes
+eviction rather than adding it, so it cuts against run 6. And n=1 per arm: at a ~2% per-turn
+event rate, separating 0.54 from 1.87 with confidence needs roughly 100 sessions per arm, which
+is not what this is. The dose-adjusted direction is the claim; the exact ratio is not.
+
+**Nothing stubbed in an assistant block is inert.** That is the transferable result. The stub is
+not passive annotation the model reads around — it is text in the model's own voice, and the
+model writes in the voice it has been shown. The design rule that follows: put everything
+recoverable in the harness's blocks, and leave the agent's own blocks empty rather than
+decorated.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -599,6 +692,15 @@ the two transcripts; the imitation count is a scan for `tool_use` blocks whose `
 an `evicted` key, and the ground-truth score is the two test files from mastra `faee052a3c`
 copied over the agent's own (`/private/tmp/onepass-eval/score5.sh`).
 
+§18 is reproducible the same way, from run 5 and run 6. Both halves of its count must be
+shape-agnostic or the comparison is rigged: scanning for an `evicted` key finds run 5's 11 and
+run 6's 0 by construction, since the fix deletes that key. Count instead any `tool_use` whose
+input is missing a parameter its tool requires, or carries the stub prefix, or ends a value in an
+ellipsis — and check the total against `InputValidationError` tool results in the same
+transcript, which is the harness's own ground truth and matched exactly (11 and 3) on both runs.
+Dose is the count of distinct `call:` ids across the proxy log's `trip` entries, over `tool_use`
+blocks in the transcript. Ground-truth score: `/private/tmp/onepass-eval/score6.sh`.
+
 §16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
 ad-hoc script:
 
@@ -610,6 +712,8 @@ cd proxy && npm run report -- <transcript> <proxy log>
 |---|---|---|
 | run 2 | `-private-tmp-onepass-eval-mastra-18877/0865d8fc-….jsonl` | `proxy.log.2026-09-02T05-44-05-988Z.jsonl` |
 | run 3 | `-private-tmp-onepass-eval-mastra-toolcall/648d49d5-….jsonl` | `proxy.log.2026-09-02T19-45-10-198Z.jsonl` |
+| run 5 | `-private-tmp-onepass-eval-mastra-run5/ad20b9c0-….jsonl` | `proxy.log.2026-09-03T04-10-52-306Z.jsonl` |
+| run 6 | `-private-tmp-onepass-eval-mastra-run6/81596f1f-….jsonl` | `proxy.log.2026-09-03T05-53-43-658Z.jsonl` |
 
 Median/p90 and the quarter-medians are not reporter output; they sum `input_tokens +
 cache_read_input_tokens + cache_creation_input_tokens` per assistant entry. Validate any such
