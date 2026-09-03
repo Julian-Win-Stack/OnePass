@@ -445,8 +445,7 @@ test("stubs an old large tool_use input, leaves its small result, and keeps both
   const first = JSON.parse(lastRecorded().body.toString("utf8")) as ForwardedCallBody;
   const firstInput = first.messages[0]?.content[0]?.input as Record<string, unknown> | undefined;
   assert.ok(firstInput, "the forwarded call has no input object");
-  assert.equal(firstInput.file_path, "/repo/x.ts");
-  assert.equal(firstInput.evicted, "[onepass: evicted 996 chars]", `unexpected call stub: ${JSON.stringify(firstInput.evicted)}`);
+  assert.deepEqual(firstInput, {}, `unexpected call stub: ${JSON.stringify(firstInput)}`);
   assert.ok(!lastRecorded().body.toString("utf8").includes("x".repeat(937)), "the edit text still reached upstream");
   assert.equal(first.messages[1]?.content[0]?.content, "The file /repo/x.ts has been updated.");
 

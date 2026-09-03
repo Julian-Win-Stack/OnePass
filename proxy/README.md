@@ -26,9 +26,11 @@ and the recall MCP server in `spike/` can fetch any of it back verbatim.
 Stubs are pointers, never summaries — and they name the target once, not three times. A tool
 block stubs to `[onepass: evicted 1,481 chars]` and nothing else: what the block was is
 already beside it in the request. A stubbed `tool_use` keeps its `id`, `name` and `type`, and
-its `input` becomes `{ file_path | command, evicted }` — off the tool's own schema, but still
-the object the API requires, and that kept path or command tells the model which call it was,
-and stands for the result underneath it too. An attached file stubs to `[onepass: evicted
+its `input` becomes `{}` — the smallest object the API will accept, and the only stub shape
+with nothing in it the model can copy. Where its result is stubbed too, that result's stub
+gains the path the call named (`[onepass: evicted 4,000 chars; call evicted, /repo/x.ts]`), so
+the pair still says which file it was; where the result is still live, it names the file
+itself. An attached file stubs to `[onepass: evicted
 attached file, N chars]`, its path left in the `Called the Read tool` reminder next to it,
 which is never evicted. Only a task notification still names its target (`[onepass: evicted
 task notification abc123, N chars; output at /tmp/out/task.log]`), because nothing else in
@@ -36,12 +38,14 @@ the request carries the task id or its output path. How to get any of it back is
 paragraph in the recall tool's own description, where it is prompt-cached and costs nothing
 per turn — so it is not repeated in every stub. Naming the target in every stub is what made
 stubs 12% of the measured peak request (docs/findings.md §15). A result now stubs to about 30
-chars whatever it held; a call costs that plus the path or command it keeps.
+chars whatever it held, and a call to 2 — plus the ~30-char suffix its result's stub gains,
+which is charged to the call whether the result takes it or not.
 
 A stub is only applied when it saves at least `ONEPASS_MIN_SAVED_CHARS`. The saving is
 measured on the finished stub, not the raw segment, so a segment that stubs to no less than
 it holds is left alone and never enters the evicted-id set. A `Read` call is the case that
-needs this: its input is nothing but the path the stub would keep anyway.
+needs this: emptying its input saves almost nothing, and most of that comes straight back as
+the path appended to its result's stub.
 
 Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
 `ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
@@ -129,13 +133,15 @@ Code interactions".
   chunked file sweep outruns the age gate and the client compacts anyway.
 - Malformed or non-JSON bodies are forwarded byte-for-byte untouched. A parse failure never
   fails a request.
-- **The one measured cost.** A stubbed `tool_use` input is deliberately off the tool's own
-  schema (`{ file_path, evicted }`), and the model sometimes imitates that shape in its *next*
-  call — sending `evicted` where `old_string`/`new_string` belong, which the harness rejects
-  with an `InputValidationError`. Measured at 11 occurrences in 588 turns (1.9%, about one
-  wasted turn each) against **zero** in an unproxied control, so the cause is evicting calls at
-  all rather than the stub text (docs/findings.md §17). It is the only way the proxy has been
-  measured to make the agent worse.
+- **Why a stubbed call keeps nothing.** The stub used to be `{ file_path | command, evicted }`,
+  and the model copied it into calls it meant to make — sending `evicted` where
+  `old_string`/`new_string` belong, and truncating its own Bash commands at exactly the 80 chars
+  this file used to truncate at, on commands the session had never run. 11 occurrences in 588
+  turns against **zero** unproxied; the rate tracked the share of the agent's own visible calls
+  that were stubbed, and the identical marker text in 361 tool *results* was copied zero times,
+  because a result is not written in the agent's voice (docs/findings.md §17–18). Emptying the
+  input removes the thing being copied, and an imitated `{}` cannot become a valid call the way
+  a kept `{ command }` could.
 
 ## The judge (off unless `ONEPASS_JUDGE_API_KEY` is set)
 

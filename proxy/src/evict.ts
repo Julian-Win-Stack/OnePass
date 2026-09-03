@@ -55,6 +55,14 @@ export interface EvictionOutcome {
    * too. Bounds a burst of fresh large reads: only the last K turns are ever untouchable.
    */
   pressure: boolean;
+  /**
+   * Chars the stubs took out of the request. Slightly low where a stubbed call's result stayed
+   * live: the call is charged for the suffix that result would have gained (see `stubbedChars`)
+   * and, being live, it never gains it. The in-request size estimates below are measured before
+   * that suffix is applied and so run low by the same amount — single-digit percent against T,
+   * inside the pressure pass's own margin. `estimatedTokensSent` is measured on the final body
+   * and carries no such lag.
+   */
   charsRemoved: number;
   newlyEvictedCharsRemoved: number;
   estimatedTokensBefore: number;
@@ -62,7 +70,6 @@ export interface EvictionOutcome {
 }
 
 export const STUB_PREFIX = "[onepass: evicted";
-const COMMAND_TRUNCATE_CHARS = 80;
 
 // Wire formats measured from real Claude Code requests (docs/findings.md §13). Prefix-matched
 // exactly: any drift in the harness makes the proxy skip the segment, never mis-evict it.
@@ -135,27 +142,55 @@ function sanitizeForStub(text: string): string {
 // Deterministic on purpose: the same request must always produce the same bytes, or the
 // stubs themselves would break the prompt-cache prefix they exist to protect.
 //
-// The stub names nothing: what a tool block was is already in the request beside it. A result
-// is preceded by its own tool_use, which keeps its name and its path or command whether it is
-// live or stubbed, and how to get any of it back is one sentence in the recall tool's
-// description (spike/src/server.ts). Naming the target made the stubs the largest thing in the
-// request they exist to shrink: 12% of the measured peak (docs/findings.md §15).
+// The stub names nothing on its own: the tool_use beside it still carries the call's `name`,
+// and where that call was stubbed too its path is appended here by
+// `nameEvictedCallsInResultStubs` — once, in the one block of the pair the model never writes.
+// How to get any of it back is one sentence in the recall tool's description
+// (spike/src/server.ts). Naming the target in every stub is what made stubs the largest thing
+// in the request they exist to shrink: 12% of the measured peak (docs/findings.md §15).
 function buildEvictedStub(originalChars: number): string {
   return `${STUB_PREFIX} ${formatThousands(originalChars)} chars]`;
 }
 
-// The API rejects a tool_use whose `input` is not an object, so the stub is an object too.
-// The path or command stays so the model can still tell which file or command the call was.
-function buildToolUseStubInput(input: Record<string, unknown>, stubText: string): Record<string, unknown> {
-  const filePath =
-    typeof input.file_path === "string" ? input.file_path : typeof input.path === "string" ? input.path : undefined;
-  if (filePath !== undefined) return { file_path: filePath, evicted: stubText };
-  if (typeof input.command !== "string") return { evicted: stubText };
-  const command =
-    input.command.length > COMMAND_TRUNCATE_CHARS
-      ? `${input.command.slice(0, COMMAND_TRUNCATE_CHARS)}…`
-      : input.command;
-  return { command, evicted: stubText };
+// A stubbed call keeps nothing at all: the API rejects a tool_use whose `input` is not an
+// object, so `{}` is the smallest legal stub.
+//
+// The shape this replaced was `{ file_path | command, evicted }`, and the model copied it into
+// calls it meant to make — every Bash imitation truncating its own command at exactly the 80
+// chars this file used to truncate at, on commands the session had never run. Whatever sits in
+// this slot is written in the agent's own voice, which is why it gets copied; the identical
+// marker text in 361 tool *results* was copied zero times (docs/findings.md §18).
+//
+// Emptiness is copied too — run 6 imitated `{}` three times in 557 turns, at a higher share of
+// calls stubbed than run 5's 11. What it cannot do is become a valid call: every tool the agent
+// uses has a required parameter, so an imitated `{}` is rejected on the spot and costs one turn.
+// That is the property the old shape lacked, where a stubbed Bash call kept a truncated
+// `{ command }` that would have run.
+const EMPTY_CALL_INPUT_CHARS = measureContentChars({});
+
+/** File path from a call's input, when it has one. Moves to the paired result's stub. */
+function callPathFrom(input: Record<string, unknown>): string | undefined {
+  if (typeof input.file_path === "string") return input.file_path;
+  return typeof input.path === "string" ? input.path : undefined;
+}
+
+// Appended to the stub of a result whose own call was stubbed too, so the pair still says which
+// file it was. Safe here and not in the call: the model never writes a tool_result block.
+// A command is deliberately not carried over — a truncated one is no better a recall key than
+// the file paths and error text already in the request, and re-teaching truncation is the
+// failure this stub exists to avoid.
+function buildEvictedCallSuffix(callPath: string | undefined): string {
+  return callPath === undefined ? "; call evicted" : `; call evicted, ${callPath}`;
+}
+
+/**
+ * Chars a stubbed call costs: its emptied input, plus the suffix its result's stub gains for it.
+ * The size floor and the judge's own gate both read this, so neither can accept a call the other
+ * would refuse. Charged whole even when the result stays live and never gains the suffix, which
+ * only ever makes the floor stricter.
+ */
+function evictedCallChars(callPath: string | undefined): number {
+  return EMPTY_CALL_INPUT_CHARS + buildEvictedCallSuffix(callPath).length;
 }
 
 // Names no path either: the "Called the Read tool with the following input" marker beside the
@@ -206,7 +241,7 @@ function buildTaskNotificationStub(text: string, originalChars: number): string 
   return `${STUB_PREFIX} task notification${idPart}, ${formatThousands(originalChars)} chars${outputPart}]`;
 }
 
-interface Segment {
+interface SegmentBase {
   /**
    * tool_use_id for tool results; "call:<tool_use_id>" for tool_use inputs (a distinct id, so
    * stubbing a big call never drags its small result along); "sha1:<hex>" for text segments.
@@ -218,14 +253,20 @@ interface Segment {
   contentChars: number;
   assistantTurnsAfter: number;
   alreadyStubShaped: boolean;
-  stubText: string;
-  /** Replacement `input` object for tool_use segments; the other kinds stub with `stubText`. */
-  stubInput?: Record<string, unknown>;
 }
 
-/** Chars the segment costs once stubbed — the replacement input for calls, the stub string otherwise. */
+/**
+ * A call stubs to an empty input and carries no stub string; the other two stub to one. The kind
+ * is explicit so `applyStubs` dispatches on it rather than on the shape of a field, and so a call
+ * cannot carry a `stubText` that renders nowhere.
+ */
+type Segment =
+  | (SegmentBase & { kind: "call"; toolUseId: string; callPath: string | undefined })
+  | (SegmentBase & { kind: "tool_result" | "text"; stubText: string });
+
+/** Chars the segment costs once stubbed. */
 function stubbedChars(segment: Segment): number {
-  return segment.stubInput === undefined ? segment.stubText.length : measureContentChars(segment.stubInput);
+  return segment.kind === "call" ? evictedCallChars(segment.callPath) : segment.stubText.length;
 }
 
 /** A block about to be stubbed, in whichever shape the size of its stub depends on. */
@@ -243,10 +284,9 @@ export function stubbedCharsFor(target: StubTarget): number {
     return buildUserTextStub(target.decision, target.text.length, recallQueryFromText(target.text)).length;
   }
   if (target.kind === "tool_result") return buildEvictedStub(measureContentChars(target.content)).length;
-  const inputChars = measureContentChars(target.input);
   // A non-object input is passed through untouched, so stubbing it would save nothing.
-  if (!isRecord(target.input)) return inputChars;
-  return measureContentChars(buildToolUseStubInput(target.input, buildEvictedStub(inputChars)));
+  if (!isRecord(target.input)) return measureContentChars(target.input);
+  return evictedCallChars(callPathFrom(target.input));
 }
 
 /** Segment id for a text block: a content hash, so it re-matches when the client resends it. */
@@ -281,6 +321,7 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
       stubText = buildUserTextStub(decision, text.length, recallQueryFromText(text));
     }
     segments.push({
+      kind: "text",
       id,
       messageIndex,
       blockIndex,
@@ -299,17 +340,18 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
         if (!isRecord(block) || block.type !== "tool_use" || typeof block.id !== "string") return;
         const input = block.input;
         if (!isRecord(input)) return;
-        const contentChars = measureContentChars(input);
-        const stubText = buildEvictedStub(contentChars);
         segments.push({
+          kind: "call",
           id: callSegmentId(block.id),
+          toolUseId: block.id,
           messageIndex,
           blockIndex,
-          contentChars,
+          contentChars: measureContentChars(input),
           assistantTurnsAfter: assistantTurnsAfterIndex[messageIndex] ?? 0,
-          alreadyStubShaped: typeof input.evicted === "string" && input.evicted.startsWith(STUB_PREFIX),
-          stubText,
-          stubInput: buildToolUseStubInput(input, stubText),
+          // An empty input is the stub. A real call with no arguments reads the same, and gets
+          // the same treatment either way: its stub would save nothing, so it is never a target.
+          alreadyStubShaped: Object.keys(input).length === 0,
+          callPath: callPathFrom(input),
         });
       });
       return;
@@ -326,6 +368,7 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
       if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
         const contentChars = measureContentChars(block.content);
         segments.push({
+          kind: "tool_result",
           id: block.tool_use_id,
           messageIndex,
           blockIndex,
@@ -364,8 +407,9 @@ function applyStubs(messages: unknown[], targets: Segment[]): StubApplication {
     const forMessage = targetsByMessage.get(messageIndex);
     if (forMessage === undefined || !isRecord(message)) return message;
 
+    // Only a text segment is ever a message's whole string content.
     const wholeString = forMessage.find((target) => target.blockIndex === null);
-    if (wholeString !== undefined && typeof message.content === "string") {
+    if (wholeString !== undefined && wholeString.kind !== "call" && typeof message.content === "string") {
       charsRemoved += wholeString.contentChars - stubbedChars(wholeString);
       stubbedIds.push(wholeString.id);
       return { ...message, content: wholeString.stubText };
@@ -381,15 +425,44 @@ function applyStubs(messages: unknown[], targets: Segment[]): StubApplication {
       if (target === undefined || !isRecord(block)) return block;
       stubbedIds.push(target.id);
       charsRemoved += target.contentChars - stubbedChars(target);
-      // tool_result blocks carry the stub in `content`; tool_use blocks in a replacement `input`
-      // object; text blocks in `text`.
-      if (target.stubInput !== undefined) return { ...block, input: target.stubInput };
-      return block.type === "tool_result" ? { ...block, content: target.stubText } : { ...block, text: target.stubText };
+      // A call stubs to a fresh empty input — never a shared one, since a body that stubs N
+      // calls to one aliased object is one stray write away from losing byte-determinism.
+      if (target.kind === "call") return { ...block, input: {} };
+      return target.kind === "tool_result"
+        ? { ...block, content: target.stubText }
+        : { ...block, text: target.stubText };
     });
     return { ...message, content: nextContent };
   });
 
   return { messages: nextMessages, charsRemoved, stubbedIds };
+}
+
+/**
+ * Moves each stubbed call's path into the stub of its own result. Runs after the passes because
+ * only then is it known which calls were stubbed. Its cost is already charged to the call by
+ * `stubbedChars`, so there is nothing here to account for.
+ */
+function nameEvictedCallsInResultStubs(
+  messages: unknown[],
+  /** tool_use_id -> suffix, for pairs where this pass stubbed the call *and* its result. */
+  suffixByToolUseId: ReadonlyMap<string, string>,
+): unknown[] {
+  if (suffixByToolUseId.size === 0) return messages;
+  return messages.map((message) => {
+    if (!isRecord(message) || message.role !== "user" || !Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (!isRecord(block) || block.type !== "tool_result" || typeof block.tool_use_id !== "string") return block;
+      const suffix = suffixByToolUseId.get(block.tool_use_id);
+      // An entry exists only where this pass stubbed this very result, so the content is a stub
+      // it just wrote and ends in the bracket being reopened. A live result has no entry.
+      if (suffix === undefined || typeof block.content !== "string") return block;
+      changed = true;
+      return { ...block, content: `${block.content.slice(0, -1)}${suffix}]` };
+    });
+    return changed ? { ...message, content } : message;
+  });
 }
 
 export function evictContextSegments(
@@ -417,7 +490,8 @@ export function evictContextSegments(
   const messages = body.messages;
   // A stub that saves too little is not worth the trip, and one no smaller than what it
   // replaces would grow the request — with monotonic eviction re-paying that on every request
-  // after. A Read call is the case: its input is nothing but the path the stub keeps anyway.
+  // after. A Read call is the case: emptying its input saves almost nothing, and most of that
+  // comes back as the path appended to its result's stub.
   // Dropping the segment here keeps its id out of the evicted set entirely.
   const candidates = collectSegments(messages, judgeDecisionById).filter(
     (segment) =>
@@ -474,7 +548,17 @@ export function evictContextSegments(
   const stubbedIds = [...afterExisting.stubbedIds, ...newlyEvictedIds];
   if (stubbedIds.length === 0) return { ...passthrough, tripped };
 
-  const finalBody = { ...body, messages: afterPressure.messages };
+  // A pair earns a suffix only when both halves were stubbed on this request: a live result
+  // still names its own file, and a live call still carries its own input.
+  const stubbed = new Set(stubbedIds);
+  const suffixByToolUseId = new Map<string, string>();
+  for (const segment of candidates) {
+    if (segment.kind !== "call" || !stubbed.has(segment.id) || !stubbed.has(segment.toolUseId)) continue;
+    suffixByToolUseId.set(segment.toolUseId, buildEvictedCallSuffix(segment.callPath));
+  }
+  const namedMessages = nameEvictedCallsInResultStubs(afterPressure.messages, suffixByToolUseId);
+
+  const finalBody = { ...body, messages: namedMessages };
   return {
     body: finalBody,
     bodyChanged: true,

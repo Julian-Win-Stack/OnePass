@@ -86,9 +86,10 @@ non-`api.anthropic.com` host (proxy/README.md). Not published to npm. Proxy logs
 The judge is opt-in per proxy run: set `ONEPASS_JUDGE_API_KEY` (the user's own API key —
 never `ANTHROPIC_API_KEY`, which would bill Claude Code to it) in the proxy's terminal, and
 optionally `ONEPASS_JUDGE_MODEL` (default `claude-sonnet-5`). Judge calls cost money on that
-key. The key lives in `~/.zshrc` as an `export ONEPASS_JUDGE_API_KEY=` line, so an interactive
-terminal already has it; a non-interactive shell does not, and picks it up with
-`eval "$(grep '^export ONEPASS_JUDGE_API_KEY=' ~/.zshrc)"`. Never print or copy the value.
+key. No key is configured on this machine — the `~/.zshrc` export was removed, so the judge is off
+everywhere until the operator exports one deliberately in the proxy's terminal. Never print or
+copy the value. On §17's evidence (1.1% of the rules' eviction) leaving it off costs almost
+nothing.
 It may evict user text, but only the block it names and only down to what it leaves
 behind — a quote it copies verbatim, a one-line note in its own words (attributed in the stub,
 capped at 200 chars), or both; naming a block with neither leaves it untouched. Harness-injected

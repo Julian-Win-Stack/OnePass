@@ -98,8 +98,9 @@ export interface RenderedMessage {
 /** A block the rules have already replaced with a stub. Tagging it would invite a wasted pick. */
 function isAlreadyStubbed(block: Record<string, unknown>): boolean {
   if (block.type === "tool_use") {
-    const input = block.input;
-    return isRecord(input) && typeof input.evicted === "string" && input.evicted.startsWith(STUB_PREFIX);
+    // A stubbed call's input is emptied, so emptiness is the tell. A real call with no
+    // arguments reads the same and is worth no pick either: stubbing it would save nothing.
+    return isRecord(block.input) && Object.keys(block.input).length === 0;
   }
   return typeof block.content === "string" && block.content.startsWith(STUB_PREFIX);
 }
