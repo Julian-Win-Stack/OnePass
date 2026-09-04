@@ -40,6 +40,12 @@ see proxy/README.md).
 docs/findings.md   baseline measurements — the evidence base
 docs/agents/       per-repo config the mattpocock engineering skills read
                    (issue tracker, triage labels, domain-doc layout)
+eval/              the A/B rig behind findings §§15-18: run.sh (one arm, proxied or control),
+                   score.sh (scores it on the real human fix's tests), analyze.mjs (stub-shape
+                   imitations, redundant reads, recall calls), and the task plan the agent
+                   implements. Needs a mastra clone at $MASTRA_REPO; run artifacts land in
+                   $ONEPASS_EVAL_DIR (default /tmp/onepass-eval), never in the repo.
+                   See eval/README.md.
 spike/             src/ is the recall MCP server — live, not throwaway: .mcp.json registers it
                    in every session, and it is the half that makes eviction safe. Its
                    recall_search description carries the legend for the proxy's stubs.
@@ -95,6 +101,10 @@ behind — a quote it copies verbatim, a one-line note in its own words (attribu
 capped at 200 chars), or both; naming a block with neither leaves it untouched. Harness-injected
 user text and already-stubbed blocks are never offered to it. Assistant text and thinking are
 never touched.
+
+In `eval/`: `./run.sh <arm> [--no-proxy]` runs one A/B arm, `./score.sh <arm>` scores it against
+the human fix's tests, `node analyze.mjs <transcript>[=<label>]` counts stub-shape imitations and
+redundant reads. Needs `MASTRA_REPO` exported. See [eval/README.md](eval/README.md).
 
 In `spike/`: `npm run build` compiles the recall MCP server. The retrieval harness has its own
 run instructions in [spike/harness/README.md](spike/harness/README.md).

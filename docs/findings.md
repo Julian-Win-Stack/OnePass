@@ -677,8 +677,11 @@ decorated.
 
 ## Reproducing
 
-Scripts are ad-hoc. Each figure above was produced by walking the `.jsonl` files and grouping
-message content blocks; `compactMetadata` supplies §2 and the recursion test in §1.
+Scripts are ad-hoc for §§1-8. The A/B rig behind §§15-18 is committed at
+[eval/](../eval/) — `run.sh` (one arm), `score.sh` (ground truth), `analyze.mjs` (transcript
+scan) and the task plan; its run artifacts stay under `/private/tmp/onepass-eval`. Each figure
+in §§1-8 was produced by walking the `.jsonl` files and grouping message content blocks;
+`compactMetadata` supplies §2 and the recursion test in §1.
 
 §§9-10 are reproducible: see [spike/harness/README.md](../spike/harness/README.md).
 
@@ -689,8 +692,9 @@ peak (dedupe by `message.id`).
 
 §17 is reproducible the same way, from `/private/tmp/onepass-eval/run{4,5}.report.txt` and
 the two transcripts; the imitation count is a scan for `tool_use` blocks whose `input` carries
-an `evicted` key, and the ground-truth score is the two test files from mastra `faee052a3c`
-copied over the agent's own (`/private/tmp/onepass-eval/score5.sh`).
+an `evicted` key ([eval/analyze.mjs](../eval/analyze.mjs)), and the ground-truth score is the
+two test files from mastra `faee052a3c` copied over the agent's own
+([eval/score.sh](../eval/score.sh)).
 
 §18 is reproducible the same way, from run 5 and run 6. Both halves of its count must be
 shape-agnostic or the comparison is rigged: scanning for an `evicted` key finds run 5's 11 and
@@ -699,7 +703,7 @@ input is missing a parameter its tool requires, or carries the stub prefix, or e
 ellipsis — and check the total against `InputValidationError` tool results in the same
 transcript, which is the harness's own ground truth and matched exactly (11 and 3) on both runs.
 Dose is the count of distinct `call:` ids across the proxy log's `trip` entries, over `tool_use`
-blocks in the transcript. Ground-truth score: `/private/tmp/onepass-eval/score6.sh`.
+blocks in the transcript. Ground-truth score: [eval/score.sh](../eval/score.sh).
 
 §16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
 ad-hoc script:
