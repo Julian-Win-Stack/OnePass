@@ -88,22 +88,21 @@ is shown but never decides.
 35. As the proxy's author, I want the eval to refuse a second run while the bar is unwritten, so that the rule is enforced and not remembered.
 36. As the proxy's author, I want a quick mode while fixing and a full mode for a published number, so that iteration is cheap and the final number is solid.
 37. As the proxy's author, I want the control samples and control tails recorded once and reused, so that a build under test pays only for its own arm.
-38. As the proxy's author, I want a replay mode that pushes the stored prefixes through the proxy with no model calls and diffs the eviction outcome against the previous build, so that most fixes are checked in seconds for free.
-39. As the proxy's author, I want a dry run that prints the case list, prefix sizes and estimated spend from the baseline's per-turn cost without forking anything, so that I can see the bill before paying it.
-40. As the proxy's author, I want the eval to never write to a transcript in my projects directory, so that a bug cannot corrupt the sessions it reads.
-41. As a stranger reading the result, I want one table with control, previous build and current build, so that I can judge the claim without reading the code.
-42. As a stranger reading the result, I want the grader's agreement with hand labels stated beside the result, so that I know how much to trust the grader.
-43. As a stranger reading the result, I want the approximations named, so that I know the planning forks ran under today's Claude Code, the repo commit per case is approximate, and the planning cases stop at the first compaction.
+38. As the proxy's author, I want a replay mode that pushes the stored prefixes through the proxy with no model calls, listing each case and its prefix size as it goes, and diffs the eviction outcome against the previous build, so that most fixes are checked in seconds for free and I can see what a scored run would cover before starting one.
+39. As the proxy's author, I want the eval to never write to a transcript in my projects directory, so that a bug cannot corrupt the sessions it reads.
+40. As a stranger reading the result, I want one table with control, previous build and current build, so that I can judge the claim without reading the code.
+41. As a stranger reading the result, I want the grader's agreement with hand labels stated beside the result, so that I know how much to trust the grader.
+42. As a stranger reading the result, I want the approximations named, so that I know the planning forks ran under today's Claude Code, the repo commit per case is approximate, and the planning cases stop at the first compaction.
 
 ## Implementation Decisions
 
 ### Shape and location
 
 - The eval becomes a package beside the proxy with the proxy's conventions: TypeScript, compiled before running, tests under Node's built-in runner. The current shell scripts and analyzer are folded into it.
-- One entry command with three modes, replay, quick and full, plus a dry-run flag. Replay makes no model calls: it builds a request body from each case's message list with a placeholder system prompt, since eviction acts on messages and not on the system prompt, runs it through a fresh proxy child against the eval's fake upstream, and writes a diff of trips, segments evicted, stub text, body sizes and rebuild count against the previous build; it is not scored and the bar rule ignores it. Quick is three proxied tails and every second eligible planning case; full is five proxied tails and every eligible case. Quick and full are run once per behavioural change, replay after every fix.
+- One entry command with three modes, replay, quick and full. Replay makes no model calls: it builds a request body from each case's message list with a placeholder system prompt, since eviction acts on messages and not on the system prompt, runs it through a fresh proxy child against the eval's fake upstream, and writes a diff of trips, segments evicted, stub text, body sizes and rebuild count against the previous build, listing each case and its prefix size as it goes; it is not scored and the bar rule ignores it. Quick is three proxied tails and every second eligible planning case; full is five proxied tails and every eligible case. Quick and full are run once per behavioural change, replay after every fix.
 - The command builds and starts the proxy under test itself, one process per planning case and one per proxied tail, each on an ephemeral port with the judge unset. The globally running proxy is never used. Restarting per case is what makes each replay fresh.
 - All session content lives under one corpus directory outside the repo, set by an environment variable: transcript copies, replay-mode bodies, fork outputs, grader outputs, hand labels and case and tail worktrees. Only the scripts, price table, calibration summary and result documents are written inside the repo.
-- Every run is labelled by the proxy's git short SHA plus an optional tag. Results are one JSON document per run plus a rendered Markdown table. The report takes the current run and the label of the previous run to compare against.
+- Every run is labelled by the proxy's git short SHA and the time it started, so two runs of the same build never collide. Results are one JSON document per run plus a rendered Markdown table. The report takes the current run and the label of the previous run to compare against.
 - Control is a stored baseline in the corpus directory, keyed by model, effort and Claude Code version. Control planning samples and control tails are recorded on the first run and reused by every later run; the eval re-records them only when the key changes, and the report names the baseline it used.
 
 ### Planning corpus
@@ -168,7 +167,7 @@ is shown but never decides.
 A good test drives the eval from the outside and reads only what a user of it would read: the result document and the rendered table. Tests do not inspect internal state.
 
 - One seam: the HTTP boundary to the model API. A fake upstream, as in the proxy's existing integration test, serves canned count-tokens answers and canned grader verdicts, and stands in for the model behind the replay mode's proxy children. The eval package is run against it with a small synthetic transcript fixture in a temporary corpus directory.
-- Through that seam the tests cover case extraction, the transcript copy placement, the replay diff through a fresh proxy child, grading with random pair order and the Unknown verdict, calibration agreement, cost and time accounting from recorded SDK result messages, the noise floor, the confidence intervals on known inputs, the previous-build comparison, the dry run, baseline reuse and re-recording when the key changes, and the refusal to run without the bar file.
+- Through that seam the tests cover case extraction, the transcript copy placement, the replay diff through a fresh proxy child, grading with random pair order and the Unknown verdict, calibration agreement, cost and time accounting from recorded SDK result messages, the noise floor, the confidence intervals on known inputs, the previous-build comparison, baseline reuse and re-recording when the key changes, and the refusal to run without the bar file.
 - Snapshot creation and fork-point selection are tested against a throwaway git repository and a fixture transcript, asserting the worktree and index are unchanged and the source transcript is byte-identical afterwards.
 - Anything that forks a real session, planning forks and tails alike, needs a live `claude` and is covered by a documented smoke step, not by the test suite.
 - Prior art: the proxy's integration test for the fake upstream, its evict and speed tests for pure computation.
@@ -189,7 +188,7 @@ A good test drives the eval from the outside and reads only what a user of it wo
 
 Still proposed, not yet in decision.md:
 
-- How many planning cases. The chp99 transcript has 21 typed turns that qualify: before the first compaction, past 110k tokens, answered in text. Full mode runs all 21. Quick mode runs every second one, about 10. For each case Claude Code answers the turn three times, once through the proxy and twice without, and each answer may include tool calls before the text. The dry run lists the cases and their sizes before anything is spent.
+- How many planning cases. The chp99 transcript has 21 typed turns that qualify: before the first compaction, past 110k tokens, answered in text. Full mode runs all 21. Quick mode runs every second one, about 10. For each case Claude Code answers the turn three times, once through the proxy and twice without, and each answer may include tool calls before the text. Replay lists the cases and their sizes before anything is spent.
 - What the first run costs is not known in advance. Nothing in the findings records Opus cost for a full run, and a planning turn or a tail costs whatever tool calls the model decides to make. The baseline run, which pays for the control samples and control tails once, is where that number is first measured, and every run after it reports the estimate up front.
 
 Known approximations to state in every report: planning forks run under today's Claude Code, not the version that recorded the session; the planning repo commit per case is the nearest earlier commit; planning measures contexts of 110k to 160k only, and deeper contexts are measured by the tails.
