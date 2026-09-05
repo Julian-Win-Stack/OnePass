@@ -27,8 +27,9 @@ proposing a context strategy; several obvious approaches are already ruled out t
 
 ## Working a ticket
 
-One branch per issue off `main` — `ticket/<NN>-<slug>`, never a long-lived branch. Commit there,
-push, open a PR. The PR diff is the review surface; merging it unblocks what that issue blocks.
+One worktree per issue, branched off `main` as `ticket/<NN>-<slug>` — never a long-lived branch.
+Commit there, push, open a PR. The PR diff is the review surface; merging it unblocks what that
+issue blocks.
 
 ## Agent skills
 

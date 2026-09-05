@@ -6,3 +6,4 @@ proxy/proxy.log.jsonl
 .claude/settings.local.json
 .env
 eval/smoke/dist/
+.claude/worktrees/
