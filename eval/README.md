@@ -14,9 +14,13 @@ instances behind a load balancer both replied to the same Slack message. The fix
 storage, shared across instances, in core plus five database backends.
 
 It is a good eval task for three reasons: it is large enough to blow past a 200k window, it
-touches many files, and **a real human fix exists** at mastra commit `faee052a3c`. That fix's
-two test files are the ground truth. The agent never sees them, so it cannot write tests that
-flatter its own implementation.
+touches many files, and **a human-written fix with its own tests exists** at mastra commit
+`faee052a3c`. That commit is by this repo's author, on
+[mastra-ai/mastra#22516](https://github.com/mastra-ai/mastra/pull/22516), which is open and
+unmerged as of 2026-09-04; it is not a maintainer's fix. Its two test files are the ground
+truth. They were written before any eval run and the agent never sees them, so it cannot write
+tests that flatter its own implementation. If the PR merges with changes to those files, re-pin
+the ground truth to the merged commit.
 
 - Base commit for every arm: `a14c2436bc`
 - The plan the agent implements: [task/witty-singing-puzzle.md](task/witty-singing-puzzle.md)

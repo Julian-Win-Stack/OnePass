@@ -24,3 +24,17 @@ Treat it as read-only — never write to or mutate a transcript.
 
 Measured properties of this data live in [docs/findings.md](docs/findings.md). Read it before
 proposing a context strategy; several obvious approaches are already ruled out there.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on Julian-Win-Stack/OnePass, via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the root, ADRs under `docs/adr/`. See `docs/agents/domain.md`.
