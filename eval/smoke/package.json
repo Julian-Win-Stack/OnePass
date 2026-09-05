@@ -1,0 +1,23 @@
+{
+  "name": "onepass-eval-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Smoke checks for the two mechanisms the Onepass eval is built on: forking a stored Claude Code session, and snapshotting a worktree invisibly.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
+    "smoke": "npm run build && node dist/smoke.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.261"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
