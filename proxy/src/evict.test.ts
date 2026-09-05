@@ -478,7 +478,7 @@ function inputAt(body: unknown, messageIndex: number, blockIndex = 0): Record<st
   return block.input as Record<string, unknown>;
 }
 
-test("stubs an old large tool_use input with the exact deterministic stub text", () => {
+test("an old large tool_use input is emptied, leaving the model nothing to copy", () => {
   const body = requestBody([
     assistantToolUse("toolu_edit", "Edit", editInput()),
     userToolResult("toolu_edit", "The file /repo/src/x.ts has been updated."),
@@ -488,19 +488,63 @@ test("stubs an old large tool_use input with the exact deterministic stub text",
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
 
   assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit"]);
-  assert.deepEqual(inputAt(outcome.body, 0), {
-    file_path: "/repo/src/x.ts",
-    evicted: "[onepass: evicted 1,000 chars]",
-  });
+  assert.deepEqual(inputAt(outcome.body, 0), {});
+  // The result stayed live, so it names the file itself and gains no suffix.
+  assert.equal(blockAt(outcome.body, 1).content, "The file /repo/src/x.ts has been updated.");
 
   // Everything the API validates the block by must survive the input swap.
   const block = blockAt(outcome.body, 0) as { type?: unknown; id?: unknown; name?: unknown };
   assert.deepEqual([block.type, block.id, block.name], ["tool_use", "toolu_edit", "Edit"]);
 });
 
+// The emptied call carries no path, so the pair would forget which file it was unless the
+// result's stub says. Only a path is carried over, never a command.
+for (const { name, call, expected } of [
+  {
+    name: "names the file where the call had one",
+    call: assistantToolUse("toolu_pair", "Edit", editInput()),
+    expected: "[onepass: evicted 4,000 chars; call evicted, /repo/src/x.ts]",
+  },
+  {
+    name: "says only that the call went, where it had no path",
+    call: assistantToolUse("toolu_pair", "Bash", { command: `echo ${"z".repeat(600)}` }),
+    expected: "[onepass: evicted 4,000 chars; call evicted]",
+  },
+]) {
+  test(`the stub of a result whose call was stubbed too ${name}`, () => {
+    const body = requestBody([call, userToolResult("toolu_pair", "R".repeat(4000)), ...filler(3)]);
+    const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+    assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_pair", "toolu_pair"]);
+    assert.deepEqual(inputAt(outcome.body, 0), {});
+    assert.equal(blockAt(outcome.body, 1).content, expected);
+  });
+}
+
+test("a result stub carrying its call's path is never given a second one", () => {
+  const build = (): Record<string, unknown> =>
+    requestBody([
+      assistantToolUse("toolu_edit", "Edit", editInput()),
+      userToolResult("toolu_edit", "R".repeat(4000)),
+      ...filler(3),
+    ]);
+  const suffixed = "[onepass: evicted 4,000 chars; call evicted, /repo/src/x.ts]";
+  const ids = new Set(["call:toolu_edit", "toolu_edit"]);
+
+  // The client resends originals, so the same conversation must stub to the same bytes every
+  // request — a second suffix would move the prefix these stubs exist to keep cacheable.
+  const first = evictContextSegments(build(), ids, NEVER_TRIP);
+  assert.equal(blockAt(first.body, 1).content, suffixed);
+  assert.deepEqual(evictContextSegments(build(), ids, NEVER_TRIP).body, first.body);
+
+  // And a body that already carries the stubs is recognised and left entirely alone.
+  const fedBack = evictContextSegments(first.body, ids, NEVER_TRIP);
+  assert.equal(fedBack.bodyChanged, false);
+  assert.deepEqual(fedBack.stubbedIds, []);
+});
+
 test("a call whose stub would cost more than its input is left alone, on this request and the next", () => {
-  // A Read call is the case the guard exists for: the input is nothing but the path the stub
-  // would keep anyway, so the stub costs 61 chars against the 21 it replaces.
+  // A Read call is the case the guard exists for: emptying a 21-char input saves 19 chars,
+  // and 14 of those come straight back as the path appended to its result's stub.
   const build = (): Record<string, unknown> =>
     requestBody([
       assistantToolUse("toolu_read", "Read", { file_path: "/a.ts" }),
@@ -554,9 +598,9 @@ test("calls inside the last K assistant turns are protected regardless of size",
   assert.deepEqual(inputAt(outcome.body, 5), editInput());
 });
 
-test("an already-stub-shaped call input is left alone rather than re-stubbed", () => {
-  const stubbed = { file_path: "/repo/src/x.ts", evicted: `${STUB_PREFIX} 1,000 chars]` };
-  const body = requestBody([assistantToolUse("toolu_edit", "Edit", stubbed), ...filler(3)]);
+test("a call whose input is already empty is never stubbed again", () => {
+  // Both guards catch this: it is stub-shaped, and its stub would save nothing anyway.
+  const body = requestBody([assistantToolUse("toolu_edit", "Edit", {}), ...filler(3)]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
   assert.equal(outcome.bodyChanged, false);
   assert.deepEqual(outcome.newlyEvictedIds, []);
@@ -572,26 +616,28 @@ test("a call whose input is not an object is passed through, however large", () 
   assert.equal((blockAt(outcome.body, 0) as { input?: unknown }).input, "s".repeat(9000));
 });
 
-test("a stubbed Bash call keeps its command, truncated to 80 chars", () => {
+test("a stubbed Bash call keeps no command, whole or truncated", () => {
+  // The truncated command was the copied artifact: every Bash imitation reproduced this exact
+  // 80-char cut on a command the session had never run (docs/findings.md §18).
   const longCommand = `grep -rn needle ${"z".repeat(600)}`;
   const body = requestBody([
     assistantToolUse("toolu_bash", "Bash", { command: longCommand, description: "search" }),
     ...filler(3),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  const input = inputAt(outcome.body, 0);
-  assert.equal(input.command, `${longCommand.slice(0, 80)}…`);
-  assert.equal(input.evicted, "[onepass: evicted 653 chars]");
-  assert.ok(!JSON.stringify(outcome.body).includes(longCommand));
+  assert.deepEqual(inputAt(outcome.body, 0), {});
+  const sent = JSON.stringify(outcome.body);
+  assert.ok(!sent.includes(longCommand.slice(0, 80)), "a prefix of the command still reached upstream");
+  assert.ok(!sent.includes("…"), "the truncation the model was copying still reached upstream");
 });
 
-test("a call with neither path nor command keeps nothing but the stub in its input", () => {
+test("a call with neither path nor command is emptied like any other", () => {
   const body = requestBody([
     assistantToolUse("toolu_web", "WebFetch", { url: "https://example.com", prompt: "p".repeat(500) }),
     ...filler(3),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
-  assert.deepEqual(inputAt(outcome.body, 0), { evicted: "[onepass: evicted 541 chars]" });
+  assert.deepEqual(inputAt(outcome.body, 0), {});
 });
 
 test("a call and its result are both charged to charsRemoved, each by its own size", () => {
@@ -603,9 +649,11 @@ test("a call and its result are both charged to charsRemoved, each by its own si
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
   assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_edit", "toolu_edit"]);
 
-  // A call is charged the JSON length of its replacement input (1,000 → 73), a result the
-  // length of its stub string (4,000 → 30). Both stubs are pinned byte-exact above.
-  assert.equal(outcome.charsRemoved, 1000 - 73 + (4000 - 30));
+  // A call is charged its emptied input plus the suffix its result's stub gains for it
+  // (1,000 → 2 + 30), a result the length of its own stub (4,000 → 30). Both are pinned
+  // byte-exact above, and the two charges together are exactly what left the request.
+  assert.equal(outcome.charsRemoved, 1000 - 32 + (4000 - 30));
+  assert.equal(measureContentChars(blockAt(outcome.body, 1).content), 60);
 });
 
 // A judge-selected user block: 3,000 chars, an instruction followed by a paste.

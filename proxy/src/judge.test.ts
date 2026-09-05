@@ -84,7 +84,7 @@ test("offers no eviction id for harness-injected text or for blocks already stub
         { type: "text", text: EXISTING_STUB },
       ],
     },
-    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { evicted: EXISTING_STUB } }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: EXISTING_STUB }] },
     { role: "assistant", content: [{ type: "text", text: "carrying on" }] },
   ];

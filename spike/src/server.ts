@@ -141,7 +141,8 @@ server.registerTool(
       "So throw several words at it rather than guessing one exact phrase. " +
       "Returns matching entries with a `ref` — pass that ref to recall_get for the full content. " +
       "Blocks marked `[onepass: evicted N chars]` were removed from your context by the Onepass proxy; the original is on disk and this tool finds it. " +
-      "For a tool call or result, search the file path or command kept in the call. " +
+      "A tool call whose `input` is an empty object was evicted the same way — its arguments are gone. " +
+      "To find one, search the path in the `call evicted, <path>` note on its result's stub, or the file names and error text around it. " +
       "For an attached file, search the path from the `Called the Read tool` line beside it. " +
       "For a task notification, search the task id. " +
       "When you need the current state rather than what it was, read the file or re-run the command instead.",
