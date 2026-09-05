@@ -25,6 +25,11 @@ Treat it as read-only — never write to or mutate a transcript.
 Measured properties of this data live in [docs/findings.md](docs/findings.md). Read it before
 proposing a context strategy; several obvious approaches are already ruled out there.
 
+## Working a ticket
+
+One branch per issue off `main` — `ticket/<NN>-<slug>`, never a long-lived branch. Commit there,
+push, open a PR. The PR diff is the review surface; merging it unblocks what that issue blocks.
+
 ## Agent skills
 
 ### Issue tracker
