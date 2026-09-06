@@ -18,35 +18,44 @@ This package proves all three before any eval code is written
 ([issue #4](https://github.com/Julian-Win-Stack/OnePass/issues/4)). It is not the eval: it is the
 step the eval's own test suite cannot take, because forking a real session needs a live `claude`.
 
+## The live runner has been removed
+
+The runner that performed checks 1, 2 and 3 — `src/smoke.ts`, with the transcript reader it
+needed — was deleted on 2026-09-06, once it had answered. It was a one-time instrument: it asked
+whether three undocumented Claude Code mechanics behave as the design assumes, and the answer is
+recorded verbatim below. Keeping a live runner that nothing runs would have been a claim about
+the past dressed up as a test.
+
+It was re-run immediately before deletion, on the same Claude Code `2.1.261`, and reproduced all
+five results — different session ids, different hashes, identical behaviour. **If Claude Code
+changes, this document is a record and not a guarantee: the mechanics have to be re-established
+before the eval is trusted again.** Recovering the runner is `git show <this commit>^:eval/smoke/src/smoke.ts`.
+
+What stays is the part that was never the instrument: `snapshot.ts` and `git.ts` are the eval's
+hidden-snapshot implementation, used as they stand by
+[issue #10](https://github.com/Julian-Win-Stack/OnePass/issues/10).
+
 ## Running
 
 ```
 cd eval/smoke
 npm install
-npm test          # criteria 4 and 5, plus the transcript reader — no model, free
-npm run smoke     # all five mechanical criteria, live: ~4 short model turns
+npm test          # criteria 4 and 5 — no model, free, ~2 seconds
 ```
 
-`npm run smoke` recreates `$ONEPASS_SMOKE_DIR` (default `/tmp/onepass-smoke`) from scratch, so
-every run starts clean. It records its fixture session on `$ONEPASS_SMOKE_MODEL` (default
-`haiku`) — the fork mechanics do not depend on the model, and a cheap one keeps the bill at
-cents. It exits non-zero if any check fails, and writes `smoke-report.json` beside the corpus.
-
-The sessions it creates stay in `~/.claude/projects/-private-tmp-onepass-smoke-*`; the script
-prints those paths and never deletes anything under `~/.claude`. Remove them by hand when you
-are done. Nothing here writes to an existing transcript.
+There is nothing live left to run. Criteria 1, 2 and 3 are covered only by the recorded output
+below.
 
 ## What is where
 
 - [`src/snapshot.ts`](src/snapshot.ts) — the hidden snapshot: stage into a temporary index,
   `write-tree`, `commit-tree`, `update-ref` under `refs/onepass/snapshots/<tool-use id>`, and
   materialise one afterwards as a detached worktree. The eval will use this as it stands.
-- [`src/transcript.ts`](src/transcript.ts) — where Claude Code files a working directory's
-  sessions, and the turn cut that gives a fork point and the dropped turn's prompt.
 - [`src/git.ts`](src/git.ts) — running git, and the one definition of what the agent can see of
-  its own git state. Both the live check and the test assert invisibility through it, so they
-  cannot drift into asserting different things.
-- [`src/smoke.ts`](src/smoke.ts) — the live runner.
+  its own git state. `agentView` is that definition, and `snapshot.test.ts` asserts invisibility
+  through it, so the claim lives in one place.
+- [`src/snapshot.test.ts`](src/snapshot.test.ts) — criteria 4 and 5, against a throwaway
+  repository. No model, so these keep running for free.
 
 ---
 
@@ -170,10 +179,14 @@ never recorded, which is what keeps a few hundred snapshots at megabytes.
 - **The fixture is a two-turn session of a few hundred tokens.** Nothing about behaviour at the
   110k–160k contexts the eval forks at was measured.
 - **One fork point shape.** A text turn followed by a text turn. A fork at a turn that ended on
-  a tool result, or one carrying a trailing attachment, is only covered by `readTurns`' unit
-  tests against a fixture, not against a live resume.
+  a tool result, or one carrying a trailing attachment, was only ever covered by `readTurns`'
+  unit tests against a fixture, never against a live resume — and those tests went with the
+  transcript reader, so today it is covered by nothing.
 - **The snapshot hook is not wired.** `snapshot.ts` was exercised directly against a throwaway
   repository. Calling it from the SDK's post-tool-use hook during a real recording is the
   eval's job and is still unproven.
-- **One machine, one OS, one Claude Code version.** Re-run this when 2.1.261 stops being what is
-  installed; the whole point is that these are undocumented internals.
+- **One machine, one OS, one Claude Code version.** Everything above holds for 2.1.261 and
+  nothing more; the whole point is that these are undocumented internals, so they can change in
+  any release with no announcement. The runner that would re-establish them is deleted, which is
+  an accepted cost of a project with a short life: when 2.1.261 stops being what is installed,
+  restore `src/smoke.ts` from git history and run it again before trusting the eval.

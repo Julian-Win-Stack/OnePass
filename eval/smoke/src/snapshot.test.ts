@@ -2,9 +2,10 @@
 // invisible to the agent working in the repo, and it can be materialised afterwards as a
 // worktree carrying the recorded file state.
 //
-// This is the half of the smoke check that needs no model and no live `claude`, so it is a
-// test rather than a step of `smoke.ts`. The live half is in `smoke.ts`, which asserts the
-// same invisibility through the same `agentView`.
+// This is the half of the smoke check that needs no model and no live `claude`, so it survives
+// as an ordinary test. The live half — criteria 1, 2 and 3 — was a one-time instrument and was
+// deleted once it had answered; see README.md for its recorded output. Invisibility is asserted
+// here through `agentView`, which is the single definition of what the agent can see.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
