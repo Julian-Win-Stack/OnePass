@@ -34,3 +34,18 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm test
+
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The eval compiles and runs the proxy under test, so it needs the proxy's toolchain too.
+      - run: npm ci
+        working-directory: proxy
+      - run: npm ci
+        working-directory: eval
+      - run: npm test
+        working-directory: eval

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `ONEPASS_PORT=0` now works end to end: the startup banner reports the port the operating
+  system bound instead of the 0 that was asked for. The eval starts a proxy child per planning
+  case and per tail, several at once, and reads each child's port out of that line.
+
 ## 0.2.0
 
 Fixes the first real-workload failure (docs/findings.md §13): a proxied session in a large

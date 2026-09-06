@@ -1,0 +1,23 @@
+{
+  "name": "onepass-eval",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Measures what the Onepass proxy costs and what it buys, against a stored control baseline.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "onepass-eval": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test --test-concurrency=1 dist/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
