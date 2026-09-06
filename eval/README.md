@@ -1,11 +1,63 @@
-# A/B eval rig
+# The Onepass eval
 
-Measures what the proxy costs and what it buys on a real task, against an unproxied control.
-Produces §§15–18 of [docs/findings.md](../docs/findings.md).
+Measures what the proxy costs and what it buys, against a stored control baseline.
+[spec.md](spec.md) is the design, [decision.md](decision.md) the decisions it rests on.
 
 The retrieval harness in [spike/harness](../spike/harness) is a different thing: it measures
 whether a fact can be recovered after it leaves context. This measures whether a whole task
 still gets done correctly with the proxy in the path.
+
+## The command
+
+`onepass-eval` is a TypeScript package beside the proxy, with the proxy's conventions: compiled
+before it runs, tests under Node's own runner.
+
+```
+export ONEPASS_EVAL_CORPUS=~/onepass-corpus   # required, and outside this repository
+
+cd eval
+npm install
+npm test
+npm run build
+
+node dist/main.js replay                      # no model calls, no score, free
+node dist/main.js quick                       # three proxied tails, every second planning case
+node dist/main.js full --compare a001c2b-20260906T101112Z
+```
+
+**Nothing is measured yet.** What exists is the spine the arms are written into: the command and
+its modes, the corpus directory, the control baseline, the proxy child, and the result document
+every later ticket writes into. A run today builds the proxy, starts a child, and writes a result
+document with no cases in it.
+
+- **The corpus.** `ONEPASS_EVAL_CORPUS` names one directory holding every byte of session
+  content: transcript copies, fork and grader outputs, hand labels, the control baseline and the
+  case worktrees. It has to resolve outside this repository, and the command refuses to start
+  otherwise — none of that material may ever be committed. (The old shell rig's
+  `ONEPASS_EVAL_DIR`, which defaulted to `/tmp/onepass-eval`, is a different variable and still
+  belongs to `run.sh`.)
+- **The proxy under test.** The command compiles `proxy/` itself and starts a child per case on
+  a port the operating system picks, with the judge held off, and tears it down after. The
+  globally running `onepass-proxy` is never used, and a build you forgot to make cannot be what
+  gets measured.
+- **The control baseline.** Control answers are recorded once under a model, effort and Claude
+  Code version key, and reused by every later run, so an iteration pays for the proxied arm
+  alone. Change any of the three and the next run records afresh rather than comparing against
+  answers from another world. `claude --version` supplies the version;
+  `ONEPASS_EVAL_CLAUDE_CODE_VERSION` pins it.
+- **The result.** Each run is labelled by the proxy's git short SHA and the time it started — a
+  build with uncommitted changes under `proxy/` says `-dirty` in its own label — and writes
+  `results/<label>.json` with `results/<label>.md` beside it. Those are committed; the corpus
+  never is.
+- **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
+  can be driven with no key and no money. Replay mode serves its own fake upstream to the proxy
+  child; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+
+## The A/B rig it is replacing
+
+The shell scripts below still run the implementation arm as they always have. They produce
+§§15–18 of [docs/findings.md](../docs/findings.md) and are folded into the package by a later
+ticket.
 
 ## The task
 

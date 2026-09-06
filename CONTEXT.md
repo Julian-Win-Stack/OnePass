@@ -46,6 +46,12 @@ The arm with no proxy in the path. Control answers are recorded once and reused 
 that stored set is the **control baseline** — the one place "baseline" is the right word.
 _Avoid_: raw, unproxied arm
 
+**Corpus**:
+Every byte of stored session content the eval reads and writes — transcript copies, fork and
+grader outputs, hand labels, the control baseline, case and tail worktrees — under one directory
+outside the repository.
+_Avoid_: dataset, fixtures, eval dir
+
 **Planning session**:
 A session whose artifact is a plan or spec for a repo, produced by discussion with the user.
 _Avoid_: discussion session, brainstorming session
@@ -82,3 +88,18 @@ _Avoid_: suffix, resume run
 **Ground-truth tests**:
 Test files from the real human fix, which the agent never sees, run against its implementation.
 _Avoid_: hidden tests, reference tests
+
+**Replay**:
+A run that pushes the stored prefixes through a fresh proxy child with no model calls, to check
+what a build evicts before anything is paid for. Not scored.
+_Avoid_: dry run, offline mode, smoke run
+
+**Run label**:
+What names one run: the proxy's git short SHA and the time the run started. Every result
+document and every run's corpus content is filed under it.
+_Avoid_: run id, tag, version
+
+**Result document**:
+The JSON one run writes inside the repository, with the rendered table beside it. It is the
+whole record of a run: a stranger reads it without reading the code.
+_Avoid_: report file, output, results json

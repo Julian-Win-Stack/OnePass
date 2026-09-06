@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
+import type { AddressInfo } from "node:net";
 import { createProxyServer } from "./server.js";
 import { newProxyLogPath } from "./log.js";
 
@@ -20,6 +21,8 @@ function envInt(name: string, fallback: number): number {
   return value;
 }
 
+// 0 asks the operating system for a free port. The eval starts a proxy child per case and per
+// tail, several at once, so it uses 0 and reads the port the child reports below.
 const port = envInt("ONEPASS_PORT", 3777);
 // No key means no judge: the proxy evicts by the rules alone, exactly as it did before.
 // Deliberately not ANTHROPIC_API_KEY — a `claudep` launched from the proxy's own shell would
@@ -50,7 +53,9 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   throw err;
 });
 server.listen(port, () => {
-  console.log(`[onepass] eviction proxy listening on http://localhost:${port}`);
+  // The requested port may be 0; what a caller has to connect to is the one that got bound.
+  const boundPort = (server.address() as AddressInfo).port;
+  console.log(`[onepass] eviction proxy listening on http://localhost:${boundPort}`);
   console.log(`[onepass] upstream: ${config.upstreamUrl}`);
   console.log(
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
@@ -66,6 +71,6 @@ server.listen(port, () => {
   // The flag keeps native-1M models at 1M: Claude Code caps them at 200k behind a non-api.anthropic.com host.
   console.log(
     `[onepass] point Claude Code at it:  ` +
-      `ANTHROPIC_BASE_URL=http://localhost:${port} _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`,
+      `ANTHROPIC_BASE_URL=http://localhost:${boundPort} _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`,
   );
 });
