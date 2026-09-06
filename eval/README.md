@@ -98,7 +98,12 @@ worktrees.
 
 ## Before the eval was built
 
-[smoke/](smoke/) checks the two mechanisms the eval rests on — forking a stored session, and
-snapshotting a worktree the agent cannot see — against a live `claude`. Its README records what
-was observed and on which Claude Code version, and its `snapshot.ts` is the snapshot
-implementation the eval will use.
+[smoke/](smoke/) recorded the three mechanics the eval rests on — resolving a stored session
+from a foreign worktree, forking it mid-session without disturbing the parent, and snapshotting
+a worktree the agent cannot see. Its README is the record: the Claude Code version, the commands,
+the verbatim output, and what the check does not prove.
+
+The live runner that answered the first two was a one-time instrument and was deleted once it
+had answered; recover it from history if the Claude Code version its record is valid for changes.
+What remains is `snapshot.ts` — the snapshot implementation the eval uses as it stands — and the
+tests that keep it honest.
