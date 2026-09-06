@@ -5,7 +5,7 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -516,6 +516,10 @@ async function startJudgeProxy(judge: { apiKey: string; model: string } | undefi
 }
 
 function judgeRecords(logPath: string): JudgeLogEntry[] {
+  // The log is created by the first entry written to it, and a judge that has to be retried
+  // writes its first one later than the caller polls. No file yet is no records yet, not a
+  // failure — otherwise the wait below throws on its first attempt instead of waiting.
+  if (!existsSync(logPath)) return [];
   return readFileSync(logPath, "utf8")
     .split("\n")
     .filter((line) => line.trim() !== "")
