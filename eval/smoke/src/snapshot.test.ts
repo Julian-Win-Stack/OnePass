@@ -6,14 +6,38 @@
 // as an ordinary test. The live half — criteria 1, 2 and 3 — was a one-time instrument and was
 // deleted once it had answered; see README.md for its recorded output. Invisibility is asserted
 // here through `agentView`, which is the single definition of what the agent can see.
+//
+// The throwaway repository and the ref listing live here rather than in `git.ts`, because
+// `git.ts` and `snapshot.ts` are the eval's own modules and nothing outside these tests needs
+// either. A snapshot is selected by tool-use id read from the transcript, never by listing.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agentView, applyAgentEdits, git, initThrowawayRepo } from "./git.js";
-import { createSnapshotter, listSnapshots, materialiseSnapshot, SNAPSHOT_NAMESPACE } from "./snapshot.js";
+import { agentView, git } from "./git.js";
+import { createSnapshotter, materialiseSnapshot, SNAPSHOT_NAMESPACE } from "./snapshot.js";
+import type { Snapshot } from "./snapshot.js";
+
+/** A repository with one commit and one ignored path, on a fresh branch. */
+function initThrowawayRepo(repo: string): string {
+  mkdirSync(repo, { recursive: true });
+  git(repo, ["init", "--quiet", "--initial-branch", "main"]);
+  git(repo, ["config", "user.email", "smoke@example.invalid"]);
+  git(repo, ["config", "user.name", "Onepass Smoke"]);
+  writeFileSync(join(repo, ".gitignore"), "node_modules/\n");
+  writeFileSync(join(repo, "tracked.txt"), "committed\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "--quiet", "-m", "base"]);
+  return repo;
+}
+
+/** What a recorded session's agent would leave behind: one tracked edit, one new file. */
+function applyAgentEdits(repo: string): void {
+  writeFileSync(join(repo, "tracked.txt"), "edited by the agent\n");
+  writeFileSync(join(repo, "untracked.txt"), "written by the agent\n");
+}
 
 /** A repository with one commit, one ignored path, and the agent's uncommitted work on top. */
 function recordingRepo(): string {
@@ -24,6 +48,19 @@ function recordingRepo(): string {
 
 function indexFile(name: string): string {
   return join(mkdtempSync(join(tmpdir(), "onepass-index-")), name);
+}
+
+/** Every snapshot in the namespace, ordered by ref name. */
+function listSnapshots(options: { repo: string }): Snapshot[] {
+  const format = "--format=%(refname) %(objectname)";
+  const output = git(options.repo, ["for-each-ref", "--sort=refname", format, SNAPSHOT_NAMESPACE]);
+  const snapshots: Snapshot[] = [];
+  for (const line of output.split("\n")) {
+    const [ref, commit] = line.split(" ");
+    if (ref === undefined || commit === undefined) continue;
+    snapshots.push({ toolUseId: ref.slice(SNAPSHOT_NAMESPACE.length + 1), commit, ref });
+  }
+  return snapshots;
 }
 
 test("a snapshot leaves the agent's git status, diff, log, index and branches unchanged", () => {
@@ -76,6 +113,18 @@ test("snapshots are stored under the private ref namespace, one ref per tool-use
   assert.notEqual(first.commit, second.commit);
 });
 
+test("a tool-use id that git would reject as a ref segment is refused where the id is named", () => {
+  const repo = recordingRepo();
+  const snapshotter = createSnapshotter({ repo, indexFile: indexFile("i") });
+
+  // A dot is the one character git rejects only in context, as `..` or a trailing `.lock`.
+  // Failing here names the id; `update-ref` would only report a malformed ref.
+  for (const rejected of ["toolu_..01", "toolu_01.lock", "", "-toolu_01", "a/b"]) {
+    assert.throws(() => snapshotter.snapshot(rejected), /not usable as a ref segment/);
+  }
+  assert.deepEqual(listSnapshots({ repo }), []);
+});
+
 test("a snapshot whose worktree did not change since the last one still gets its own ref", () => {
   const repo = recordingRepo();
   const snapshotter = createSnapshotter({ repo, indexFile: indexFile("e") });
@@ -123,6 +172,31 @@ test("a materialised worktree carries one snapshot commit, not the whole run's c
   assert.equal(log.length, 2);
   assert.match(log[0] ?? "", /onepass snapshot toolu_03/);
   assert.match(log[1] ?? "", /base/);
+});
+
+test("a snapshot taken after the agent commits hangs off the new HEAD, not a stale base", () => {
+  const repo = recordingRepo();
+  const snapshotter = createSnapshotter({ repo, indexFile: indexFile("j") });
+  snapshotter.snapshot("toolu_01");
+
+  // A recorded agent is free to commit its own work part-way through a session. Reading HEAD
+  // once at construction would parent every later snapshot to the commit before this one, and
+  // the tail materialised from it would be missing the agent's commit entirely.
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "--quiet", "-m", "the agent's own commit"]);
+  const head = git(repo, ["rev-parse", "HEAD"]).trim();
+
+  writeFileSync(join(repo, "tracked.txt"), "work after the agent's commit\n");
+  const later = snapshotter.snapshot("toolu_02");
+
+  assert.equal(git(repo, ["rev-parse", `${later.commit}^`]).trim(), head);
+
+  const destination = join(mkdtempSync(join(tmpdir(), "onepass-tail-")), "tail");
+  materialiseSnapshot({ repo, commit: later.commit, destination });
+  const log = git(destination, ["log", "--oneline"]).trim().split("\n");
+  assert.equal(log.length, 3);
+  assert.match(log[1] ?? "", /the agent's own commit/);
+  assert.equal(readFileSync(join(destination, "tracked.txt"), "utf8"), "work after the agent's commit\n");
 });
 
 test("materialising a snapshot leaves the recording worktree's own git state alone", () => {

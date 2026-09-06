@@ -11,6 +11,9 @@
 // Every snapshot hangs off the recording's HEAD rather than off the snapshot before it. A
 // chain would put the whole run's history into each tail's `git log` once the snapshot is
 // checked out; hanging off HEAD leaves one commit on top of the repository's real history.
+// HEAD is read per snapshot rather than once, because a recorded agent may commit mid-run: a
+// cached base would parent every later snapshot to a stale commit, and the tail materialised
+// from it would be missing the agent's own commits.
 //
 // The temporary index is reused across snapshots on purpose: it keeps git's stat cache warm,
 // so a snapshot of a large worktree costs a fraction of a second instead of a full rescan.
@@ -49,12 +52,14 @@ export interface Snapshotter {
 /**
  * A tool-use id lands in a ref name, so it has to be one git will accept. The ids Claude Code
  * issues are `toolu_` plus base62; anything else is a caller bug, not something to sanitise.
+ * The dot is excluded deliberately: it is the one character in that class git itself rejects
+ * in context, as `..` and a trailing `.lock`, and failing here names the culprit id where
+ * `update-ref` would only report a malformed ref.
  */
-const SAFE_REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SAFE_REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 export function createSnapshotter(options: SnapshotterOptions): Snapshotter {
   const { repo, indexFile } = options;
-  const base = headCommit(repo);
 
   return {
     snapshot(toolUseId: string): Snapshot {
@@ -63,6 +68,7 @@ export function createSnapshotter(options: SnapshotterOptions): Snapshotter {
       }
       git(repo, ["add", "-A"], { indexFile });
       const tree = git(repo, ["write-tree"], { indexFile }).trim();
+      const base = headCommit(repo);
       const parentArgs = base === null ? [] : ["-p", base];
       const commit = git(repo, ["commit-tree", tree, ...parentArgs, "-m", `onepass snapshot ${toolUseId}`]).trim();
       const ref = `${SNAPSHOT_NAMESPACE}/${toolUseId}`;
@@ -82,22 +88,6 @@ function headCommit(repo: string): string | null {
   } catch {
     return null; // An unborn branch: every snapshot is a root commit.
   }
-}
-
-/**
- * Every snapshot in the namespace, ordered by ref name. The eval pairs a snapshot to a turn by
- * tool-use id read from the transcript, so this order is for inspection, not for selection.
- */
-export function listSnapshots(options: { repo: string }): Snapshot[] {
-  const format = "--format=%(refname) %(objectname)";
-  const output = git(options.repo, ["for-each-ref", "--sort=refname", format, SNAPSHOT_NAMESPACE]);
-  const snapshots: Snapshot[] = [];
-  for (const line of output.split("\n")) {
-    const [ref, commit] = line.split(" ");
-    if (ref === undefined || commit === undefined) continue;
-    snapshots.push({ toolUseId: ref.slice(SNAPSHOT_NAMESPACE.length + 1), commit, ref });
-  }
-  return snapshots;
 }
 
 /**

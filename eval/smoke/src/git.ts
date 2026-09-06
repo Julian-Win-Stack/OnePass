@@ -1,12 +1,12 @@
-// Running git, seeing what the agent sees, and building the repository the checks run against.
+// Running git, and seeing what the agent sees.
 //
-// `agentView` lives here and not in either caller because the live check and the test both
-// assert the same claim — that a snapshot is invisible — and two copies of that list would
-// drift into asserting different things.
+// `agentView` is the single definition of what an agent working in a recorded worktree could
+// observe of its own git state. The snapshot tests assert invisibility through it rather than
+// listing commands of their own, so there is one list to keep honest rather than one per
+// caller. It was shared with the live smoke runner until that runner was deleted; see
+// ../README.md.
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 
 export interface GitOptions {
   /** Stage into this index instead of the repository's own. */
@@ -60,23 +60,4 @@ export function agentView(repo: string): Record<string, string> {
   const view: Record<string, string> = {};
   for (const args of commands) view[`git ${args.join(" ")}`] = git(repo, args);
   return view;
-}
-
-/** A repository with one commit and one ignored path, on a fresh branch. */
-export function initThrowawayRepo(repo: string): string {
-  mkdirSync(repo, { recursive: true });
-  git(repo, ["init", "--quiet", "--initial-branch", "main"]);
-  git(repo, ["config", "user.email", "smoke@example.invalid"]);
-  git(repo, ["config", "user.name", "Onepass Smoke"]);
-  writeFileSync(join(repo, ".gitignore"), "node_modules/\n");
-  writeFileSync(join(repo, "tracked.txt"), "committed\n");
-  git(repo, ["add", "-A"]);
-  git(repo, ["commit", "--quiet", "-m", "base"]);
-  return repo;
-}
-
-/** What a recorded session's agent would leave behind: one tracked edit, one new file. */
-export function applyAgentEdits(repo: string): void {
-  writeFileSync(join(repo, "tracked.txt"), "edited by the agent\n");
-  writeFileSync(join(repo, "untracked.txt"), "written by the agent\n");
 }
