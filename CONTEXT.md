@@ -42,8 +42,9 @@ One run of a task under one condition, proxied or control.
 _Avoid_: variant, treatment, branch
 
 **Control**:
-The arm with no proxy in the path.
-_Avoid_: baseline, raw, unproxied arm
+The arm with no proxy in the path. Control answers are recorded once and reused across runs;
+that stored set is the **control baseline** — the one place "baseline" is the right word.
+_Avoid_: raw, unproxied arm
 
 **Planning session**:
 A session whose artifact is a plan or spec for a repo, produced by discussion with the user.
@@ -55,7 +56,12 @@ _Avoid_: coding session, task run
 
 **Case**:
 One stored request prefix cut at one turn of a session, replayed to produce one model turn.
-_Avoid_: sample, example, cut point
+_Avoid_: example, cut point; and *sample*, which is an answer to a case, not the case itself
+
+**Sample**:
+One generated answer to one case. Each case is answered three times: once proxied per build,
+twice control.
+_Avoid_: run, attempt, generation
 
 **Pair**:
 One case scored proxied against control by the grader.

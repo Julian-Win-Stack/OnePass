@@ -1,0 +1,19 @@
+{
+  "name": "onepass-eval-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hidden worktree snapshots for the Onepass eval. The live smoke runner that proved the fork mechanics was removed once it had answered; see README.md for what it observed.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

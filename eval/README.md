@@ -95,3 +95,15 @@ Run outputs land in `$ONEPASS_EVAL_DIR` (default `/tmp/onepass-eval`), which is 
 directory — copy anything you intend to cite before it is cleaned up. The runs behind
 findings.md §§15–18 are still there as `run{3..6}.*`, `control.*` and their `mastra-*`
 worktrees.
+
+## Before the eval was built
+
+[smoke/](smoke/) recorded the three mechanics the eval rests on — resolving a stored session
+from a foreign worktree, forking it mid-session without disturbing the parent, and snapshotting
+a worktree the agent cannot see. Its README is the record: the Claude Code version, the commands,
+the verbatim output, and what the check does not prove.
+
+The live runner that answered the first two was a one-time instrument and was deleted once it
+had answered; recover it from history if the Claude Code version its record is valid for changes.
+What remains is `snapshot.ts` — the snapshot implementation the eval uses as it stands — and the
+tests that keep it honest.

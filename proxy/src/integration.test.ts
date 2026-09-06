@@ -154,18 +154,54 @@ function lastRecorded(): RecordedRequest {
 }
 
 function loggedEntries(): ProxyLogEntry[] {
-  return readFileSync(logFilePath, "utf8")
+  let text = "";
+  try {
+    text = readFileSync(logFilePath, "utf8");
+  } catch {
+    return []; // The writer opens the file lazily, on its first entry.
+  }
+  return text
     .split("\n")
     .filter((line) => line.trim() !== "")
     .map((line) => JSON.parse(line) as ProxyLogEntry);
 }
 
-function lastLoggedRequest(path: string): RequestLogEntry {
-  const requests = loggedEntries().filter(
-    (entry): entry is RequestLogEntry => entry.kind === "request" && entry.path === path,
-  );
+/**
+ * The proxy logs through a buffered write stream, so an entry can still be in flight once the
+ * response it describes has reached the client. Reading the log once does not fail when that
+ * happens: it hands back an earlier test's entry and the assertion then describes the wrong
+ * request. So every read waits for the entries it expects, and says plainly when they never came.
+ *
+ * A mark is what "expects" means here. It is taken before the requests it covers and past the
+ * current millisecond, so no entry written earlier can share its timestamp.
+ */
+async function logMark(): Promise<string> {
+  const started = Date.now();
+  while (Date.now() === started) await new Promise((resolve) => setTimeout(resolve, 1));
+  return new Date().toISOString();
+}
+
+async function loggedRequestsSince(path: string, mark: string, count: number): Promise<RequestLogEntry[]> {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    const requests = loggedEntries().filter(
+      (entry): entry is RequestLogEntry =>
+        entry.kind === "request" && entry.path === path && entry.timestamp >= mark,
+    );
+    if (requests.length >= count) return requests;
+    assert.ok(
+      Date.now() < deadline,
+      `the proxy log holds ${requests.length} ${path} request(s) since ${mark}, expected ${count}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** The entry for the one `path` request made since `mark`. */
+async function loggedRequestSince(path: string, mark: string): Promise<RequestLogEntry> {
+  const requests = await loggedRequestsSince(path, mark, 1);
   const last = requests[requests.length - 1];
-  assert.ok(last, `the proxy log has no ${path} request`);
+  assert.ok(last, `the proxy log has no ${path} request since ${mark}`);
   return last;
 }
 
@@ -220,6 +256,7 @@ test("forwards /v1/messages byte-for-byte when nothing is stubbed", async () => 
 });
 
 test("stubs old large tool results and keeps them stubbed on later requests", async () => {
+  const mark = await logMark();
   await sendRequest(proxyOrigin, "/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -243,6 +280,9 @@ test("stubs old large tool results and keeps them stubbed on later requests", as
   };
   assert.equal(secondSeen.messages[1]?.content[0]?.content, firstStub);
 
+  // A trip is logged while the request is being handled and the request entry at its response,
+  // and the writer keeps that order, so both trips are on disk once both requests are.
+  await loggedRequestsSince("/v1/messages", mark, 2);
   const trips = loggedEntries().filter((entry) => entry.kind === "trip");
   assert.equal(trips.length, 1, "the second identical request must not log a second trip");
   assert.deepEqual(trips[0]?.addedToolUseIds, ["toolu_big"]);
@@ -275,17 +315,19 @@ test("calibrates chars-per-token from the API's reported usage", async () => {
     body: teach,
   });
   const second = JSON.stringify({ model: "claude-test", max_tokens: 100, messages: [{ role: "user", content: "hello again" }] });
+  const mark = await logMark();
   await sendRequest(proxyOrigin, "/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: second,
   });
-  const last = lastLoggedRequest("/v1/messages");
+  const last = await loggedRequestSince("/v1/messages", mark);
   assert.ok(last.charsPerToken !== undefined, "request log entry should record charsPerToken");
   assert.ok(Math.abs(last.charsPerToken - 2) < 0.1, `expected ~2 chars/token, got ${last.charsPerToken}`);
 });
 
 test("logs the speed gauge: proxy time, first byte, and the cache numbers from usage", async () => {
+  const mark = await logMark();
   const body = JSON.stringify({
     model: "claude-test",
     max_tokens: 100,
@@ -297,7 +339,7 @@ test("logs the speed gauge: proxy time, first byte, and the cache numbers from u
     body,
   });
 
-  const entry = lastLoggedRequest("/v1/messages");
+  const entry = await loggedRequestSince("/v1/messages", mark);
   // The stub's three counts differ in size, so a swapped or dropped field shows up here.
   const reported = stubUsage(lastRecorded().body.byteLength);
   assert.equal(entry.inputTokens, reported.input_tokens);
@@ -327,6 +369,7 @@ test("forwards malformed /v1/messages bodies unchanged", async () => {
 });
 
 test("streams SSE responses without buffering, and gauges them from message_start", async () => {
+  const mark = await logMark();
   sseGate = new Promise<void>((resolve) => {
     openSseGate = resolve;
   });
@@ -369,7 +412,7 @@ test("streams SSE responses without buffering, and gauges them from message_star
   assert.ok(fullStream.includes("message_stop"));
   assert.ok(received.length >= 2, "expected the SSE stream to arrive in more than one chunk");
 
-  const entry = lastLoggedRequest("/v1/messages");
+  const entry = await loggedRequestSince("/v1/messages", mark);
   assert.equal(
     entry.cacheReadInputTokens,
     STREAMED_USAGE.cache_read_input_tokens,
@@ -434,6 +477,7 @@ interface ForwardedCallBody {
 }
 
 test("stubs an old large tool_use input, leaves its small result, and keeps both that way", async () => {
+  const mark = await logMark();
   const send = (): Promise<unknown> =>
     sendRequest(proxyOrigin, "/v1/messages", {
       method: "POST",
@@ -453,6 +497,7 @@ test("stubs an old large tool_use input, leaves its small result, and keeps both
   const second = JSON.parse(lastRecorded().body.toString("utf8")) as ForwardedCallBody;
   assert.deepEqual(second.messages[0]?.content[0]?.input, firstInput);
 
+  await loggedRequestsSince("/v1/messages", mark, 2);
   const callTrips = loggedEntries().filter(
     (entry) => entry.kind === "trip" && (entry.addedToolUseIds ?? []).includes("call:toolu_call"),
   );
