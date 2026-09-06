@@ -31,13 +31,14 @@ One worktree per issue, branched off `main` as `ticket/<NN>-<slug>` — never a 
 Commit there, push, open a PR. The PR diff is the review surface; merging it unblocks what that
 issue blocks.
 
-## Keeping tickets in sync with the spec
+## Keeping the spec and its tickets in sync
 
-A spec is one GitHub issue; the tickets implementing it are issues linked to it. When the spec
-changes, work out which linked tickets that change invalidates and bring them back in line.
+A spec is one GitHub issue; the tickets implementing it are issues linked to it. When a spec
+decision changes, write it into the spec issue first, then work out which linked tickets that
+change invalidates and bring them back in line.
 
-Never edit an issue off your own back — show me the list of affected tickets and the exact edits
-you propose, and wait for my go-ahead before touching any of them.
+Never edit an issue off your own back — show me the exact edits you propose, spec and tickets
+alike, and wait for my go-ahead before touching any of them.
 
 ## Agent skills
 
