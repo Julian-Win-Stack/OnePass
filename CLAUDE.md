@@ -40,6 +40,10 @@ change invalidates and bring them back in line.
 Never edit an issue off your own back — show me the exact edits you propose, spec and tickets
 alike, and wait for my go-ahead before touching any of them.
 
+## Give me the order of the files that I have to review
+
+After doing a implementation, give me the order of the files that I have to review and read code. I am still a junior and struggling so, give advice specifically for me. And tell me which files are important for manual code review and tell me which files are not important and which files that I can skip reading the code. 
+
 ## Agent skills
 
 ### Issue tracker
