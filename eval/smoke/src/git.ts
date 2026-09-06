@@ -13,12 +13,24 @@ export interface GitOptions {
   indexFile?: string;
 }
 
+/**
+ * Variables through which git picks its repository, work tree and index. They override `-C`, so
+ * inheriting one would point a snapshot at a different repository than the one being recorded —
+ * or, for `GIT_INDEX_FILE`, make `agentView` read an index that is not the agent's and assert
+ * invisibility against the wrong state. Anything spawned from a git hook, a git alias or
+ * `git rebase -x` carries them, so they are dropped rather than assumed absent.
+ */
+const REPOSITORY_SELECTORS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"] as const;
+
 export function git(repo: string, args: string[], options: GitOptions = {}): string {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of REPOSITORY_SELECTORS) delete env[name];
+  if (options.indexFile !== undefined) env.GIT_INDEX_FILE = options.indexFile;
+
   return execFileSync("git", ["-C", repo, ...args], {
     encoding: "utf8",
     env: {
-      ...process.env,
-      ...(options.indexFile === undefined ? {} : { GIT_INDEX_FILE: options.indexFile }),
+      ...env,
       // Set explicitly so a repository with no configured identity — a detached worktree of
       // someone else's clone, say — can still be snapshotted.
       GIT_AUTHOR_NAME: "Onepass eval",

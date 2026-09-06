@@ -136,3 +136,45 @@ test("materialising a snapshot leaves the recording worktree's own git state alo
 
   assert.deepEqual(agentView(repo), before);
 });
+
+// A process spawned from a git hook, a git alias or `git rebase -x` carries GIT_DIR and friends,
+// and git lets them override `-C`. Both of these fail loudly if `git()` ever spreads the ambient
+// environment through unfiltered again.
+
+test("an inherited GIT_DIR does not redirect a snapshot into another repository", () => {
+  const repo = recordingRepo();
+  const stranger = initThrowawayRepo(mkdtempSync(join(tmpdir(), "onepass-stranger-")));
+  const inherited = process.env.GIT_DIR;
+  process.env.GIT_DIR = join(stranger, ".git");
+  try {
+    const snapshotter = createSnapshotter({ repo, indexFile: indexFile("f") });
+    const snapshot = snapshotter.snapshot("toolu_01");
+    snapshotter.dispose();
+
+    assert.deepEqual(listSnapshots({ repo }).map((s) => s.commit), [snapshot.commit]);
+    assert.deepEqual(listSnapshots({ repo: stranger }), []);
+    assert.equal(git(repo, ["show", `${snapshot.commit}:tracked.txt`]), "edited by the agent\n");
+  } finally {
+    if (inherited === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = inherited;
+  }
+});
+
+test("an inherited GIT_INDEX_FILE does not become the index agentView reads", () => {
+  const repo = recordingRepo();
+  const clean = agentView(repo);
+  const inherited = process.env.GIT_INDEX_FILE;
+  process.env.GIT_INDEX_FILE = indexFile("g");
+  try {
+    // Without filtering, this would stage the agent's work into the ambient index and agentView
+    // would then report it as staged — passing the invisibility check against the wrong state.
+    const snapshotter = createSnapshotter({ repo, indexFile: indexFile("h") });
+    snapshotter.snapshot("toolu_01");
+    snapshotter.dispose();
+
+    assert.deepEqual(agentView(repo), clean);
+  } finally {
+    if (inherited === undefined) delete process.env.GIT_INDEX_FILE;
+    else process.env.GIT_INDEX_FILE = inherited;
+  }
+});
