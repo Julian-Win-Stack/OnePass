@@ -31,13 +31,15 @@ stored prefixes before any model is paid for.
 The corpus is one planning session and one implementation session:
 
 - **Planning.** My existing biggest planning session is replayed one turn at a time, in
-  Claude Code itself. Each case is one of my typed turns past 110k tokens whose real answer
-  was text. The session is forked just before that turn and my recorded turn is sent again,
-  so Claude Code builds the request, runs any tools, and answers as it would live. The answer
-  is regenerated on Opus 5 at xhigh, once behind the proxy per build and twice without it,
-  once ever. A grader on Sonnet answers yes/no questions about each pair, seeing the full
-  history including everything the proxy evicted. The two control answers to the same case
-  give the noise floor.
+  Claude Code itself. Each case is one of my typed turns whose full prefix is past 110k
+  tokens, whether or not its recorded answer used tools. The session is forked just before
+  that turn and my recorded turn is sent again, so Claude Code builds the request, runs any
+  tools, and answers as it would live. The cases are drawn from the three stretches of the
+  session that carry them, spanning 110k to 290k, and both arms run at the 1M window so the
+  deepest cases fit and neither arm compacts. The answer is regenerated on Opus 5 at xhigh,
+  once behind the proxy per build and twice without it, once ever. A grader on Sonnet
+  answers yes/no questions about each pair, seeing the full history including everything
+  the proxy evicted. The two control answers to the same case give the noise floor.
 - **Implementation.** The mastra #18877 task is recorded once as a control on Opus 5 at high,
   with a worktree snapshot taken after every edit. Every arm forks that recording at the last
   turn under 110k, restores the matching worktree snapshot, and runs to the end as a tail:
@@ -58,7 +60,7 @@ is shown but never decides.
 5. As the proxy's author, I want a noise floor from control-versus-control pairs, so that I can tell a real difference from luck.
 6. As the proxy's author, I want the planning replay to reuse my real typed turns, so that the eval measures the sessions I actually have and nothing simulates me.
 7. As the proxy's author, I want each planning case replayed as a real Claude Code turn forked from the stored session, so that the harness, tools and request are the real ones and nothing has to be rebuilt or defended.
-8. As the proxy's author, I want planning cases to be text-only model turns, so that the grader compares reasoning and not tool behaviour.
+8. As the proxy's author, I want every turn past the threshold replayed whether or not its recorded answer used tools, with the two kinds reported as separate groups, so that the corpus looks like a real session and I can see whether the proxy hurts one kind more than the other.
 9. As the proxy's author, I want a proxied tool call where control answered in text to be counted as cost, so that a build that makes the model re-read things is charged for it.
 10. As the proxy's author, I want the grader to see the full history including evicted content, so that it judges each answer against everything the session actually contained.
 11. As the proxy's author, I want both graders to read the repo the answer was written against, so that a judgment about code is checked against real code and not guessed.
@@ -107,23 +109,27 @@ is shown but never decides.
 
 ### Planning corpus
 
-- The planning session is my biggest existing session. The candidate is the chp99-takehome transcript of 11–12 August 2026 with 140 typed turns, 631 text-only model turns and 6 compactions, the first at 173k tokens. Two smaller transcripts share its first timestamp and are earlier forks of it; the biggest is the superset.
+- The planning session is my biggest existing session. The candidate is the chp99-takehome transcript of 11–12 August 2026: 122 turns I typed, 631 text-only model turns, and 6 compactions. Two smaller transcripts share its first timestamp and are earlier forks of it; the biggest is the superset. Counting rule matters here, because an earlier draft of this spec said 140: that number counted the 6 compaction summaries and 12 system-injected meta entries as turns I typed. A case must never be one of those, so the rule is explicit — a `user` entry that is not sidechain, not `isMeta`, not a compaction summary, and carries no `tool_result` block.
+- All 6 compactions were `trigger: manual` — I typed `/compact` at 173k, 291k, 159k, 206k, 159k and 237k. None was forced, so no compaction marks a ceiling and "before the first compaction" is not a natural boundary.
+- The session changes model partway through. The three stretches before the third compaction were recorded on Fable 5; the four after it on Opus 5, at effort xhigh except two stretches at max. This is measured from the transcript, not assumed.
 - Importing copies the transcript into the corpus directory. The original under the projects directory is never opened for writing by any eval code.
-- Cases are taken only from the stretch before the session's first compaction, which in this transcript is 21 typed turns between 110k and 160k tokens. Both arms therefore fork the same untouched copy of the transcript, placed under a new session id where Claude Code looks for the case worktree's sessions, and no compaction has to be stripped or reproduced. The later stretches of the session, with their compactions, are not used; the tails cover the deeper contexts.
+- Cases are taken from the three stretches that carry turns past the threshold at useful depth: the two Opus stretches of 21 eligible turns each, reaching 205k and 197k, and the Fable stretch of 8 eligible turns reaching 290k. That is 50 cases spanning 110k to 290k. Both arms fork the same untouched copy of the transcript, placed under a new session id where Claude Code looks for the case worktree's sessions.
+- The first stretch of the session is deliberately left out. It was recorded on Fable and its turns sit between 131k and 172k, where the proxy evicts only a sixth to a third of the context — the sizes least likely to show a difference. Its 20 eligible turns are not worth the model calls.
+- Every case therefore sits on history that opens with a compaction summary rather than raw turns. That is a change from an earlier draft, which used the uncompacted first stretch to avoid it. It costs nothing the eval depends on: the summary is recorded in the transcript, both arms fork identical bytes, and 205k of context is 205k either way. It is named as an approximation in the report.
 - Each case runs in a throwaway worktree of the chp99-takehome checkout at the last commit before the case's timestamp, so the model reads code close to what it read live; this is approximate and the report says so. The transcript copy is placed where Claude Code looks for that worktree's sessions.
-- Model and effort are the recording's, Opus 5 at xhigh, passed to the fork; Claude Code supplies the system prompt, tools and headers itself, so nothing about the request is reconstructed.
+- Both arms answer on Opus 5 at effort xhigh, whichever model recorded the stretch the case came from. That is the recording's model and effort for the two Opus stretches; for the deep Fable stretch it means Opus continues a session Fable started. Both arms carry that equally, so it cannot favour either, and it is named as an approximation in the report. Claude Code supplies the system prompt, tools and headers itself, so nothing about the request is reconstructed.
 
 ### Case extraction
 
-- A case is a typed user turn whose recorded answer was a text-only model turn, no tool use in it, and whose full uncompacted prefix exceeds the trip threshold of 110k tokens. Size is measured with the count-tokens endpoint over the message list plus the fixed system-and-tools overhead read from the transcript's first model turn usage; the margin only affects turns near the threshold.
-- The fork point is the model turn before the case's user turn, so the forked history ends there and the case's user turn is the prompt sent to the fork, verbatim. Both forks see the same full history; the proxy evicts it from an empty state for the proxied fork, and the control fork sends it whole at the 200k window, as the live session did.
+- A case is a turn I typed whose full prefix exceeds the trip threshold of 110k tokens. Below that threshold the proxy evicts nothing, both arms send byte-identical requests, and the model call buys no information. Whether the recorded answer used tools does not decide eligibility: it is recorded as a label on the case, and the result document reports the two groups separately. Size is measured with the count-tokens endpoint over the message list plus the fixed system-and-tools overhead read from the transcript's first model turn usage; the margin only affects turns near the threshold.
+- The fork point is the model turn before the case's user turn, so the forked history ends there and the case's user turn is the prompt sent to the fork, verbatim. Both forks see the same full history; the proxy evicts it from an empty state for the proxied fork, and the control fork sends it whole at the 1M window. 1M is what keeps the two arms comparable: at 200k the control fork would auto-compact any case past roughly 170k and answer from a model-written summary, so the arms would differ by two lossy transforms instead of one and nothing could be attributed to the proxy. It is also what makes the 10 cases past 200k testable at all, since a 290k history cannot be loaded at 200k. Neither arm compacts.
 - The eligible cases are listed by rule at run time, in session order. Quick mode takes every second one, which spreads the subset across the session with no seed. Every result document records the case list it ran, with turn index and prefix size, and the previous-build comparison refuses when the two runs' case lists differ, so a drift in eligibility fails loudly instead of silently comparing different cases. There is no separate manifest file.
 - The fork runs one turn: the model may call tools and the turn ends when it answers in text. The text is what is graded; tool calls inside the turn are not graded but are counted per arm as "asked for a tool" and reported as cost with their tokens. A fork that ends without text, or hits the turn cap, is scored Unknown on every question and reported.
 
 ### Planning arms
 
 - Three samples per case: one proxied per build, two control from the stored baseline. The proxied sample against each control sample gives two pairs; the two control samples give one noise-floor pair. The noise floor and its grader verdicts are computed once with the baseline and reused.
-- Every sample is a Claude Code fork through the Agent SDK, with full tool access inside its throwaway worktree, the same as the tails. The proxied fork's base URL is the proxy child process, with the assume-first-party flag; control forks talk to the API directly. Both run on Claude Code's own login. My API key is used only for count-tokens and the graders; the proxy's judge key is never set.
+- Every sample is a Claude Code fork through the Agent SDK at the 1M window, with full tool access inside its throwaway worktree, the same as the tails. The proxied fork's base URL is the proxy child process, with the assume-first-party flag; control forks talk to the API directly. Both run on Claude Code's own login. My API key is used only for count-tokens and the graders; the proxy's judge key is never set.
 - Usage from every fork is taken from the SDK's result message in the four token classes, together with request count, API time and the proxy's own log of trips, rebuilds and first-byte latency.
 
 ### Implementation corpus and tails
@@ -179,16 +185,15 @@ A good test drives the eval from the outside and reads only what a user of it wo
 - Grading tool behaviour in planning cases.
 - Continuous integration or scheduled runs.
 - A pass threshold before the first result.
-- Fable as grader or as a model in any arm.
+- Fable as grader, or as the model answering in any arm. Fable-recorded history is in the corpus, since the deepest cases come from a stretch it recorded; Opus answers both arms there.
 - Evaluating the proxy's judge; it is off in every arm.
 - Comparing with the findings runs 3–6, which used a different model and effort.
-- Planning cases after the session's first compaction.
 
 ## Further Notes
 
 Still proposed, not yet in decision.md:
 
-- How many planning cases. The chp99 transcript has 21 typed turns that qualify: before the first compaction, past 110k tokens, answered in text. Full mode runs all 21. Quick mode runs every second one, about 10. For each case Claude Code answers the turn three times, once through the proxy and twice without, and each answer may include tool calls before the text. Replay lists the cases and their sizes before anything is spent.
+- How many planning cases. The chp99 transcript has 50 turns that qualify across the three stretches used: 21 in each Opus stretch and 8 in the deep Fable stretch, all past 110k tokens. Full mode runs all 50. Quick mode runs every second one, 25. For each case Claude Code answers the turn three times, once through the proxy and twice without, and each answer may include tool calls before the text. Replay lists the cases and their sizes before anything is spent.
 - What the first run costs is not known in advance. Nothing in the findings records Opus cost for a full run, and a planning turn or a tail costs whatever tool calls the model decides to make. The baseline run, which pays for the control samples and control tails once, is where that number is first measured, and every run after it reports the estimate up front.
 
-Known approximations to state in every report: planning forks run under today's Claude Code, not the version that recorded the session; the planning repo commit per case is the nearest earlier commit; planning measures contexts of 110k to 160k only, and deeper contexts are measured by the tails.
+Known approximations to state in every report: planning forks run under today's Claude Code, not the version that recorded the session; the planning repo commit per case is the nearest earlier commit; planning measures contexts of 110k to 290k; every planning case sits on history that opens with a compaction summary; and the 8 deepest cases were recorded by Fable and are answered by Opus in both arms.
