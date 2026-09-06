@@ -44,7 +44,7 @@ The corpus is one planning session and one implementation session:
   with a worktree snapshot taken after every edit. Every arm forks that recording at the last
   turn under 110k, restores the matching worktree snapshot, and runs to the end as a tail:
   three proxied tails while fixing, five for a published number, against stored control tails. Tails are scored by the
-  ground-truth tests, deterministic checks, and a Sonnet grader that compares a proxied
+  ground-truth tests, deterministic checks, and an Opus 5 grader at effort xhigh that compares a proxied
   tail's diff with a control tail's diff, with control-versus-control pairs as the noise floor.
 
 Cost is four token classes per arm plus notional dollars at list price. Time is request
@@ -74,9 +74,9 @@ is shown but never decides.
 19. As the proxy's author, I want tails to run in parallel, so that five per arm finish in one sitting.
 20. As the proxy's author, I want tails scored by the ground-truth tests the agent never sees, so that it cannot flatter its own implementation.
 21. As the proxy's author, I want deterministic checks on each tail's diff, so that type errors, lint failures and diff size are counted without a model.
-22. As the proxy's author, I want a Sonnet grader that compares a proxied tail's diff with a control tail's diff and judges which is the better change, so that simplicity and reuse of existing code are measured and not just test counts.
+22. As the proxy's author, I want an Opus 5 grader at effort xhigh that compares a proxied tail's diff with a control tail's diff and judges which is the better change, so that simplicity and reuse of existing code are measured and not just test counts.
 23. As the proxy's author, I want implementation arms to run without compaction, so that the control is what an engineer would actually do at 1M.
-24. As the proxy's author, I want planning cases taken from before the session's first compaction, so that both arms fork the same untouched history and no transcript has to be rewritten.
+24. As the proxy's author, I want planning cases drawn from the session's three deep stretches, spanning 110k to 290k, so that the corpus reaches the sizes where the proxy evicts most.
 25. As the proxy's author, I want the proxied planning arm to see that history with the proxy's stubs and the control arm to see it whole, so that the only difference between the arms is the proxy.
 26. As the proxy's author, I want cost broken into fresh input, cache write, cache read and output, so that a rebuild that moves tokens between classes is visible.
 27. As the proxy's author, I want notional dollars at list price beside the token counts, so that a stranger can read the cost in one number.
@@ -94,7 +94,7 @@ is shown but never decides.
 39. As the proxy's author, I want the eval to never write to a transcript in my projects directory, so that a bug cannot corrupt the sessions it reads.
 40. As a stranger reading the result, I want one table with control, previous build and current build, so that I can judge the claim without reading the code.
 41. As a stranger reading the result, I want the grader's agreement with hand labels stated beside the result, so that I know how much to trust the grader.
-42. As a stranger reading the result, I want the approximations named, so that I know the planning forks ran under today's Claude Code, the repo commit per case is approximate, and the planning cases stop at the first compaction.
+42. As a stranger reading the result, I want the approximations named, so that I know the planning forks ran under today's Claude Code, the repo commit per case is approximate, and every planning case sits on history that opens with a compaction summary.
 
 ## Implementation Decisions
 
