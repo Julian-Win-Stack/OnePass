@@ -23,12 +23,14 @@ npm run build
 node dist/main.js replay                      # no model calls, no score, free
 node dist/main.js quick                       # three proxied tails, every second planning case
 node dist/main.js full --compare a001c2b-20260906T101112Z
+
+node dist/main.js import <transcript.jsonl> --tip <uuid>   # copy one session into the corpus
 ```
 
-**Nothing is measured yet.** What exists is the spine the arms are written into: the command and
+**No arm is measured yet.** What exists is the spine the arms are written into — the command and
 its modes, the corpus directory, the control baseline, the proxy child, and the result document
-every later ticket writes into. A run today builds the proxy, starts a child, and writes a result
-document with no cases in it.
+every later ticket writes into — and the corpus import that gives them a session to read. A run
+today builds the proxy, starts a child, and writes a result document with no cases in it.
 
 - **The corpus.** `ONEPASS_EVAL_CORPUS` names one directory holding every byte of session
   content: transcript copies, fork and grader outputs, hand labels, the control baseline and the
@@ -52,6 +54,58 @@ document with no cases in it.
 - **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
   can be driven with no key and no money. Replay mode serves its own fake upstream to the proxy
   child; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+
+## Importing a session
+
+```
+node dist/main.js import \
+  ~/.claude/projects/-Users-...-chp99-takehome/62d8de7e-c2f3-448d-829f-9d25b23123eb.jsonl \
+  --tip b7881712-2e5c-4b77-a409-02ceb65f496f --name planning
+```
+
+That copies the transcript into `$ONEPASS_EVAL_CORPUS/transcripts/` and prints the branch it
+holds: turn counts, compaction points and the token trajectory, then what the file held around the
+branch. The original under the projects directory is only ever opened for reading.
+
+**A transcript file is a tree, not a list, and a session is one branch of it.** Every entry records
+its parent. A rewind leaves the path it abandoned in the file with nothing marking it; entries are
+rewritten in place, so the same uuid recurs and the last copy is the authoritative one; and a
+resumed session copies its ancestor in, so one file holds entries from more than one session id.
+The reader resolves those three before it counts anything, and in that order — duplicates, then the
+walk from the tip, then the filter to conversation entries. Filtering first snaps the chain, because
+the spine runs through `system` and `attachment` entries that are not conversation.
+
+It matters. The planning corpus file read flat looks like 95 typed turns and 5 compactions; the
+branch the corpus is taken from is 57 typed turns and 2 compactions.
+
+`--tip` is what chooses the branch. Without it the branch ending at the last entry written is the
+one imported, which for the planning session is *not* the branch the corpus uses — the deep Fable
+branch was rewound out of. Being rewound out of does not make a branch less real: the model saw
+that context and answered against it.
+
+**Compactions are not on the branch.** Each one writes a root of its own — a `system` entry with a
+null parent, with the summary hanging off it — while the conversation spine's parent links run
+straight through it unbroken. So the reader never looks for a compaction summary in the chain. It
+finds boundaries by scanning the file for `compact_boundary` entries and matching each one's
+`logicalParentUuid`, the last entry it preserved, against the walked path. On the spine a compaction
+shows only as a fall in reported usage, and the two are matched: a fall with no boundary straddling
+it is printed as unexplained rather than called a compaction. Nothing downstream depends on getting
+this exactly right — a turn's depth is read from its own recorded usage, which is absolute — so a
+boundary in the wrong place mislabels a report line rather than corrupting case selection.
+
+Two smaller things the reader has to know. An `assistant` entry whose model is `<synthetic>` is an
+interrupt or an error notice rather than an API turn; it reports zeroes, and letting them into the
+trajectory would read as the context collapsing, so it is counted separately and contributes no
+usage. And entry types vary by Claude Code version — the corpus branch is 2.1.222, current sessions
+are 2.1.260 and carry `bridge-session`, `ai-title` and `atis-latch`, which did not exist then — so an
+entry type the reader does not recognise is passed over, never a parse failure.
+
+Beside the copy the import writes `<name>.import.json`: the source, the tip, the counts, the
+compactions, the stretches and the full trajectory. The turn model itself is not written out; it is
+read from the copy whenever it is wanted.
+
+`planningCorpus.test.ts` holds the numbers above as assertions against the real transcript, and
+skips itself where that transcript is not present.
 
 ## The A/B rig it is replacing
 

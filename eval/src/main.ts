@@ -5,8 +5,10 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { parseArgs, USAGE, wantsHelp } from "./args.js";
+import { parseArgs, USAGE, wantsHelp, type ImportCommand, type RunCommand } from "./args.js";
+import { resolveCorpus } from "./corpus.js";
 import { EvalError, messageOf, UsageError } from "./errors.js";
+import { importSession, renderImport } from "./importSession.js";
 import { runEval } from "./run.js";
 
 async function main(argv: string[]): Promise<number> {
@@ -14,7 +16,11 @@ async function main(argv: string[]): Promise<number> {
     console.log(USAGE);
     return 0;
   }
-  const options = parseArgs(argv);
+  const command = parseArgs(argv);
+  return command.kind === "import" ? importOne(command) : run(command);
+}
+
+async function run(options: RunCommand): Promise<number> {
   const repoRoot = repositoryRoot();
   const { result, written } = await runEval({ options, env: process.env, repoRoot });
 
@@ -22,6 +28,13 @@ async function main(argv: string[]): Promise<number> {
   console.log(`[onepass-eval] corpus:  ${result.corpusDir}`);
   console.log(`[onepass-eval] result:  ${written.jsonPath}`);
   console.log(`[onepass-eval] table:   ${written.markdownPath}`);
+  return 0;
+}
+
+function importOne(command: ImportCommand): number {
+  const corpus = resolveCorpus(process.env, repositoryRoot());
+  const imported = importSession(corpus, command.transcript, { tip: command.tip, name: command.name });
+  console.log(renderImport(imported));
   return 0;
 }
 

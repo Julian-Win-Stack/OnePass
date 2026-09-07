@@ -1,27 +1,40 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isScored, parseArgs, USAGE, wantsHelp } from "./args.js";
+import { isScored, parseArgs, USAGE, wantsHelp, type ImportCommand, type RunCommand } from "./args.js";
 import { UsageError } from "./errors.js";
 
+/** Narrows to a run, so a test that means to read a mode fails loudly when it did not get one. */
+function run(argv: string[]): RunCommand {
+  const command = parseArgs(argv);
+  assert.equal(command.kind, "run");
+  return command as RunCommand;
+}
+
+function imported(argv: string[]): ImportCommand {
+  const command = parseArgs(argv);
+  assert.equal(command.kind, "import");
+  return command as ImportCommand;
+}
+
 test("reads each mode", () => {
-  assert.equal(parseArgs(["replay"]).mode, "replay");
-  assert.equal(parseArgs(["quick"]).mode, "quick");
-  assert.equal(parseArgs(["full"]).mode, "full");
+  assert.equal(run(["replay"]).mode, "replay");
+  assert.equal(run(["quick"]).mode, "quick");
+  assert.equal(run(["full"]).mode, "full");
 });
 
 test("defaults the optional arguments to null", () => {
-  const options = parseArgs(["quick"]);
+  const options = run(["quick"]);
   assert.equal(options.compareWith, null);
   assert.equal(options.resultsDir, null);
 });
 
 test("takes the label of a previous run, either spelling", () => {
-  assert.equal(parseArgs(["quick", "--compare", "abc1234-20260906T101112Z"]).compareWith, "abc1234-20260906T101112Z");
-  assert.equal(parseArgs(["quick", "--compare=abc1234-20260906T101112Z"]).compareWith, "abc1234-20260906T101112Z");
+  assert.equal(run(["quick", "--compare", "abc1234-20260906T101112Z"]).compareWith, "abc1234-20260906T101112Z");
+  assert.equal(run(["quick", "--compare=abc1234-20260906T101112Z"]).compareWith, "abc1234-20260906T101112Z");
 });
 
 test("takes a results directory", () => {
-  assert.equal(parseArgs(["full", "--results-dir", "/tmp/out"]).resultsDir, "/tmp/out");
+  assert.equal(run(["full", "--results-dir", "/tmp/out"]).resultsDir, "/tmp/out");
 });
 
 test("refuses a missing mode", () => {
@@ -48,14 +61,41 @@ test("refuses an option with no value", () => {
   );
 });
 
+test("import takes a transcript, and a tip and a name are optional", () => {
+  const bare = imported(["import", "/tmp/session.jsonl"]);
+  assert.equal(bare.transcript, "/tmp/session.jsonl");
+  assert.equal(bare.tip, null);
+  assert.equal(bare.name, null);
+
+  const named = imported(["import", "/tmp/session.jsonl", "--tip", "b788171", "--name=planning"]);
+  assert.equal(named.tip, "b788171");
+  assert.equal(named.name, "planning");
+});
+
+test("import refuses without a transcript, and refuses a second one", () => {
+  assert.throws(
+    () => parseArgs(["import"]),
+    (err: unknown) => err instanceof UsageError && /needs the path of a transcript/.test(err.message),
+  );
+  assert.throws(
+    () => parseArgs(["import", "a.jsonl", "b.jsonl"]),
+    (err: unknown) => err instanceof UsageError && /unexpected argument: b.jsonl/.test(err.message),
+  );
+});
+
+test("import refuses a run's options, and a run refuses import's", () => {
+  assert.throws(() => parseArgs(["import", "a.jsonl", "--compare", "x"]), UsageError);
+  assert.throws(() => parseArgs(["quick", "--tip", "x"]), UsageError);
+});
+
 test("recognises a request for the usage text", () => {
   assert.equal(wantsHelp(["--help"]), true);
   assert.equal(wantsHelp(["-h"]), true);
   assert.equal(wantsHelp(["quick"]), false);
 });
 
-test("the usage text names every mode and the corpus variable", () => {
-  for (const needle of ["replay", "quick", "full", "ONEPASS_EVAL_CORPUS"]) {
+test("the usage text names every mode, the import command and the corpus variable", () => {
+  for (const needle of ["replay", "quick", "full", "import", "--tip", "ONEPASS_EVAL_CORPUS"]) {
     assert.ok(USAGE.includes(needle), `usage does not mention ${needle}`);
   }
 });

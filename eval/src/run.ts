@@ -11,7 +11,7 @@
 // nothing but the build.
 
 import { isScored } from "./args.js";
-import type { Options } from "./args.js";
+import type { RunCommand } from "./args.js";
 import {
   openBaselineStore,
   planningBaselineKey,
@@ -39,7 +39,7 @@ export const UPSTREAM_ENV = "ONEPASS_EVAL_UPSTREAM";
 export const DEFAULT_UPSTREAM = "https://api.anthropic.com";
 
 export interface RunContext {
-  options: Options;
+  options: RunCommand;
   env: NodeJS.ProcessEnv;
   repoRoot: string;
   /** Read once when the run starts and once when it ends; injected so tests can pin a label. */
