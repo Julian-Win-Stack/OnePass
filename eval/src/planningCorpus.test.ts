@@ -42,8 +42,21 @@ test("the deep Fable branch reads as the corpus decisions describe it", (t) => {
   // Single-model, single-version: Fable 5 at xhigh throughout, on Claude Code 2.1.222.
   assert.deepEqual(new Set(branch.turns.map((turn) => turn.version)), new Set(["2.1.222"]));
   assert.deepEqual(
-    branch.stretches.flatMap((stretch) => stretch.models.map((entry) => entry.name)),
-    ["claude-fable-5", "claude-fable-5", "claude-fable-5"],
+    branch.stretches.map((stretch) => stretch.models.map((entry) => entry.name)),
+    [["claude-fable-5"], ["claude-fable-5"], ["claude-fable-5"]],
+  );
+  // Effort is read from the top level of an `assistant` entry, which only a real transcript can
+  // confirm: xhigh throughout, bar the four turns the session opened on at high.
+  assert.deepEqual(
+    branch.stretches.map((stretch) => stretch.efforts),
+    [
+      [
+        { name: "xhigh", count: 136 },
+        { name: "high", count: 4 },
+      ],
+      [{ name: "xhigh", count: 315 }],
+      [{ name: "xhigh", count: 68 }],
+    ],
   );
 
   // A resumed session copied its ancestor in, so one file holds entries from two session ids.

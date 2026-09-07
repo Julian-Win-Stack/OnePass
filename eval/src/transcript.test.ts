@@ -314,6 +314,56 @@ test("the stretches between compactions carry the model and effort they were rec
   assert.equal(second?.typedTurns, 1);
 });
 
+test("a compaction that precedes every turn on the branch is what opened its first stretch", () => {
+  // The branch opens on a non-conversation entry, and that is the last entry the compaction
+  // preserved — so the boundary sits before every turn there is. It cuts nothing, but the history
+  // does open with a compaction, and calling that stretch "from the start" would be a lie.
+  const path = write([
+    systemEntry("s1", null),
+    typed("u1", "s1", "the first turn after the compaction"),
+    model("a1", "u1", { contextTokens: 8_000 }),
+    compactBoundary("k1", "s1", { trigger: "auto" }),
+  ]);
+
+  const branch = readTranscript(path, { tip: "a1" });
+  assert.equal(branch.compactions[0]?.afterIndex, -1, "the boundary precedes every turn");
+  assert.equal(branch.compactions[0]?.trigger, "auto");
+  assert.equal(branch.stretches.length, 1);
+  assert.equal(branch.stretches[0]?.openedBy, "k1", "the stretch did not start from the start");
+});
+
+test("a subagent's model turn is not the branch's, and never enters the trajectory", () => {
+  const path = write([
+    typed("u1", null, "start"),
+    model("a1", "u1", { contextTokens: 150_000 }),
+    // A subagent answers inside its own much smaller context. Counted as a model turn, its 9k
+    // would read as the conversation collapsing.
+    model("sub", "a1", { contextTokens: 9_000, isSidechain: true }),
+    model("a2", "sub", { contextTokens: 160_000 }),
+  ]);
+
+  const branch = readTranscript(path, { tip: "a2" });
+  assert.deepEqual(branch.trajectory.map((point) => point.contextTokens), [150_000, 160_000]);
+  assert.deepEqual(branch.unexplainedDrops, [], "a sidechain turn must not manufacture a drop");
+  assert.equal(branch.counts.model, 2);
+  assert.equal(branch.counts.sidechain, 1);
+  assert.equal(branch.stretches[0]?.modelTurns, 2);
+});
+
+test("every fall in reported usage is accounted for, however small", () => {
+  // No floor under a drop: a size below which a fall is neither matched nor reported would be the
+  // one thing that can go unmentioned.
+  const path = write([
+    typed("u1", null, "start"),
+    model("a1", "u1", { contextTokens: 100_000 }),
+    model("a2", "a1", { contextTokens: 99_950 }),
+  ]);
+
+  const branch = readTranscript(path, { tip: "a2" });
+  assert.equal(branch.unexplainedDrops.length, 1);
+  assert.equal(branch.unexplainedDrops[0]?.toTokens, 99_950);
+});
+
 test("a file that holds more than one session id says which ones the branch runs through", () => {
   const path = write([
     typed("u1", null, "recorded in the ancestor", { sessionId: "ancestor" }),

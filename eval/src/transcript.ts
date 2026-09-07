@@ -28,17 +28,10 @@
 // The source file is only ever read. Nothing in this module opens a transcript for writing.
 
 import { readFileSync } from "node:fs";
-import { EvalError } from "./errors.js";
+import { EvalError, messageOf } from "./errors.js";
 
 /** The model an `assistant` entry carries when it is an interrupt or an error notice, not a real API turn. */
 export const SYNTHETIC_MODEL = "<synthetic>";
-
-/**
- * A fall in reported context smaller than this is jitter, not a compaction. Measured on the corpus
- * branch, where context never falls at all except at the two compactions — 172,630 to 57,284 and
- * 290,591 to 77,986 — so the floor only has to keep a noisier transcript from inventing boundaries.
- */
-const DROP_FLOOR_TOKENS = 1_000;
 
 /** What one model turn reported it was shown and produced. */
 export interface Usage {
@@ -79,6 +72,13 @@ interface TurnBase {
   sessionId: string | null;
   /** The Claude Code version that wrote the entry. */
   version: string | null;
+  /**
+   * True when the entry belongs to a subagent's conversation rather than the user's. It is read on
+   * every kind of turn, not only the `user` entries the typed-turn rule names, because a subagent's
+   * model turn reports its own much smaller context and would otherwise enter the trajectory and
+   * manufacture a fall that looks like a compaction.
+   */
+  sidechain: boolean;
 }
 
 export interface UserTurn extends TurnBase {
@@ -291,20 +291,20 @@ export function readTranscript(path: string, options: ReadOptions = {}): Branch 
 
   // 2. The walk. Every entry type links, whatever it is, because the spine runs through entries
   //    that are not conversation and dropping them here would snap the chain.
-  const path_ = walk(byUuid, tipUuid);
+  const walked = walk(byUuid, tipUuid);
 
   // 3. The filter, and only now.
-  const turns = buildTurns(path_);
+  const turns = buildTurns(walked);
   const trajectory = buildTrajectory(turns);
   const drops = findDrops(trajectory);
-  const { compactions, unexplained } = locateCompactions(byUuid, path_, turns, drops);
+  const { compactions, unexplained } = locateCompactions(byUuid, walked, turns, drops);
   const stretches = buildStretches(turns, compactions);
 
   return {
     source: path,
     tipUuid,
     tipChosen,
-    sessionIds: distinct(path_.map((entry) => stringOr(entry.sessionId, null))),
+    sessionIds: distinct(walked.map((entry) => stringOr(entry.sessionId, null))),
     turns,
     counts: countTurns(turns),
     trajectory,
@@ -321,9 +321,9 @@ export function readTranscript(path: string, options: ReadOptions = {}): Branch 
       roots: [...byUuid.values()].filter((entry) => stringOr(entry.parentUuid, null) === null).length,
       branches: countBranches(byUuid),
       sessionIds: distinct([...byUuid.values()].map((entry) => stringOr(entry.sessionId, null))),
-      pathLength: path_.length,
-      pathTypes: tally(countBy(path_.map((entry) => stringOr(entry.type, "<untyped>")))),
-      entriesOffPath: byUuid.size - path_.length,
+      pathLength: walked.length,
+      pathTypes: tally(countBy(walked.map((entry) => stringOr(entry.type, "<untyped>")))),
+      entriesOffPath: byUuid.size - walked.length,
     },
   };
 }
@@ -332,7 +332,7 @@ function readSource(path: string): string {
   try {
     return readFileSync(path, "utf8");
   } catch (err: unknown) {
-    throw new EvalError(`cannot read the transcript at ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new EvalError(`cannot read the transcript at ${path}: ${messageOf(err)}`);
   }
 }
 
@@ -375,13 +375,14 @@ function buildTurns(path: Entry[]): Turn[] {
     const type = stringOr(entry.type, null);
     if (type !== "user" && type !== "assistant") return;
     const base = {
-      uuid: stringOr(entry.uuid, "") as string,
+      uuid: stringOr(entry.uuid, ""),
       parentUuid: stringOr(entry.parentUuid, null),
       index: turns.length,
       pathIndex,
       timestamp: stringOr(entry.timestamp, null),
       sessionId: stringOr(entry.sessionId, null),
       version: stringOr(entry.version, null),
+      sidechain: entry.isSidechain === true,
     };
     turns.push(type === "user" ? readUserTurn(entry, base) : readModelTurn(entry, base));
   });
@@ -394,9 +395,9 @@ function buildTurns(path: Entry[]): Turn[] {
  * excluded keeps a kind of its own, so a compaction summary or an injected meta entry is
  * distinguishable from a typed turn and can never be counted as one.
  */
-function readUserTurn(entry: Entry, base: Omit<TurnBase, never>): UserTurn {
+function readUserTurn(entry: Entry, base: TurnBase): UserTurn {
   const content = messageContent(entry);
-  const kind: UserTurn["kind"] = entry.isSidechain === true
+  const kind: UserTurn["kind"] = base.sidechain
     ? "sidechain"
     : entry.isMeta === true
       ? "meta"
@@ -408,7 +409,7 @@ function readUserTurn(entry: Entry, base: Omit<TurnBase, never>): UserTurn {
   return { ...base, kind, text: textOf(content) };
 }
 
-function readModelTurn(entry: Entry, base: Omit<TurnBase, never>): ModelTurn {
+function readModelTurn(entry: Entry, base: TurnBase): ModelTurn {
   const message = asRecord(entry.message);
   const model = stringOr(message?.model, null);
   const synthetic = model === SYNTHETIC_MODEL;
@@ -444,7 +445,7 @@ function readUsage(value: unknown): Usage | null {
 function buildTrajectory(turns: Turn[]): TrajectoryPoint[] {
   const points: TrajectoryPoint[] = [];
   for (const turn of turns) {
-    if (turn.kind !== "model" || turn.synthetic || turn.usage === null) continue;
+    if (turn.kind !== "model" || turn.sidechain || turn.synthetic || turn.usage === null) continue;
     points.push({
       index: turn.index,
       uuid: turn.uuid,
@@ -455,13 +456,19 @@ function buildTrajectory(turns: Turn[]): TrajectoryPoint[] {
   return points;
 }
 
-/** Every fall in reported context between consecutive real model turns, jitter excepted. */
+/**
+ * Every fall in reported context between consecutive real model turns — every one, with no floor
+ * under it. A floor would be a size below which a fall is neither matched to a compaction nor
+ * reported as unmatched, and a fall nobody is told about is the one thing this must not produce.
+ * Measured on the corpus branch, context never falls at all except at the two compactions, so
+ * there is nothing for a floor to suppress but a real surprise.
+ */
 function findDrops(trajectory: TrajectoryPoint[]): UsageDrop[] {
   const drops: UsageDrop[] = [];
   for (let i = 1; i < trajectory.length; i += 1) {
     const from = trajectory[i - 1] as TrajectoryPoint;
     const to = trajectory[i] as TrajectoryPoint;
-    if (from.contextTokens - to.contextTokens < DROP_FLOOR_TOKENS) continue;
+    if (to.contextTokens >= from.contextTokens) continue;
     drops.push({
       fromIndex: from.index,
       fromUuid: from.uuid,
@@ -509,7 +516,7 @@ function locateCompactions(
     if (position === undefined) continue; // A compaction on some other branch of the same file.
     const metadata = asRecord(entry.compactMetadata);
     compactions.push({
-      uuid: stringOr(entry.uuid, "") as string,
+      uuid: stringOr(entry.uuid, ""),
       trigger: stringOr(metadata?.trigger, null),
       preTokens: numberOrNull(metadata?.preTokens),
       postTokens: numberOrNull(metadata?.postTokens),
@@ -553,9 +560,12 @@ function buildStretches(turns: Turn[], compactions: Compaction[]): Stretch[] {
   const cuts = compactions.map((compaction) => compaction.afterIndex).filter((index) => index >= 0 && index < turns.length - 1);
   const stretches: Stretch[] = [];
   let from = 0;
-  let openedBy: string | null = null;
+  // A boundary at -1 precedes every turn, which is what a branch forked from just after a
+  // compaction looks like: it cuts nothing, but it is what opened the first stretch, and saying
+  // "from the start" of history that opens with a compaction summary would be a lie.
+  let openedBy: string | null = compactions.find((compaction) => compaction.afterIndex === -1)?.uuid ?? null;
   for (const cut of [...cuts, turns.length - 1]) {
-    if (from <= cut) stretches.push(describeStretch(turns, stretches.length, from, cut, openedBy));
+    if (from <= cut) stretches.push(buildStretch(turns, stretches.length, from, cut, openedBy));
     const compaction = compactions.find((candidate) => candidate.afterIndex === cut);
     openedBy = compaction?.uuid ?? null;
     from = cut + 1;
@@ -563,7 +573,7 @@ function buildStretches(turns: Turn[], compactions: Compaction[]): Stretch[] {
   return stretches;
 }
 
-function describeStretch(turns: Turn[], index: number, from: number, to: number, openedBy: string | null): Stretch {
+function buildStretch(turns: Turn[], index: number, from: number, to: number, openedBy: string | null): Stretch {
   const slice = turns.slice(from, to + 1);
   const models = new Map<string, number>();
   const efforts = new Map<string, number>();
@@ -572,7 +582,7 @@ function describeStretch(turns: Turn[], index: number, from: number, to: number,
   let modelTurns = 0;
   for (const turn of slice) {
     if (turn.kind === "typed") typedTurns += 1;
-    if (turn.kind !== "model" || turn.synthetic) continue;
+    if (turn.kind !== "model" || turn.sidechain || turn.synthetic) continue;
     modelTurns += 1;
     models.set(turn.model ?? "<unrecorded>", (models.get(turn.model ?? "<unrecorded>") ?? 0) + 1);
     efforts.set(turn.effort ?? "<unrecorded>", (efforts.get(turn.effort ?? "<unrecorded>") ?? 0) + 1);
@@ -607,7 +617,10 @@ function countTurns(turns: Turn[]): TurnCounts {
     synthetic: 0,
   };
   for (const turn of turns) {
-    if (turn.kind === "model") {
+    // A subagent's turn is counted as one whatever its entry type, so the branch's own model turns
+    // and the trajectory over them mean the same thing.
+    if (turn.sidechain) counts.sidechain += 1;
+    else if (turn.kind === "model") {
       if (turn.synthetic) counts.synthetic += 1;
       else {
         counts.model += 1;
@@ -617,8 +630,7 @@ function countTurns(turns: Turn[]): TurnCounts {
     } else if (turn.kind === "typed") counts.typed += 1;
     else if (turn.kind === "tool-result") counts.toolResult += 1;
     else if (turn.kind === "meta") counts.meta += 1;
-    else if (turn.kind === "compact-summary") counts.compactSummary += 1;
-    else counts.sidechain += 1;
+    else counts.compactSummary += 1;
   }
   return counts;
 }

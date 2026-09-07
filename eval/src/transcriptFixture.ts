@@ -62,6 +62,8 @@ export interface ModelOptions extends Common {
   effort?: string;
   /** True when the turn answered in text and called no tool. */
   textOnly?: boolean;
+  /** True when the turn belongs to a subagent's conversation rather than the user's. */
+  isSidechain?: boolean;
 }
 
 export function model(uuid: string, parentUuid: string | null, options: ModelOptions = {}): Line {
@@ -71,6 +73,7 @@ export function model(uuid: string, parentUuid: string | null, options: ModelOpt
     : [{ type: "text", text: "answer" }];
   return {
     ...common(options),
+    isSidechain: options.isSidechain ?? false,
     type: "assistant",
     uuid,
     parentUuid,

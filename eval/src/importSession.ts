@@ -54,7 +54,11 @@ export function importSession(corpus: Corpus, source: string, options: ImportOpt
 }
 
 /**
- * What the import recorded. The turn model itself is not written out — it is derived from the copy
+ * What the import recorded. It exists for one thing the copy cannot say on its own: *which branch*
+ * was imported. A transcript file holds many, the copy holds all of them, and every later stage has
+ * to walk the same one — so the tip is written down here rather than retyped from memory.
+ *
+ * The turn model is not written out. It is derived from the copy in a few tens of milliseconds
  * whenever it is wanted, and a second copy of it would be one more thing to keep in step.
  */
 function manifest(branch: Branch, transcriptPath: string): unknown {
@@ -95,16 +99,16 @@ export function renderImport(imported: ImportedSession): string {
   say(`  tip       ${branch.tipUuid} (${branch.tipChosen})`);
   say();
 
-  const c = branch.counts;
+  const counts = branch.counts;
   say(`Turns on the branch: ${branch.turns.length}`);
-  say(`  typed by the user     ${c.typed}`);
-  say(`  model, text only      ${c.modelTextOnly}`);
-  say(`  model, called a tool  ${c.modelToolUse}`);
-  say(`  tool results          ${c.toolResult}`);
-  say(`  compaction summaries  ${c.compactSummary}`);
-  say(`  injected meta         ${c.meta}`);
-  say(`  sidechain             ${c.sidechain}`);
-  say(`  synthetic, no usage   ${c.synthetic}`);
+  say(`  typed by the user     ${counts.typed}`);
+  say(`  model, text only      ${counts.modelTextOnly}`);
+  say(`  model, called a tool  ${counts.modelToolUse}`);
+  say(`  tool results          ${counts.toolResult}`);
+  say(`  compaction summaries  ${counts.compactSummary}`);
+  say(`  injected meta         ${counts.meta}`);
+  say(`  sidechain             ${counts.sidechain}`);
+  say(`  synthetic, no usage   ${counts.synthetic}`);
   say();
 
   say(`Compactions on the branch: ${branch.compactions.length}`);

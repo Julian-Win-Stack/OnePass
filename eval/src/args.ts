@@ -56,6 +56,7 @@ Import
                          written is the one imported.
   --name <name>          File the copy under this name instead of the source file's.
 
+Anywhere
   --help                 Show this text.
 
 Environment
@@ -79,7 +80,7 @@ export function parseArgs(argv: readonly string[]): Command {
 }
 
 function parseRun(argv: readonly string[]): RunCommand {
-  const { positionals, values } = split(argv, ["--compare", "--results-dir"]);
+  const { positionals, values } = splitArgs(argv, ["--compare", "--results-dir"]);
   if (positionals.length === 0) throw new UsageError(`no mode given (expected ${MODES.join(", ")}, or import)`);
   if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
 
@@ -94,7 +95,7 @@ function parseRun(argv: readonly string[]): RunCommand {
 }
 
 function parseImport(argv: readonly string[]): ImportCommand {
-  const { positionals, values } = split(argv, ["--tip", "--name"]);
+  const { positionals, values } = splitArgs(argv, ["--tip", "--name"]);
   if (positionals.length === 0) throw new UsageError("import needs the path of a transcript to read");
   if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
 
@@ -111,7 +112,7 @@ function parseImport(argv: readonly string[]): ImportCommand {
  * of each option named in `takesValue` — `--tip x` and `--tip=x` alike. Any other option is a
  * mistake, and is refused by name.
  */
-function split(
+function splitArgs(
   argv: readonly string[],
   takesValue: readonly string[],
 ): { positionals: string[]; values: Map<string, string> } {
