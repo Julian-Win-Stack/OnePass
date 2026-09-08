@@ -32,8 +32,17 @@ function countTokens(body: string): number {
 /** What an unscripted `/v1/messages` call is answered with, so a caller can tell fake from real. */
 const ANSWER = "fake upstream";
 
-/** A canned assistant turn: the text it ends on, or a call to one of the caller's tools. */
-export type CannedTurn = { say: string } | { call: string; input?: unknown };
+/** One call to one of the caller's tools. */
+export interface CannedToolCall {
+  name: string;
+  input?: unknown;
+}
+
+/**
+ * A canned assistant turn: the text it ends on, or the tools it calls. A turn may call more than
+ * one at a time, which is what a model does when it asks for two files at once.
+ */
+export type CannedTurn = { say: string } | { call: string; input?: unknown } | { calls: CannedToolCall[] };
 
 export interface FakeUpstreamOptions {
   /**
@@ -41,7 +50,7 @@ export interface FakeUpstreamOptions {
    * already served. Returning undefined serves the default one-line answer, which is also what a
    * streamed call always gets.
    */
-  answer?: (turn: number, request: RecordedRequest) => CannedTurn | undefined;
+  answer?: (turn: number) => CannedTurn | undefined;
 }
 
 export interface FakeUpstream {
@@ -55,6 +64,10 @@ export interface FakeUpstream {
 export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Promise<FakeUpstream> {
   const requests: RecordedRequest[] = [];
   let scripted = 0;
+  // Per server, not per process: two fakes running at once would otherwise hand out ids that
+  // interleave, and a tool result is matched to its call by id alone.
+  let toolUses = 0;
+  const nextToolUseId = (): string => `toolu_fake_${(toolUses += 1)}`;
 
   const server = http.createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -75,9 +88,9 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
           streamedMessage(response, ANSWER, tokens);
           return;
         }
-        const turn = options.answer?.(scripted, requests[requests.length - 1] as RecordedRequest);
+        const turn = options.answer?.(scripted);
         if (turn !== undefined) scripted += 1;
-        json(response, 200, message(turn ?? { say: ANSWER }, tokens));
+        json(response, 200, message(turn ?? { say: ANSWER }, nextToolUseId, tokens));
         return;
       }
       json(response, 404, { type: "error", error: { type: "not_found_error", message: `fake upstream has no ${path}` } });
@@ -94,22 +107,21 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
   };
 }
 
-let toolUseId = 0;
-
-function message(turn: CannedTurn, inputTokens: number): unknown {
-  const calling = "call" in turn;
+function message(turn: CannedTurn, nextToolUseId: () => string, inputTokens: number): unknown {
+  const calls = toolCallsOf(turn);
+  const said = "say" in turn ? turn.say : "";
   const content =
-    calling ?
-      [{ type: "tool_use", id: `toolu_fake_${(toolUseId += 1)}`, name: turn.call, input: turn.input ?? {} }]
-    : [{ type: "text", text: turn.say }];
-  const spoken = calling ? JSON.stringify(content) : turn.say;
+    calls === null ?
+      [{ type: "text", text: said }]
+    : calls.map((call) => ({ type: "tool_use", id: nextToolUseId(), name: call.name, input: call.input ?? {} }));
+  const spoken = calls === null ? said : JSON.stringify(content);
   return {
     id: "msg_fake",
     type: "message",
     role: "assistant",
     model: "fake-upstream",
     content,
-    stop_reason: calling ? "tool_use" : "end_turn",
+    stop_reason: calls === null ? "end_turn" : "tool_use",
     usage: {
       input_tokens: inputTokens,
       cache_creation_input_tokens: 0,
@@ -117,6 +129,13 @@ function message(turn: CannedTurn, inputTokens: number): unknown {
       output_tokens: Math.max(1, Math.ceil(spoken.length / 4)),
     },
   };
+}
+
+/** The tools `turn` calls, or null when it is text. */
+function toolCallsOf(turn: CannedTurn): CannedToolCall[] | null {
+  if ("calls" in turn) return turn.calls;
+  if ("call" in turn) return [{ name: turn.call, input: turn.input }];
+  return null;
 }
 
 function json(response: http.ServerResponse, status: number, value: unknown): void {
@@ -127,7 +146,7 @@ function json(response: http.ServerResponse, status: number, value: unknown): vo
 /** The proxy reads usage out of `message_start`, so a streamed answer has to carry one. */
 function streamedMessage(response: http.ServerResponse, text: string, inputTokens: number): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
-  const started = message({ say: text }, inputTokens) as { usage: unknown };
+  const started = message({ say: text }, () => "", inputTokens) as { usage: unknown };
   response.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: started.usage } })}\n\n`);
   response.write(
     `event: content_block_delta\ndata: ${JSON.stringify({

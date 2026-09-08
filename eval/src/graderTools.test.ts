@@ -7,14 +7,14 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GRADER_TOOL_NAMES, graderTools } from "./graderTools.js";
+import { graderTools } from "./graderTools.js";
 
 /** A small repository to read: two files, one of them a directory down. */
 function aRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "onepass-eval-repo-"));
   mkdirSync(join(dir, "src"));
   writeFileSync(join(dir, "README.md"), "Onepass\n=======\n");
-  writeFileSync(join(dir, "src", "evict.ts"), "export function evict(): void {\n  // drops a tool result\n}\n");
+  writeFileSync(join(dir, "src", "evict.ts"), "export function evict(): void {\n  // evicts a tool result\n}\n");
   writeFileSync(join(dir, "src", "keep.ts"), "export const keep = true;\n");
   return dir;
 }
@@ -33,14 +33,13 @@ test("the grader gets read file, search and list, and nothing else", () => {
     graderTools(repo).map((tool) => tool.name),
     ["read_file", "search", "list"],
   );
-  assert.deepEqual([...GRADER_TOOL_NAMES], ["read_file", "search", "list"]);
 });
 
 test("read_file answers with the file's lines, numbered", async () => {
   const repo = aRepo();
   const out = await call(repo, "read_file", { path: "src/evict.ts" });
   assert.match(out, /1\texport function evict\(\): void \{/);
-  assert.match(out, /2\t {2}\/\/ drops a tool result/);
+  assert.match(out, /2\t {2}\/\/ evicts a tool result/);
 });
 
 test("list answers with a directory's entries, directories marked", async () => {
@@ -57,7 +56,7 @@ test("list answers with a directory's entries, directories marked", async () => 
 test("search answers with the file, the line number and the line", async () => {
   const repo = aRepo();
   const out = await call(repo, "search", { pattern: "tool result" });
-  assert.match(out, /^src\/evict\.ts:2:\s+\/\/ drops a tool result$/m);
+  assert.match(out, /^src\/evict\.ts:2:\s+\/\/ evicts a tool result$/m);
   assert.doesNotMatch(out, /keep\.ts/);
 });
 
@@ -89,6 +88,36 @@ test("a symlink pointing out of the repository is refused too", async () => {
   const out = await call(repo, "read_file", { path: "escape.txt" });
   assert.match(out, /outside the repository/);
   assert.doesNotMatch(out, /not the grader's business/);
+});
+
+test("search does not follow a symlink out of the repository either", async () => {
+  // The refusal on read_file is a check on an argument; search takes no path to the file it
+  // reads, so nothing refuses on its behalf and only the walk keeps it inside.
+  const repo = aRepo();
+  const outside = mkdtempSync(join(tmpdir(), "onepass-eval-elsewhere-"));
+  writeFileSync(join(outside, "secret.txt"), "a tool result nobody may grade\n");
+  symlinkSync(join(outside, "secret.txt"), join(repo, "escape.txt"));
+  symlinkSync(outside, join(repo, "escape"));
+
+  const out = await call(repo, "search", { pattern: "nobody may grade" });
+  assert.match(out, /no match/i);
+});
+
+test("neither .git nor node_modules is code the answer was written against", async () => {
+  const repo = aRepo();
+  mkdirSync(join(repo, "node_modules", "left-pad"), { recursive: true });
+  writeFileSync(join(repo, "node_modules", "left-pad", "index.js"), "// evicts a tool result\n");
+  mkdirSync(join(repo, ".git"));
+  writeFileSync(join(repo, ".git", "COMMIT_EDITMSG"), "evicts a tool result\n");
+
+  const found = await call(repo, "search", { pattern: "evicts a tool result" });
+  assert.match(found, /^src\/evict\.ts:2:/m);
+  assert.doesNotMatch(found, /node_modules/);
+  assert.doesNotMatch(found, /COMMIT_EDITMSG/);
+
+  const listed = await call(repo, "list", {});
+  assert.doesNotMatch(listed, /node_modules/);
+  assert.doesNotMatch(listed, /\.git/);
 });
 
 test("a file that is not there is said so, rather than thrown", async () => {

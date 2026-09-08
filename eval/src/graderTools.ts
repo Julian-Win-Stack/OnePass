@@ -15,11 +15,9 @@ import { betaTool } from "@anthropic-ai/sdk/helpers/beta/json-schema";
 import type { BetaRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableTool";
 import type { BetaTool } from "@anthropic-ai/sdk/resources/beta";
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { messageOf } from "./errors.js";
 import { join, relative, resolve, sep } from "node:path";
 import { isInside, resolveThroughSymlinks } from "./paths.js";
-
-/** The whole of the grader's reach, in the order the tools are given to it. */
-export const GRADER_TOOL_NAMES = ["read_file", "search", "list"] as const;
 
 /**
  * A grader tool: an ordinary custom tool, plus the `run` and `parse` the tool runner calls.
@@ -153,7 +151,7 @@ function searchWithin(root: string, pattern: string, path: string): string {
   try {
     expression = new RegExp(pattern);
   } catch (err: unknown) {
-    return `${pattern} is not a regular expression: ${err instanceof Error ? err.message : String(err)}`;
+    return `${pattern} is not a regular expression: ${messageOf(err)}`;
   }
 
   const matches: string[] = [];
@@ -183,7 +181,13 @@ function searchWithin(root: string, pattern: string, path: string): string {
   return matches.length === 0 ? `No match for ${pattern}${path === "." ? "" : ` under ${path}`}.` : matches.join("\n");
 }
 
-/** Every file under `dir`, depth first, skipping what is not code the answer was written against. */
+/**
+ * Every file under `dir`, depth first, skipping what is not code the answer was written against.
+ *
+ * A symlink is never followed, which is what keeps search inside the repository: `readdirSync`
+ * reports one as neither a file nor a directory, so it matches neither arm below. That is also
+ * why a link back up the tree cannot walk the same files forever.
+ */
 function* filesUnder(dir: string): Generator<string> {
   let entries;
   try {
@@ -193,9 +197,6 @@ function* filesUnder(dir: string): Generator<string> {
   }
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (SKIPPED.has(entry.name)) continue;
-    // Not `isDirectory`, which follows nothing: a symlink is left alone rather than followed,
-    // so a link back up the tree cannot walk the same files forever or reach outside the root.
-    if (entry.isSymbolicLink()) continue;
     const path = join(dir, entry.name);
     if (entry.isDirectory()) yield* filesUnder(path);
     else if (entry.isFile()) yield path;

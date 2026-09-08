@@ -43,7 +43,7 @@ interface Graded {
   requests: RecordedRequest[];
 }
 
-interface GradeOptions {
+interface GradeRun {
   random?: () => number;
   maxTurns?: number;
   /** Point the client somewhere other than the fake, which is how a failed call is tested. */
@@ -51,7 +51,7 @@ interface GradeOptions {
 }
 
 /** Grades one pair against a fake upstream running `answer`. */
-async function grade(answer: FakeUpstreamOptions["answer"], options: GradeOptions = {}): Promise<Graded> {
+async function grade(answer: FakeUpstreamOptions["answer"], options: GradeRun = {}): Promise<Graded> {
   const upstream = await startFakeUpstream({ answer });
   const warnings: string[] = [];
   try {
@@ -114,6 +114,12 @@ test("the verdict is the last one the grader wrote, not the first it weighed", a
     says("Verdict: Yes would be right if A had read the rules first.\nIt did not.\n\nVerdict: No"),
   );
   assert.equal(call.verdict, "No");
+
+  // "Verdict:" has to open a line. Prose that mentions one in passing is not an answer, and
+  // reading it as one would count a verdict the grader never gave.
+  const inPassing = await grade(() => says("They asked for a verdict: yes or no. I cannot give one."));
+  assert.equal(inPassing.call.verdict, "Unknown");
+  assert.ok(inPassing.call.problem !== null);
 });
 
 test("the grader is given read file, search and list, and nothing else", async () => {
@@ -183,7 +189,7 @@ test("a grader that never stops calling tools is cut off at forty model turns", 
   assert.equal(requests.length, GRADER_TURN_CAP, "the cap is not what stopped it");
   assert.equal(call.turns, GRADER_TURN_CAP);
   assert.equal(call.verdict, "Unknown");
-  assert.match(call.reason ?? "", /40 model turns/);
+  assert.match(call.reason ?? "", /model turn 40 of its cap of 40/);
 
   // What it was waiting on is the whole point of the warning: a grader stuck reading the same
   // file forty times and one that was one call from an answer are told apart by this line alone.
@@ -207,5 +213,33 @@ test("a call that fails is Unknown with what failed, not a run that throws", asy
 test("the cap can be lowered, and a lowered cap says its own number", async () => {
   const { call, requests } = await grade(() => ({ call: "list", input: {} }), { maxTurns: 3 });
   assert.equal(requests.length, 3);
-  assert.match(call.reason ?? "", /3 model turns/);
+  assert.match(call.reason ?? "", /model turn 3 of its cap of 3/);
+});
+
+test("a cap below one model turn is refused, because the runner would read it as no cap", async () => {
+  await assert.rejects(() => grade(() => says("Verdict: Yes"), { maxTurns: 0 }), /capped at one model turn or more/);
+});
+
+test("a grader waiting on two tool calls at once is told it was waiting on both", async () => {
+  const { call } = await grade(
+    () => ({
+      calls: [
+        { name: "read_file", input: { path: "src/evict.ts" } },
+        { name: "search", input: { pattern: "evict" } },
+      ],
+    }),
+    { maxTurns: 2 },
+  );
+
+  assert.match(call.waitingOn ?? "", /read_file\(/);
+  assert.match(call.waitingOn ?? "", /search\(/);
+});
+
+test("a final message with no text at all is Unknown, and says that is what it was", async () => {
+  const { call, warnings } = await grade(() => says(""));
+
+  assert.equal(call.verdict, "Unknown");
+  assert.match(call.reason ?? "", /no text at all/);
+  assert.equal(warnings.length, 1);
+  assert.ok(call.problem !== null);
 });

@@ -18,7 +18,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessage, BetaToolUseBlock } from "@anthropic-ai/sdk/resources/beta";
 import { graderTools } from "./graderTools.js";
-import { messageOf } from "./errors.js";
+import { EvalError, messageOf } from "./errors.js";
 import type { Problem } from "./result.js";
 
 /**
@@ -34,6 +34,12 @@ const MAX_OUTPUT_TOKENS = 16_000;
 const MAX_WAITING_ON = 300;
 
 export type Verdict = "Yes" | "No" | "Unknown";
+
+/** Which answer was shown as A and which as B: the order chosen for one pair. */
+export interface ShownAs {
+  A: string;
+  B: string;
+}
 
 /** One side of a pair: an answer, and what produced it. */
 export interface Answer {
@@ -52,7 +58,7 @@ export interface Pair {
 }
 
 export interface GraderQuestion {
-  /** Names the question in the result, the warnings and the calibration. */
+  /** Names the question in the result, and in every warning about a call that asked it. */
   id: string;
   /** Asked of the pair, phrased so that Yes is an answer about A. */
   ask: string;
@@ -66,13 +72,12 @@ export interface GraderCall {
   pair: string;
   question: string;
   verdict: Verdict;
-  /** Which answer was shown as A and which as B: the order chosen for this pair. */
-  shownAs: { A: string; B: string };
+  shownAs: ShownAs;
   /** Model turns the call took. */
   turns: number;
   /** Why nothing was decided, or null when the verdict is the grader's own answer. */
   reason: string | null;
-  /** The tool call the grader was left waiting on, or null. */
+  /** The tool call the grader was left waiting on, or null. Several, when it asked for several. */
   waitingOn: string | null;
   /** The run's problems entry, or null when nothing stopped early. */
   problem: Problem | null;
@@ -103,14 +108,19 @@ export interface GradeOptions {
  */
 export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   const { client, model, effort, question, pair, repoPath } = options;
+  // A cap below one is not a cap: the runner treats a falsy `max_iterations` as no limit, so a
+  // caller who passed zero meaning "none" would get an uncapped call rather than a refusal.
   const cap = options.maxTurns ?? GRADER_TURN_CAP;
+  if (!Number.isInteger(cap) || cap < 1) {
+    throw new EvalError(`a grader call has to be capped at one model turn or more, not ${cap}.`);
+  }
   const random = options.random ?? Math.random;
   const warn = options.warn ?? ((line: string) => console.warn(line));
 
   const [first, second] = pair.answers;
   const swap = random() >= 0.5;
   const [a, b] = swap ? [second, first] : [first, second];
-  const shownAs = { A: a.id, B: b.id };
+  const shownAs: ShownAs = { A: a.id, B: b.id };
 
   let turns = 0;
   let last: BetaMessage | null = null;
@@ -134,7 +144,7 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
     failure = `the call failed after ${turns} model turn${turns === 1 ? "" : "s"}: ${messageOf(err)}`;
   }
 
-  const outcome = read({ cap, turns, last, failure });
+  const outcome = outcomeOf({ cap, turns, last, failure });
   const call: GraderCall = {
     case: pair.case,
     pair: pair.id,
@@ -163,21 +173,23 @@ interface Outcome {
  * final message's stop reason, and whether a tool call was left unanswered — is the whole of
  * how the two are told apart, and it is why the cap is enforced by the runner rather than by
  * counting requests here.
+ *
+ * The runner answers every tool call it sends, an unknown tool name included, so the cap is the
+ * only thing that leaves one unanswered. The reason says which turn of which cap it stopped on
+ * rather than asserting the cap was reached, so it stays true if that ever stops being so.
  */
-function read(state: { cap: number; turns: number; last: BetaMessage | null; failure: string | null }): Outcome {
+function outcomeOf(state: { cap: number; turns: number; last: BetaMessage | null; failure: string | null }): Outcome {
   if (state.failure !== null) return { verdict: "Unknown", reason: state.failure, waitingOn: null };
   if (state.last === null) {
     return { verdict: "Unknown", reason: "the call ended without a message from the model.", waitingOn: null };
   }
 
   const pending = unanswered(state.last);
-  if (pending !== null) {
-    const waitingOn = describe(pending);
+  if (pending.length > 0) {
+    const waitingOn = pending.map(describe).join(", ");
     const reason =
-      state.turns >= state.cap ?
-        `the call hit its cap of ${state.cap} model turns with a tool call still unanswered.`
-      : `the call stopped on an unanswered tool call after ${state.turns} model turns ` +
-        `(stop reason ${state.last.stop_reason}).`;
+      `the call stopped with a tool call unanswered on model turn ${state.turns} ` +
+      `of its cap of ${state.cap} (stop reason ${state.last.stop_reason}).`;
     return { verdict: "Unknown", reason, waitingOn };
   }
 
@@ -196,14 +208,14 @@ function read(state: { cap: number; turns: number; last: BetaMessage | null; fai
 }
 
 /**
- * The tool call the grader was left waiting on, or null when it was not waiting on one. The
- * runner answers every tool call it sends, so a final message that still asks for one is a call
- * that stopped rather than finished.
+ * The tool calls the grader was left waiting on, or an empty list when it was not waiting on
+ * any. A final message that still asks for one is a call that stopped rather than finished. All
+ * of them are kept: a model asking for two files at once was waiting on both, and naming one
+ * would send whoever reads the warning after half the reason it stopped.
  */
-function unanswered(message: BetaMessage): BetaToolUseBlock | null {
-  if (message.stop_reason !== "tool_use") return null;
-  const calls = message.content.filter((block): block is BetaToolUseBlock => block.type === "tool_use");
-  return calls[calls.length - 1] ?? null;
+function unanswered(message: BetaMessage): BetaToolUseBlock[] {
+  if (message.stop_reason !== "tool_use") return [];
+  return message.content.filter((block): block is BetaToolUseBlock => block.type === "tool_use");
 }
 
 function textOf(message: BetaMessage): string {
@@ -240,7 +252,7 @@ function problemOf(
   pair: Pair,
   question: GraderQuestion,
   outcome: Outcome,
-  shownAs: { A: string; B: string },
+  shownAs: ShownAs,
 ): Problem {
   return {
     what: `grader Unknown: case ${pair.case}, pair ${pair.id}, question ${question.id}`,
