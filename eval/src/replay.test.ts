@@ -213,18 +213,36 @@ test("a stub whose wording changed is a change, even when the sizes did not move
   assert.match(diff.changes[0]?.current ?? "", /a tool result of 600000 chars/);
 });
 
-test("a case list that drifted refuses the comparison rather than diffing what the two share", () => {
-  const previous = [outcome({ caseId: "turn-1" }), outcome({ caseId: "turn-2", segmentsEvicted: 9 })];
-  const current = [outcome({ caseId: "turn-1" }), outcome({ caseId: "turn-9" })];
+// Drift in one direction only, in each direction, as well as both at once. A fixture that only
+// ever drifted both ways would hold just as well if the rule asked for a case missing from the
+// current list *and* one missing from the previous — and then a list that had merely grown, or
+// merely shrunk, would be diffed as though the two builds covered the same turns.
+for (const { what, previousIds, currentIds, gone, added } of [
+  { what: "shrank", previousIds: ["turn-1", "turn-2"], currentIds: ["turn-1"], gone: ["turn-2"], added: [] },
+  { what: "grew", previousIds: ["turn-1"], currentIds: ["turn-1", "turn-9"], gone: [], added: ["turn-9"] },
+  {
+    what: "swapped a case",
+    previousIds: ["turn-1", "turn-2"],
+    currentIds: ["turn-1", "turn-9"],
+    gone: ["turn-2"],
+    added: ["turn-9"],
+  },
+]) {
+  test(`a case list that ${what} refuses the comparison rather than diffing what the two share`, () => {
+    // turn-1 is in both lists and *moved* between them, so a rule that diffed the overlap would
+    // have a change to report. Nothing is reported at all.
+    const previous = previousIds.map((caseId) => outcome({ caseId, segmentsEvicted: 9 }));
+    const current = currentIds.map((caseId) => outcome({ caseId }));
 
-  const diff = diffReplays("abc1234", previous, current);
+    const diff = diffReplays("abc1234", previous, current);
 
-  assert.deepEqual(diff.onlyInPrevious, ["turn-2"]);
-  assert.deepEqual(diff.onlyInCurrent, ["turn-9"]);
-  assert.deepEqual(diff.changes, [], "turn-1 is shared and unchanged, but nothing is reported at all");
-  assert.equal(diff.unchanged, 0);
-  assert.equal(diff.totals, null, "totals over two different sets of turns are not a comparison");
-});
+    assert.deepEqual(diff.onlyInPrevious, gone);
+    assert.deepEqual(diff.onlyInCurrent, added);
+    assert.deepEqual(diff.changes, []);
+    assert.equal(diff.unchanged, 0);
+    assert.equal(diff.totals, null, "totals over two different sets of turns are not a comparison");
+  });
+}
 
 test("with no previous build to compare against, the diff says so rather than inventing one", () => {
   const diff = diffReplays(null, null, [outcome({ caseId: "turn-1" })]);

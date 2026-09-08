@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractCases, selectCases, TRIP_THRESHOLD_TOKENS } from "./cases.js";
+import { extractCases, selectCases, type PlanningCase } from "./cases.js";
 import type { CaseMessage } from "./messages.js";
 import { readTranscript, type Branch } from "./transcript.js";
 import {
@@ -68,7 +68,9 @@ test("only turns past the trip threshold are cases; below it both arms would sen
   );
   assert.equal(list.typedTurns, 3);
   assert.equal(list.belowThreshold, 2);
-  assert.equal(list.thresholdTokens, TRIP_THRESHOLD_TOKENS);
+  // Written out rather than imported: comparing the constant with itself would hold for any value
+  // it was ever changed to, and the number is a claim about the client's compaction point.
+  assert.equal(list.thresholdTokens, 110_000);
 });
 
 test("the fixed system-and-tools overhead counts towards the threshold", async () => {
@@ -91,14 +93,25 @@ test("a compaction summary, a meta entry, a sidechain entry and a tool result ar
       model("a1", "u1", { textOnly: false, contextTokens: 170_000 }),
       toolResult("t1", "a1"),
       model("a2", "t1", { textOnly: true, contextTokens: 172_000 }),
-      typed("m1", "a2", "injected by the harness", { isMeta: true }),
+      // The boundary itself is off the branch — it carries no parentUuid, only a logical one — but
+      // the summary it introduces is a plain user entry sitting *on* the chain, which is the whole
+      // reason it is dangerous. A fixture that hung it off the boundary would leave it unreachable
+      // from the tip, and this test would pass while the exclusion did nothing.
+      compactBoundary("c1", "a2"),
+      compactSummary("cs1", "a2"),
+      typed("m1", "cs1", "injected by the harness", { isMeta: true }),
       typed("s1", "m1", "a subagent's prompt", { isSidechain: true }),
       typed("u2", "s1", "typed by me again"),
       model("a3", "u2", { contextTokens: 9_000 }),
-      compactBoundary("c1", "a2"),
-      compactSummary("cs1", "c1"),
     ],
     "a3",
+  );
+
+  // Each excluded kind has to be reachable from the tip, or the exclusion is never exercised.
+  const { typed: typedTurns, meta, compactSummary: summaries, sidechain, toolResult: results } = branch.counts;
+  assert.deepEqual(
+    { typedTurns, meta, summaries, sidechain, results },
+    { typedTurns: 2, meta: 1, summaries: 1, sidechain: 1, results: 1 },
   );
 
   // Everything is over the threshold, so nothing is left out for being small.
@@ -172,17 +185,33 @@ test("cases are listed in session order, with the turn index they were cut at", 
   );
 });
 
-test("quick mode takes every second eligible case; full mode takes all of them", async () => {
-  const branch = deepBranch();
-  const { cases } = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
+/** Three eligible cases, so a mode that takes half of them takes a different set from one that
+ * takes all of them. */
+async function eligibleCases(): Promise<readonly PlanningCase[]> {
+  const { cases } = await extractCases(deepBranch(), async () => 200_000, { overheadTokens: 0 });
   assert.equal(cases.length, 3, "every typed turn of the fixture is over the threshold");
+  return cases;
+}
 
+test("quick mode takes every second eligible case", async () => {
   assert.deepEqual(
-    selectCases(cases, "quick").map((planningCase) => planningCase.typedIndex),
+    selectCases(await eligibleCases(), "quick").map((planningCase) => planningCase.typedIndex),
     [0, 2],
   );
-  assert.equal(selectCases(cases, "full").length, 3);
-  assert.equal(selectCases(cases, "replay").length, 3, "replay is free, so it covers every case");
+});
+
+test("full mode takes every eligible case", async () => {
+  assert.deepEqual(
+    selectCases(await eligibleCases(), "full").map((planningCase) => planningCase.typedIndex),
+    [0, 1, 2],
+  );
+});
+
+test("replay mode takes every eligible case, because a replay costs nothing to run", async () => {
+  assert.deepEqual(
+    selectCases(await eligibleCases(), "replay").map((planningCase) => planningCase.typedIndex),
+    [0, 1, 2],
+  );
 });
 
 test("the overhead is read from the first model turn's usage when it is not given", async () => {

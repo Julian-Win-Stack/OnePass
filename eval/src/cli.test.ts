@@ -168,12 +168,18 @@ test("quick mode takes every second eligible case, and says which ones it took",
   const selection = result.caseSelection;
   assert.ok(selection !== null);
 
-  assert.equal(selection.selected, Math.ceil(selection.eligible / 2));
+  // Counted off the fixture rather than recomputed from the answer: 13 turns typed, of which the
+  // first is the one before the big tool result and so the only one under the threshold, leaving
+  // 12 eligible and every second one of those taken.
+  assert.deepEqual(
+    { typedTurns: selection.typedTurns, eligible: selection.eligible, belowThreshold: selection.belowThreshold },
+    { typedTurns: 13, eligible: 12, belowThreshold: 1 },
+  );
+  assert.equal(selection.selected, 6);
   assert.deepEqual(
     result.cases.filter((one) => one.selected).map((one) => one.id),
-    result.cases.filter((_, index) => index % 2 === 0).map((one) => one.id),
+    ["turn-4", "turn-8", "turn-12", "turn-18", "turn-22", "turn-26"],
   );
-  assert.equal(selection.eligible + selection.belowThreshold, selection.typedTurns);
 });
 
 test("the case list records the turn index, the prefix size and the tool label", async () => {
@@ -245,24 +251,49 @@ test("the result names the control baseline for both kinds of arm", async () => 
   assert.equal(result.baselines[0]?.directory, "claude-opus-5--xhigh--cc2.1.261");
 });
 
-test("replay serves its own upstream to the children, is not scored, and needs no baseline", async () => {
-  // No Claude Code version: the check run after every proxy fix has to work with nothing set up
-  // but a corpus.
-  const before = upstream.requests.length;
-  const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
-  assert.equal(run.code, 0, run.stderr);
+/**
+ * One replay run, shared by the three tests below that each ask a different question of it. Run
+ * with no Claude Code version set, because the check run after every proxy fix has to work with
+ * nothing set up but a corpus.
+ *
+ * Shared because a replay run costs about a second, and these three read the run rather than
+ * changing it — but they stay three tests, because "the children get their own upstream" failing
+ * and "the run is not scored" failing are different bugs and should be different red lines.
+ */
+let versionlessReplay: { result: RunResult; upstreamPathsDuring: string[] } | null = null;
 
-  const result = resultOf(run);
-  assert.equal(result.scored, false);
+async function replayWithoutAVersion(): Promise<{ result: RunResult; upstreamPathsDuring: string[] }> {
+  if (versionlessReplay === null) {
+    const before = upstream.requests.length;
+    const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
+    assert.equal(run.code, 0, run.stderr);
+    versionlessReplay = {
+      result: resultOf(run),
+      upstreamPathsDuring: upstream.requests.slice(before).map((request) => request.url.split("?")[0]),
+    };
+  }
+  return versionlessReplay;
+}
+
+test("replay serves the children an upstream of its own, never the real API", async () => {
+  const { result, upstreamPathsDuring } = await replayWithoutAVersion();
+
   assert.match(result.upstream, /^http:\/\/127\.0\.0\.1:\d+$/, "replay must not reach the real API");
   assert.notEqual(result.upstream, upstream.url, "the children forward to replay's own fake, not the run's");
 
   // Two upstreams, and only the children's is replay's own. The eval's own sizing calls still go
   // to the run's upstream — which is the real API outside a test — because a replay that measured
   // its cases against a fake would not be listing the cases a scored run covers.
-  const paths = upstream.requests.slice(before).map((request) => request.url.split("?")[0]);
-  assert.deepEqual([...new Set(paths)], ["/v1/messages/count_tokens"], "the run's upstream sized the cases");
+  assert.deepEqual([...new Set(upstreamPathsDuring)], ["/v1/messages/count_tokens"], "the run's upstream sized the cases");
+});
 
+test("a replay run is not scored", async () => {
+  const { result } = await replayWithoutAVersion();
+  assert.equal(result.scored, false);
+});
+
+test("a replay run needs no baseline to compare against", async () => {
+  const { result } = await replayWithoutAVersion();
   assert.deepEqual(result.baselines, [], "replay has no control to compare against");
 });
 
@@ -274,11 +305,26 @@ test("replay pushes every case through a proxy child and reports what came out",
   const replay = result.replay;
   assert.ok(replay !== null, "a replay run reports a replay");
   assert.equal(replay.outcomes.length, result.cases.length, "replay is free, so it covers every case");
-  assert.ok(replay.totals.trips > 0, "every case is past the threshold, so every case trips");
-  assert.ok(replay.totals.segmentsEvicted > 0, `nothing was evicted: ${JSON.stringify(replay.totals)}`);
-  assert.ok(
-    replay.totals.forwardedBytes < replay.totals.sentBytes,
-    "the proxy forwarded no less than it was given",
+
+  // Which cases trip, not merely that some do. The three earliest sit inside the proxy's age gate
+  // — too few assistant turns have followed the big tool result for it to be eligible — so they
+  // forward what they were given, byte for byte. From turn-10 on it is old enough to go.
+  assert.deepEqual(
+    replay.outcomes.filter((one) => one.tripped).map((one) => one.caseId),
+    ["turn-10", "turn-12", "turn-16", "turn-18", "turn-20", "turn-22", "turn-24", "turn-26", "turn-28"],
+  );
+  assert.deepEqual(
+    { cases: replay.totals.cases, trips: replay.totals.trips, segmentsEvicted: replay.totals.segmentsEvicted },
+    { cases: 12, trips: 9, segmentsEvicted: 9 },
+    "one segment per trip: there is only the one tool result big enough to be worth a stub",
+  );
+
+  // The saving is the tool result minus the stub that replaced it, nine times over — so a stub
+  // that kept any of the content, or an eviction that dropped more than the one segment, moves it.
+  const stub = "[onepass: evicted 400,000 chars]";
+  assert.equal(
+    replay.totals.sentBytes - replay.totals.forwardedBytes,
+    9 * (400_000 - stub.length),
   );
 
   // The forwarded bodies are session content, so they live in the corpus and not in the repository.
