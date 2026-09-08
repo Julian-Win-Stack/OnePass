@@ -108,7 +108,7 @@ async function runCli(args: string[], options: RunOptions = {}): Promise<Run & {
       env: {
         PATH: process.env.PATH,
         HOME: process.env.HOME,
-        ONEPASS_EVAL_CORPUS: corpus ?? scratch("onepass-eval-corpus-"),
+        ONEPASS_EVAL_CORPUS: corpus,
         ONEPASS_EVAL_CLAUDE_CODE_VERSION: "2.1.261",
         ONEPASS_EVAL_UPSTREAM: upstream.url,
         ...env,
@@ -209,6 +209,20 @@ test("the case list records the turn index, the prefix size and the tool label",
   // turns and the person starting it should see which ones without waiting for the document.
   assert.match(run.stdout, /turn-4\s+154k\s+text/);
   assert.match(run.stdout, /turn-12\s+154k\s+tools/, "the tool label is printed, not only recorded");
+});
+
+test("the progress lines and the result document count the cases the same way", async () => {
+  const run = await runCli(["full"]);
+
+  // Counted by hand from the fixture session: 13 turns typed, and the first sits under the
+  // threshold because the 400,000-character tool result lands after it. 80k, not the proxy's 110k,
+  // for the reason `TRIP_THRESHOLD_TOKENS` gives. A run states these counts twice — once to whoever
+  // started it, once to whoever reads the committed document later — and the two being written in
+  // different places is how they come to disagree.
+  const counted = "12 of 13 typed turns are past the 80k trip threshold";
+  assert.ok(run.stdout.includes(counted), `progress lines do not say "${counted}":\n${run.stdout}`);
+  const table = readFileSync(join(run.results, `${resultOf(run).label}.md`), "utf8");
+  assert.ok(table.includes(counted), `the document does not say "${counted}":\n${table}`);
 });
 
 test("what I typed is printed but never recorded: a result document is committed", async () => {

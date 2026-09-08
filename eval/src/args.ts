@@ -46,7 +46,8 @@ Modes
 
 Every mode lists the eligible cases by rule: the turns of the planning session whose full prefix
 is past the proxy's trip threshold. There is no case manifest — the list is recomputed each run
-and recorded in the result document.
+and recorded in the result document. Sizing a case is a count-tokens call, so every mode needs
+ANTHROPIC_API_KEY: free, but not offline.
 
 Run options
   --compare <label>      Report this run against a previous run's label.

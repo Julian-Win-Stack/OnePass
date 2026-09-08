@@ -55,8 +55,10 @@ lists its cases, replays them if asked, and writes a result document with no sco
   `results/<label>.json` with `results/<label>.md` beside it. Those are committed; the corpus
   never is.
 - **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
-  can be driven with no key and no money. Replay mode serves its own fake upstream to the proxy
-  children; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+  can be driven with no model calls and no money. Replay mode serves its own fake upstream to the
+  proxy children; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`. It is not a
+  cold start, though: sizing a case is a count-tokens call, which is free but still needs
+  `ANTHROPIC_API_KEY` and a route to answer it.
 
 ## Cases
 
@@ -81,7 +83,9 @@ second case; full and replay take all of them.
   so a chars-per-token estimate reads the deepest stretch as three times its real size. The
   endpoint is free, which is why replay measures its cases the same way a scored run does; it
   needs `ANTHROPIC_API_KEY`.
-- **The request is rebuilt as the session sent it.** Claude Code writes one entry per content
+- **For sizing and replay, the request is rebuilt as the session sent it.** A scored case is
+  answered by Claude Code itself, which builds its own request; this rebuild is what sizes a case
+  and what replay pushes through the proxy. Claude Code writes one entry per content
   block, so consecutive entries of one role are merged back into the one message the API saw — a
   rebuild that did not merge them would count several assistant messages where there was one, and
   the proxy's age gate counts assistant messages. History starts at the last compaction the case
@@ -98,7 +102,8 @@ second case; full and replay take all of them.
 node dist/main.js replay
 ```
 
-The check to run after every proxy fix. It makes no model calls and costs nothing: each case's
+The check to run after every proxy fix. It makes no model calls and costs nothing — sizing its
+cases is a count-tokens call, which is free but not offline: each case's
 message list goes into a request body with a placeholder system prompt — eviction acts on
 messages, not on the system prompt — and through a proxy child of its own against the fake
 upstream. One child per case, torn down after, because a child that has already evicted something

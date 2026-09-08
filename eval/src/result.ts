@@ -16,7 +16,7 @@ import type { Mode } from "./args.js";
 import type { BaselineKey } from "./baseline.js";
 import type { AnswerLabel } from "./cases.js";
 import { EvalError, messageOf } from "./errors.js";
-import { formatTokens } from "./format.js";
+import { describeAnswerGroups, describeEligibility, describeSizing, formatTokens } from "./format.js";
 import type { ReplayDiff, ReplayOutcome, ReplayTotals } from "./replay.js";
 
 /** Bumped when a field older result documents carry stops meaning what it did. */
@@ -179,15 +179,12 @@ function renderCases(result: RunResult): string[] {
     return lines;
   }
   lines.push(
-    `${selection.eligible} of ${selection.typedTurns} typed turns are past the ` +
-      `${formatTokens(selection.thresholdTokens)} trip threshold. The other ${selection.belowThreshold} buy no ` +
-      `information: below the threshold the proxy evicts nothing and both arms send the same bytes.`,
+    `${describeEligibility(selection)}. The other ${selection.belowThreshold} buy no information: below the ` +
+      `threshold the proxy evicts nothing and both arms send the same bytes.`,
     "",
-    `Sizes are the message list measured with count-tokens, plus ${formatTokens(selection.overheadTokens)} of ` +
-      `system prompt and tool definitions read from the first model turn's usage.`,
+    describeSizing(selection),
     "",
-    `By recorded answer: ${selection.answers.tools} used tools, ${selection.answers.text} answered in text, ` +
-      `${selection.answers.none} have no recorded answer.`,
+    describeAnswerGroups(selection),
     "",
   );
   if (result.cases.length === 0) return lines;
@@ -264,7 +261,7 @@ function formatBytes(bytes: number): string {
  * outcomes, so diffing against one would report every case as newly appeared; only a run that
  * replayed is a build's replay behaviour written down.
  */
-export function latestReplayBefore(resultsDir: string): RunResult | null {
+export function latestReplayedRun(resultsDir: string): RunResult | null {
   let names: string[];
   try {
     names = readdirSync(resultsDir);

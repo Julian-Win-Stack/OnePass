@@ -7,27 +7,19 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { extractCases, selectCases, type PlanningCase } from "./cases.js";
 import type { CaseMessage } from "./messages.js";
-import { readTranscript, type Branch } from "./transcript.js";
+import type { Branch } from "./transcript.js";
 import {
+  branchOf,
   compactBoundary,
   compactSummary,
   model,
   synthetic,
   toolResult,
   typed,
-  writeTranscript,
   type Line,
 } from "./transcriptFixture.js";
-
-function branchOf(lines: readonly Line[], tip: string): Branch {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "onepass-cases-")));
-  return readTranscript(writeTranscript(dir, "session.jsonl", lines), { tip });
-}
 
 /** Four chars a token, which is what the fake upstream's count-tokens answers too. */
 const byLength = async (messages: readonly CaseMessage[]): Promise<number> =>

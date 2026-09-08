@@ -29,19 +29,20 @@ import { extractCases, selectCases, type CaseList, type PlanningCase } from "./c
 import { API_KEY_ENV, createTokenCounter } from "./countTokens.js";
 import { resolveCorpus } from "./corpus.js";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
-import { formatTokens } from "./format.js";
+import { describeAnswerGroups, describeEligibility, describeSizing, formatTokens } from "./format.js";
 import { openImported, PLANNING_SESSION } from "./importSession.js";
 import { buildProxyUnderTest, withProxyChild, type ProxyBuild } from "./proxy.js";
 import { diffReplays, replayCases, totalsOf, type ReplayOutcome } from "./replay.js";
 import {
   freeLabel,
-  latestReplayBefore,
+  latestReplayedRun,
   readRunResult,
   RESULT_SCHEMA,
   runLabel,
   writeRunResult,
   type BaselineUse,
   type CaseRecord,
+  type CaseSelection,
   type Problem,
   type ReplayReport,
   type RunResult,
@@ -118,7 +119,16 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       createTokenCounter({ baseUrl: sizingUpstream, apiKey: env[API_KEY_ENV] }),
     );
     const selected = selectCases(caseList.cases, options.mode);
-    for (const line of renderCaseList(caseList, selected, options.mode)) say(line);
+    const caseSelection: CaseSelection = {
+      typedTurns: caseList.typedTurns,
+      eligible: caseList.cases.length,
+      selected: selected.length,
+      belowThreshold: caseList.belowThreshold,
+      thresholdTokens: caseList.thresholdTokens,
+      overheadTokens: caseList.overheadTokens,
+      answers: caseList.answers,
+    };
+    for (const line of renderCaseList(caseList, caseSelection, selected, options.mode)) say(line);
     problems.push(...caseProblems(caseList, planning.record.transcriptPath));
 
     const replay =
@@ -156,19 +166,11 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       upstream,
       baselines,
       cases: recordCases(caseList, selected),
-      caseSelection: {
-        typedTurns: caseList.typedTurns,
-        eligible: caseList.cases.length,
-        selected: selected.length,
-        belowThreshold: caseList.belowThreshold,
-        thresholdTokens: caseList.thresholdTokens,
-        overheadTokens: caseList.overheadTokens,
-        answers: caseList.answers,
-      },
+      caseSelection,
       replay,
       arms: [],
       problems,
-      notes: notesFor(options.mode, caseList),
+      notes: notesFor(options.mode, caseList, caseSelection),
     };
     return { result, written: writeRunResult(resultsDir, result) };
   } finally {
@@ -207,7 +209,7 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
   // this build against nothing.
   const against =
     context.compareWith === null
-      ? latestReplayBefore(context.resultsDir)
+      ? latestReplayedRun(context.resultsDir)
       : readRunResult(context.resultsDir, context.compareWith);
   const previous: ReplayOutcome[] | null = against?.replay?.outcomes ?? null;
   return {
@@ -285,13 +287,16 @@ function recordCases(list: CaseList, selected: readonly PlanningCase[]): CaseRec
  * is what a run covers, and a person watching a scored run start should be able to see the turns it
  * is about to spend money on without waiting for the result document.
  */
-function renderCaseList(list: CaseList, selected: readonly PlanningCase[], mode: RunCommand["mode"]): string[] {
+function renderCaseList(
+  list: CaseList,
+  counts: CaseSelection,
+  selected: readonly PlanningCase[],
+  mode: RunCommand["mode"],
+): string[] {
   const ran = new Set(selected.map((planningCase) => planningCase.id));
   const lines = [
-    `[onepass-eval] ${list.cases.length} of ${list.typedTurns} typed turns are past ` +
-      `${formatTokens(list.thresholdTokens)}; ${mode} mode covers ${selected.length} of them`,
-    `[onepass-eval] by recorded answer: ${list.answers.tools} used tools, ${list.answers.text} answered in text, ` +
-      `${list.answers.none} have none`,
+    `[onepass-eval] ${describeEligibility(counts)}; ${mode} mode covers ${selected.length} of them`,
+    `[onepass-eval] ${describeAnswerGroups(counts)}`,
   ];
   for (const planningCase of list.cases) {
     // The id is `turn-<index>`, so it is the turn index as well as the name the diff uses.
@@ -304,11 +309,10 @@ function renderCaseList(list: CaseList, selected: readonly PlanningCase[], mode:
 }
 
 /** Anything a reader has to know to read the numbers honestly. */
-function notesFor(mode: RunCommand["mode"], list: CaseList): string[] {
+function notesFor(mode: RunCommand["mode"], list: CaseList, counts: CaseSelection): string[] {
   const notes = [
     "Nothing is scored yet: this build of the eval lists the cases and replays them, and the arms are not written.",
-    `Case sizes are the message list measured with count-tokens plus ${list.overheadTokens} tokens of system ` +
-      `prompt and tool definitions, read from the first model turn's usage and held fixed for the whole branch.`,
+    `${describeSizing(counts)} That overhead is one number for the whole branch.`,
   ];
   const opened = list.cases.filter((one) => one.opensWithCompactionSummary).length;
   if (opened > 0) {

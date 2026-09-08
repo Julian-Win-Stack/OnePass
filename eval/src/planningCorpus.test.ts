@@ -96,10 +96,13 @@ test("the branch carries the 37 eligible turns the corpus decision was made on",
 
   const branch = readTranscript(TRANSCRIPT, { tip: TIP });
 
-  // The figure in eval/decision.md was measured against recorded usage: a turn's depth is what the
-  // last model turn before it reported it was shown. A run measures the same prefixes with
-  // count-tokens instead, which needs a key — this is the check that the branch itself still holds
-  // the turns that measurement found. If it stops holding them, the decision is wrong, not the run.
+  // The figure in eval/decision.md was measured backwards: a turn's depth is what the last model
+  // turn *before* it reported it was shown. This is not the prefix a run measures. A compaction
+  // collapses the context, so a turn typed just after one is credited here with the depth reached
+  // before the collapse, while `extractCases` sizes the rebuilt prefix, which starts at the
+  // compaction. The two disagree on eight turns; the bullet of 2026-09-08 in eval/decision.md has
+  // the reconciliation. This test pins the old measure as it was taken, so the branch is still the
+  // one that decision was made on — it is not a check that a run would list these turns.
   const depthAt = (index: number): number => {
     const before = [...branch.turns.slice(0, index)].reverse().find(isRealModelTurn);
     return before?.usage?.contextTokens ?? 0;

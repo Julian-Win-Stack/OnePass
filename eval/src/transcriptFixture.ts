@@ -6,8 +6,10 @@
 // the same uuid, a spine running through entries that are not conversation, a compaction written
 // as a root of its own, and entry types from a Claude Code version that did not exist yet.
 
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readTranscript, type Branch } from "./transcript.js";
 
 export type Line = Record<string, unknown>;
 
@@ -189,4 +191,14 @@ export function writeTranscript(dir: string, name: string, lines: readonly Line[
   const path = join(dir, name);
   writeFileSync(path, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
   return path;
+}
+
+/**
+ * The branch these lines hold, read the way a run reads one: written to a real file and walked
+ * back from `tip`. The reader takes a path and nothing else, so a fixture that skipped the file
+ * would be testing a function that does not exist.
+ */
+export function branchOf(lines: readonly Line[], tip: string): Branch {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "onepass-fixture-")));
+  return readTranscript(writeTranscript(dir, "session.jsonl", lines), { tip });
 }

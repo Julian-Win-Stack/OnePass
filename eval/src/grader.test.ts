@@ -179,7 +179,7 @@ test("the grader is given read file, search and list, and nothing else", async (
 
 test("it reads the repository through those tools, and what it read reaches the model", async () => {
   const { call, requests } = await grade((turn) =>
-    turn === 0 ? { call: "read_file", input: { path: "src/evict.ts" } } : says("Verdict: No"),
+    turn === 0 ? { calls: [{ name: "read_file", input: { path: "src/evict.ts" } }] } : says("Verdict: No"),
   );
 
   assert.equal(call.verdict, "No");
@@ -244,7 +244,7 @@ test("the second breakpoint follows the tool results down, one mark at a time", 
   // on every turn. Marking the newest result instead is what makes each turn read back the ones
   // before it. The old mark has to go: the API allows four and a call may take forty turns, so
   // marks left behind would fail the call outright partway through.
-  const { call, requests } = await grade((turn) => (turn < 3 ? { call: "list", input: {} } : says("Verdict: Yes")));
+  const { call, requests } = await grade((turn) => (turn < 3 ? { calls: [{ name: "list", input: {} }] } : says("Verdict: Yes")));
 
   assert.equal(call.turns, 4);
   assert.deepEqual(marked(sent(requests, 0)), ["0:0 text"]);
@@ -258,7 +258,7 @@ test("a tool the grader invented is answered, not left to end the call", async (
   // died there would be counted as an Unknown the grader chose. It is told what it may call
   // instead, which is the same bargain the tools make by answering a bad path as text.
   const { call, requests } = await grade((turn) =>
-    turn === 0 ? { call: "write_file", input: { path: "x" } } : says("Verdict: No"),
+    turn === 0 ? { calls: [{ name: "write_file", input: { path: "x" } }] } : says("Verdict: No"),
   );
 
   assert.equal(call.verdict, "No");
@@ -274,7 +274,7 @@ test("a call records how full its context was when it finished", async () => {
   // reached the model, and would read *smaller* the better the cache worked.
   const { call } = await grade((turn) =>
     turn === 0 ?
-      { call: "list", input: {}, usage: { input: 4_000, cacheCreation: 5_000 } }
+      { calls: [{ name: "list", input: {} }], usage: { input: 4_000, cacheCreation: 5_000 } }
     : { say: "Verdict: Yes", usage: { input: 900, cacheRead: 6_000, cacheCreation: 100 } },
   );
 
@@ -287,7 +287,7 @@ test("cache reads are totalled across every turn of a call", async () => {
   // history — exactly the calls where caching matters most.
   const { call } = await grade((turn) =>
     turn < 2 ?
-      { call: "list", input: {}, usage: { cacheRead: 1_500, cacheCreation: 400 } }
+      { calls: [{ name: "list", input: {} }], usage: { cacheRead: 1_500, cacheCreation: 400 } }
     : { say: "Verdict: Yes", usage: { cacheRead: 2_000, cacheCreation: 50 } },
   );
 
@@ -364,7 +364,7 @@ test("an answer with no verdict line is Unknown, with the reason and a problem",
 
 test("a grader that never stops calling tools is cut off at forty model turns", async () => {
   assert.equal(GRADER_TURN_CAP, 40);
-  const { call, warnings, requests } = await grade(() => ({ call: "search", input: { pattern: "evict" } }));
+  const { call, warnings, requests } = await grade(() => ({ calls: [{ name: "search", input: { pattern: "evict" } }] }));
 
   assert.equal(requests.length, GRADER_TURN_CAP, "the cap is not what stopped it");
   assert.equal(call.turns, GRADER_TURN_CAP);
@@ -397,7 +397,7 @@ test("a call that fails on its second turn says it failed after one", async () =
   // The turn count is what separates a grader that never started from one that died halfway, and
   // every other test here dies on turn 0 — where the plural is right whatever the rule says.
   const { call } = await grade(
-    () => ({ call: "list", input: {} }),
+    () => ({ calls: [{ name: "list", input: {} }] }),
     { failWith: (turn) => (turn === 1 ? 500 : undefined) },
   );
 
@@ -416,7 +416,7 @@ test("a call the upstream refuses is not sent again", async () => {
 });
 
 test("the cap can be lowered, and a lowered cap says its own number", async () => {
-  const { call, requests } = await grade(() => ({ call: "list", input: {} }), { maxTurns: 3 });
+  const { call, requests } = await grade(() => ({ calls: [{ name: "list", input: {} }] }), { maxTurns: 3 });
   assert.equal(requests.length, 3);
   assert.match(call.reason ?? "", /model turn 3 of its cap of 3/);
 });
@@ -469,7 +469,7 @@ test("a pending tool call with long arguments is quoted up to 300 characters", a
   // The warning names what the grader was waiting on, and a model can wait on a search whose
   // pattern is longer than the warning. Uncut, one entry would fill the problems list; cut too
   // short, the reader cannot tell which of forty identical searches it stopped on.
-  const { call } = await grade(() => ({ call: "search", input: { pattern: "0123456789".repeat(40) } }), {
+  const { call } = await grade(() => ({ calls: [{ name: "search", input: { pattern: "0123456789".repeat(40) } }] }), {
     maxTurns: 1,
   });
 
@@ -552,7 +552,7 @@ test("a stopped call that also ran hot reports both problems", async () => {
   // Two different facts about one call: it never answered, and it was full when it stopped.
   // Keeping only the first would lose the reason it was reading forty times in the first place.
   const { call, warnings } = await grade(
-    () => ({ call: "search", input: { pattern: "evict" }, usage: { input: 250_000 } }),
+    () => ({ calls: [{ name: "search", input: { pattern: "evict" } }], usage: { input: 250_000 } }),
     { maxTurns: 2 },
   );
 

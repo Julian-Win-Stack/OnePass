@@ -8,26 +8,17 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { buildMessages, historyStart } from "./messages.js";
-import { readTranscript } from "./transcript.js";
 import {
+  branchOf,
   compactBoundary,
   compactSummary,
   model,
   synthetic,
   toolResult,
   typed,
-  writeTranscript,
   type Line,
 } from "./transcriptFixture.js";
-
-function branchOf(lines: readonly Line[], tip: string) {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "onepass-messages-")));
-  return readTranscript(writeTranscript(dir, "session.jsonl", lines), { tip });
-}
 
 /** The role of each message, which is the shape the merge is really about. */
 function roles(messages: readonly { role: string }[]): string[] {
