@@ -10,11 +10,14 @@
 // under `proxy/` says so in its own label, since the SHA alone would be a claim about code that
 // is not what ran.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Mode } from "./args.js";
 import type { BaselineKey } from "./baseline.js";
+import type { AnswerLabel } from "./cases.js";
 import { EvalError, messageOf } from "./errors.js";
+import { formatTokens } from "./format.js";
+import type { ReplayDiff, ReplayOutcome, ReplayTotals } from "./replay.js";
 
 /** Bumped when a field older result documents carry stops meaning what it did. */
 export const RESULT_SCHEMA = 1;
@@ -33,6 +36,51 @@ export interface BaselineUse {
 export interface Problem {
   what: string;
   detail: string;
+}
+
+/**
+ * One eligible case, as a result document records it. No message list and no bodies: those are in
+ * the corpus, and what a stranger has to be able to read here is which turns the run covered and
+ * how deep they were.
+ */
+export interface CaseRecord {
+  id: string;
+  turnIndex: number;
+  typedIndex: number;
+  stretchIndex: number;
+  /** The message list plus the fixed system-and-tools overhead. */
+  prefixTokens: number;
+  messageTokens: number;
+  /** Whether the recorded answer used tools. Not a criterion — a label the groups are read by. */
+  answer: AnswerLabel;
+  /** True when the request opened with a compaction summary rather than the session's own start. */
+  opensWithCompactionSummary: boolean;
+  /** Whether this run covered the case. Quick mode takes every second one; the rest are listed. */
+  selected: boolean;
+}
+
+// What I typed is deliberately not here. A result document is committed, my session's words are
+// corpus content, and the corpus directory exists so that none of it lands in git. A case is named
+// by its turn index, which is enough to find it in the transcript copy.
+
+/** How the case list came out, before any arm ran. */
+export interface CaseSelection {
+  /** Turns on the branch that I typed, cases and non-cases alike. */
+  typedTurns: number;
+  eligible: number;
+  selected: number;
+  belowThreshold: number;
+  thresholdTokens: number;
+  overheadTokens: number;
+  /** Eligible cases per answer group. */
+  answers: Record<AnswerLabel, number>;
+}
+
+/** What replay did. Absent on a scored run, which does not replay. */
+export interface ReplayReport {
+  outcomes: ReplayOutcome[];
+  totals: ReplayTotals;
+  diff: ReplayDiff;
 }
 
 export interface RunResult {
@@ -59,8 +107,12 @@ export interface RunResult {
   /** Where the proxy children sent what they forwarded. */
   upstream: string;
   baselines: BaselineUse[];
-  /** The cases this run covered. Empty until case extraction lands. */
-  cases: unknown[];
+  /** Every eligible case, in session order, with the ones this run covered marked. */
+  cases: CaseRecord[];
+  /** How the list was arrived at, or null when no session was read. */
+  caseSelection: CaseSelection | null;
+  /** What replay found, or null on a scored run. */
+  replay: ReplayReport | null;
   /** What each arm scored. Empty until the arms land. */
   arms: unknown[];
   problems: Problem[];
@@ -114,6 +166,123 @@ export function readRunResult(resultsDir: string, label: string): RunResult | nu
   }
 }
 
+/**
+ * The case list, which is the record of what a run covered. It is printed whole rather than
+ * summarised: a run reported against an earlier one is only meaningful if both covered the same
+ * turns, and a reader cannot check that against a count.
+ */
+function renderCases(result: RunResult): string[] {
+  const lines: string[] = ["## Cases", ""];
+  const selection = result.caseSelection;
+  if (selection === null) {
+    lines.push("No session was read, so no case was listed.", "");
+    return lines;
+  }
+  lines.push(
+    `${selection.eligible} of ${selection.typedTurns} typed turns are past the ` +
+      `${formatTokens(selection.thresholdTokens)} trip threshold. The other ${selection.belowThreshold} buy no ` +
+      `information: below the threshold the proxy evicts nothing and both arms send the same bytes.`,
+    "",
+    `Sizes are the message list measured with count-tokens, plus ${formatTokens(selection.overheadTokens)} of ` +
+      `system prompt and tool definitions read from the first model turn's usage.`,
+    "",
+    `By recorded answer: ${selection.answers.tools} used tools, ${selection.answers.text} answered in text, ` +
+      `${selection.answers.none} have no recorded answer.`,
+    "",
+  );
+  if (result.cases.length === 0) return lines;
+
+  lines.push("| case | turn | stretch | prefix | answer | opens on | ran |", "| --- | --- | --- | --- | --- | --- | --- |");
+  for (const record of result.cases) {
+    lines.push(
+      `| ${record.id} | ${record.turnIndex} | ${record.stretchIndex} | ${formatTokens(record.prefixTokens)} | ` +
+        `${record.answer} | ${record.opensWithCompactionSummary ? "a compaction summary" : "the session start"} | ` +
+        `${record.selected ? "yes" : "no"} |`,
+    );
+  }
+  lines.push("");
+  return lines;
+}
+
+/** What replay did, and what moved since the build before it. */
+function renderReplay(result: RunResult): string[] {
+  if (result.replay === null) return [];
+  const { totals, diff } = result.replay;
+  const lines: string[] = ["## Replay", ""];
+  lines.push(
+    "No model calls and no score: each case went through a fresh proxy child against a fake upstream.",
+    "",
+  );
+  const before = diff.totals?.previous ?? null;
+  const heading = before === null ? [] : [diff.comparedWith ?? "previously"];
+  lines.push(`| | ${[...heading, "this build"].join(" | ")} |`, `| --- |${" --- |".repeat(heading.length + 1)}`);
+  const row = (name: string, was: string | number | null, now: string | number): void => {
+    lines.push(`| ${name} | ${was === null ? "" : `${was} | `}${now} |`);
+  };
+  row("cases replayed", before?.cases ?? null, totals.cases);
+  row("tripped", before?.trips ?? null, totals.trips);
+  row("segments evicted", before?.segmentsEvicted ?? null, totals.segmentsEvicted);
+  row("bytes sent", before === null ? null : formatBytes(before.sentBytes), formatBytes(totals.sentBytes));
+  row("bytes forwarded", before === null ? null : formatBytes(before.forwardedBytes), formatBytes(totals.forwardedBytes));
+  row("rebuilds", before?.rebuilds ?? null, totals.rebuilds);
+  lines.push("");
+
+  lines.push("### Against the previous build", "");
+  if (diff.onlyInPrevious.length > 0 || diff.onlyInCurrent.length > 0) {
+    lines.push(
+      `**Refused.** The case list drifted since \`${diff.comparedWith ?? "the previous run"}\`: ` +
+        `${diff.onlyInPrevious.length} case(s) it covered are gone and ${diff.onlyInCurrent.length} are new. ` +
+        `Totals over two different sets of turns are not a comparison, so none is shown.`,
+      "",
+    );
+    return lines;
+  }
+  if (diff.totals === null) {
+    const named = diff.comparedWith === null ? "" : `: \`${diff.comparedWith}\` replayed nothing`;
+    lines.push(`Nothing to compare against${named}.`, "");
+    return lines;
+  }
+  lines.push(`Compared with \`${diff.comparedWith ?? "the previous run"}\`.`, "");
+  if (diff.changes.length === 0) {
+    lines.push(`No case came out differently; ${diff.unchanged} were identical.`, "");
+  } else {
+    lines.push("| case | what | previous | now |", "| --- | --- | --- | --- |");
+    for (const change of diff.changes) {
+      lines.push(`| ${change.caseId} | ${change.what} | ${change.previous} | ${change.current} |`);
+    }
+    lines.push("", `${diff.unchanged} case(s) came out the same.`, "");
+  }
+  return lines;
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+/**
+ * The most recent run in `resultsDir` that replayed anything. A scored run holds no replay
+ * outcomes, so diffing against one would report every case as newly appeared; only a run that
+ * replayed is a build's replay behaviour written down.
+ */
+export function latestReplayBefore(resultsDir: string): RunResult | null {
+  let names: string[];
+  try {
+    names = readdirSync(resultsDir);
+  } catch {
+    return null;
+  }
+  const labels = names.filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -".json".length));
+  // A label is `<short sha>[-dirty]-<start time>`, so it sorts by build then by time, not by time
+  // alone. The most recent replay is therefore found by reading them, not by sorting the names.
+  let latest: RunResult | null = null;
+  for (const label of labels) {
+    const result = readRunResult(resultsDir, label);
+    if (result?.replay == null || result.replay.outcomes.length === 0) continue;
+    if (latest === null || result.startedAt > latest.startedAt) latest = result;
+  }
+  return latest;
+}
+
 export function renderRunResult(result: RunResult): string {
   const lines: string[] = [];
   lines.push(`# Onepass eval — ${result.label}`, "");
@@ -126,7 +295,7 @@ export function renderRunResult(result: RunResult): string {
   lines.push(`| upstream | ${result.upstream} |`);
   lines.push(`| corpus | ${result.corpusDir} |`);
   lines.push(`| compared with | ${result.comparedWith ?? "nothing"} |`);
-  lines.push(`| cases | ${result.cases.length} |`);
+  lines.push(`| cases | ${result.cases.filter((one) => one.selected).length} of ${result.cases.length} eligible |`);
   lines.push(`| took | ${(result.durationMs / 1000).toFixed(1)}s |`);
   lines.push("");
 
@@ -144,9 +313,16 @@ export function renderRunResult(result: RunResult): string {
     lines.push("");
   }
 
+  lines.push(...renderCases(result));
+  lines.push(...renderReplay(result));
+
   lines.push("## Result", "");
   if (result.arms.length === 0) {
-    lines.push("Nothing measured. This run built the proxy, started a child and wrote this document.", "");
+    lines.push(
+      "No arm has been measured. This run built the proxy, listed the cases above" +
+        `${result.replay === null ? "" : ", replayed them"} and wrote this document.`,
+      "",
+    );
   }
 
   lines.push("## Problems", "");

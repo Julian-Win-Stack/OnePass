@@ -12,14 +12,22 @@
 // Read flat, one file mixes conversations that never coexisted, so the numbers only mean anything
 // beside the branch they were measured on.
 
-import { chmodSync, copyFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Corpus } from "./corpus.js";
-import { EvalError } from "./errors.js";
+import { EvalError, messageOf } from "./errors.js";
+import { formatTokens } from "./format.js";
 import { readTranscript, type Branch, type Stretch, type Tally } from "./transcript.js";
 
 /** The schema of the manifest written beside a transcript copy, bumped when its shape changes. */
 export const IMPORT_SCHEMA = "onepass-eval/import@1";
+
+/**
+ * What the planning session is filed under. The corpus holds one planning session and one
+ * implementation session, so a run finds its cases by name rather than by being told a path every
+ * time: `onepass-eval import <transcript> --tip <uuid> --name planning`.
+ */
+export const PLANNING_SESSION = "planning";
 
 export interface ImportedSession {
   branch: Branch;
@@ -71,7 +79,12 @@ function manifest(branch: Branch, transcriptPath: string): unknown {
     sessionIds: branch.sessionIds,
     counts: branch.counts,
     peakContextTokens: branch.peakContextTokens,
-    compactions: branch.compactions,
+    // The compaction summaries are tens of thousands of characters each and are read from the
+    // transcript whenever they are wanted, so the manifest records that there is one and how big.
+    compactions: branch.compactions.map((compaction) => ({
+      ...compaction,
+      summary: compaction.summary === null ? null : { uuid: compaction.summary.uuid, chars: compaction.summary.chars },
+    })),
     unexplainedDrops: branch.unexplainedDrops,
     stretches: branch.stretches,
     file: branch.file,
@@ -116,16 +129,16 @@ export function renderImport(imported: ImportedSession): string {
     const drop =
       compaction.drop === null
         ? "no usage drop lines up with it"
-        : `usage ${tokens(compaction.drop.fromTokens)} → ${tokens(compaction.drop.toTokens)}`;
+        : `usage ${formatTokens(compaction.drop.fromTokens)} → ${formatTokens(compaction.drop.toTokens)}`;
     say(
       `  after turn ${compaction.afterIndex}  trigger ${compaction.trigger ?? "unrecorded"}  ` +
-        `recorded ${tokens(compaction.preTokens)} → ${tokens(compaction.postTokens)}  ${drop}`,
+        `recorded ${formatTokens(compaction.preTokens)} → ${formatTokens(compaction.postTokens)}  ${drop}`,
     );
   }
   if (branch.unexplainedDrops.length > 0) {
     say(`  unexplained usage drops: ${branch.unexplainedDrops.length} — a fall no compaction accounts for`);
     for (const drop of branch.unexplainedDrops) {
-      say(`    turn ${drop.fromIndex} → ${drop.toIndex}  ${tokens(drop.fromTokens)} → ${tokens(drop.toTokens)}`);
+      say(`    turn ${drop.fromIndex} → ${drop.toIndex}  ${formatTokens(drop.fromTokens)} → ${formatTokens(drop.toTokens)}`);
     }
   }
   say();
@@ -134,11 +147,11 @@ export function renderImport(imported: ImportedSession): string {
   for (const stretch of branch.stretches) say(`  ${describeStretch(stretch)}`);
   say();
 
-  say(`Token trajectory over ${branch.trajectory.length} model turns, peak ${tokens(branch.peakContextTokens)}`);
+  say(`Token trajectory over ${branch.trajectory.length} model turns, peak ${formatTokens(branch.peakContextTokens)}`);
   if (branch.trajectory.length > 0) {
     say(`  ${sparkline(branch.trajectory.map((point) => point.contextTokens))}`);
-    say(`  ${tokens(branch.trajectory[0]?.contextTokens ?? null)} at the first turn, ` +
-      `${tokens(branch.trajectory[branch.trajectory.length - 1]?.contextTokens ?? null)} at the last`);
+    say(`  ${formatTokens(branch.trajectory[0]?.contextTokens ?? null)} at the first turn, ` +
+      `${formatTokens(branch.trajectory[branch.trajectory.length - 1]?.contextTokens ?? null)} at the last`);
   }
   say();
 
@@ -159,7 +172,7 @@ function describeStretch(stretch: Stretch): string {
   const range =
     stretch.firstContextTokens === null
       ? "no model turn"
-      : `${tokens(stretch.firstContextTokens)} → ${tokens(stretch.lastContextTokens)}, peak ${tokens(stretch.peakContextTokens)}`;
+      : `${formatTokens(stretch.firstContextTokens)} → ${formatTokens(stretch.lastContextTokens)}, peak ${formatTokens(stretch.peakContextTokens)}`;
   return (
     `${stretch.index}: turns ${stretch.fromIndex}–${stretch.toIndex} ${opened}, ` +
     `${stretch.typedTurns} typed, ${stretch.modelTurns} model — ` +
@@ -192,6 +205,48 @@ function sparkline(values: readonly number[]): string {
   return out;
 }
 
-function tokens(value: number | null): string {
-  return value === null ? "unrecorded" : `${Math.round(value / 1000)}k`;
+
+
+/** An imported session, found in the corpus by the name it was filed under. */
+export interface ImportedRecord {
+  name: string;
+  transcriptPath: string;
+  manifestPath: string;
+  /** The branch tip the import walked back from, so every later stage reads the same branch. */
+  tip: string;
+}
+
+/**
+ * The session filed under `name`, and the tip its import chose.
+ *
+ * The tip is the whole reason the manifest exists. A transcript file holds many branches, the copy
+ * holds all of them, and a run that guessed the tip would measure a conversation the import never
+ * looked at — so it is read back from what the import wrote rather than defaulted to the last entry.
+ */
+export function readImported(corpus: Corpus, name: string): ImportedRecord {
+  const transcriptPath = join(corpus.transcripts, `${name}.jsonl`);
+  const manifestPath = join(corpus.transcripts, `${name}.import.json`);
+  if (!existsSync(transcriptPath) || !existsSync(manifestPath)) {
+    throw new EvalError(
+      `no session filed under ${name} in ${corpus.transcripts}. Import one first:\n` +
+        `  onepass-eval import <transcript.jsonl> --tip <uuid> --name ${name}`,
+    );
+  }
+  let manifest: { tip?: { uuid?: unknown } };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { tip?: { uuid?: unknown } };
+  } catch (err: unknown) {
+    throw new EvalError(`the import record at ${manifestPath} is not readable JSON: ${messageOf(err)}`);
+  }
+  const tip = manifest.tip?.uuid;
+  if (typeof tip !== "string" || tip === "") {
+    throw new EvalError(`the import record at ${manifestPath} names no tip, so there is no branch to read.`);
+  }
+  return { name, transcriptPath, manifestPath, tip };
+}
+
+/** The branch of the session filed under `name`, read from the corpus copy. */
+export function openImported(corpus: Corpus, name: string): { record: ImportedRecord; branch: Branch } {
+  const record = readImported(corpus, name);
+  return { record, branch: readTranscript(record.transcriptPath, { tip: record.tip }) };
 }

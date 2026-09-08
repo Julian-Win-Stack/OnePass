@@ -43,15 +43,24 @@ export function typed(uuid: string, parentUuid: string | null, text: string, ext
   };
 }
 
+export interface ToolResultOptions extends Common {
+  /** How big the result is. A case only trips the proxy when its prefix is large. */
+  chars?: number;
+}
+
 /** A `user` entry carrying tool results back to the model. */
-export function toolResult(uuid: string, parentUuid: string | null, extra: Line & Common = {}): Line {
+export function toolResult(uuid: string, parentUuid: string | null, extra: Line & ToolResultOptions = {}): Line {
+  const { chars, ...rest } = extra;
   return {
     ...common(extra),
     type: "user",
     uuid,
     parentUuid,
-    message: { role: "user", content: [{ type: "tool_result", tool_use_id: `tool-${uuid}`, content: "ok" }] },
-    ...extra,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: `tool-${uuid}`, content: chars === undefined ? "ok" : "x".repeat(chars) }],
+    },
+    ...rest,
   };
 }
 

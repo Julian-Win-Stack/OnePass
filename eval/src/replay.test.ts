@@ -1,0 +1,201 @@
+// Replay, driven the way a run drives it: a real build of the proxy, a child per case, and the
+// fake upstream behind it. Nothing here reaches inside the proxy — what replay reports has to be
+// readable off the body the upstream received and the log the child wrote, because that is all a
+// scored run will have either.
+
+import { after, before, test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { PlanningCase } from "./cases.js";
+import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
+import { buildProxyUnderTest, type ProxyBuild } from "./proxy.js";
+import { diffReplays, replayCases, STUB_PREFIX, type ReplayOutcome } from "./replay.js";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+let build: ProxyBuild;
+let upstream: FakeUpstream;
+
+before(async () => {
+  build = await buildProxyUnderTest(repoRoot);
+  upstream = await startFakeUpstream();
+});
+
+after(async () => {
+  await upstream.close();
+});
+
+function scratch(): string {
+  return mkdtempSync(join(tmpdir(), "onepass-replay-"));
+}
+
+/**
+ * A case shaped like a deep planning turn: one large tool result, then enough assistant turns after
+ * it that the proxy's age gate has let go of it, and a typed turn at the end.
+ */
+function deepCase(id: string, resultChars: number): PlanningCase {
+  const messages: PlanningCase["messages"] = [
+    { role: "user", content: [{ type: "text", text: "read the file" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "x".repeat(resultChars) }] },
+  ];
+  for (let turn = 0; turn < 10; turn += 1) {
+    messages.push({ role: "assistant", content: [{ type: "text", text: `thinking about it, ${turn}` }] });
+    messages.push({ role: "user", content: [{ type: "text", text: `carry on, ${turn}` }] });
+  }
+  messages.push({ role: "user", content: [{ type: "text", text: "so what do you make of it?" }] });
+
+  return {
+    id,
+    turnIndex: 42,
+    typedIndex: 7,
+    uuid: `uuid-${id}`,
+    timestamp: "2026-08-11T00:00:00.000Z",
+    text: "so what do you make of it?",
+    stretchIndex: 0,
+    opensWithCompactionSummary: false,
+    messageTokens: Math.ceil(resultChars / 4),
+    prefixTokens: Math.ceil(resultChars / 4) + 54_000,
+    answer: "tools",
+    messages,
+  };
+}
+
+test("a case over the threshold trips the build and comes back stubbed", async () => {
+  const runDir = scratch();
+  const listed: string[] = [];
+
+  const [outcome] = (await replayCases({
+    build,
+    cases: [deepCase("turn-42", 600_000)],
+    upstream,
+    runDir,
+    onCase: (one, position, total) => listed.push(`${position + 1}/${total} ${one.id} ${one.prefixTokens}`),
+  })) as [ReplayOutcome];
+
+  assert.deepEqual(listed, ["1/1 turn-42 204000"], "each case is printed as it goes");
+  assert.equal(outcome.tripped, true);
+  assert.ok(outcome.segmentsEvicted >= 1, `nothing was evicted: ${JSON.stringify(outcome)}`);
+  assert.ok(outcome.stubExamples[0]?.startsWith(STUB_PREFIX), `first stub was ${outcome.stubExamples[0]}`);
+  assert.ok(outcome.stubDigest.length > 0, "the stub text is digested so a wording change is detectable");
+  assert.ok(
+    outcome.forwardedBytes < outcome.sentBytes / 2,
+    `forwarded ${outcome.forwardedBytes} of ${outcome.sentBytes}`,
+  );
+  assert.equal(existsSync(outcome.bodyPath), true, "the forwarded body is kept in the corpus");
+  assert.ok(readFileSync(outcome.bodyPath, "utf8").includes(STUB_PREFIX));
+});
+
+test("a case under the threshold goes through untouched, so both arms would send the same bytes", async () => {
+  const [outcome] = (await replayCases({
+    build,
+    cases: [deepCase("turn-7", 4_000)],
+    upstream,
+    runDir: scratch(),
+  })) as [ReplayOutcome];
+
+  assert.equal(outcome.tripped, false);
+  assert.equal(outcome.segmentsEvicted, 0);
+  assert.deepEqual(outcome.stubExamples, []);
+  assert.equal(outcome.forwardedBytes, outcome.sentBytes);
+});
+
+test("each case sees a child of its own, so nothing one case evicted is carried into the next", async () => {
+  const outcomes = await replayCases({
+    build,
+    cases: [deepCase("turn-1", 600_000), deepCase("turn-2", 4_000)],
+    upstream,
+    runDir: scratch(),
+  });
+
+  assert.equal(outcomes[0]?.tripped, true);
+  assert.equal(outcomes[1]?.tripped, false, "a fresh child has evicted nothing yet");
+  assert.equal(outcomes[1]?.segmentsEvicted, 0);
+});
+
+// The diff is pure, so it is checked on made-up outcomes rather than by building the proxy twice.
+
+function outcome(overrides: Partial<ReplayOutcome> & { caseId: string }): ReplayOutcome {
+  return {
+    turnIndex: 42,
+    prefixTokens: 200_000,
+    answer: "tools",
+    sentBytes: 1_000,
+    forwardedBytes: 500,
+    tripped: true,
+    segmentsEvicted: 1,
+    stubDigest: "aaaaaaaaaaaa",
+    stubExamples: [`${STUB_PREFIX} tool_result, 600000 chars]`],
+    rebuild: null,
+    estimatedTokensBefore: 200_000,
+    estimatedTokensSent: 100_000,
+    bodyPath: "/tmp/body.json",
+    ...overrides,
+  };
+}
+
+test("the diff names what moved, and counts what did not", () => {
+  const previous = [outcome({ caseId: "turn-1" }), outcome({ caseId: "turn-2" })];
+  const current = [
+    outcome({ caseId: "turn-1" }),
+    outcome({ caseId: "turn-2", segmentsEvicted: 3, sentBytes: 1_200, forwardedBytes: 300 }),
+  ];
+
+  const diff = diffReplays("abc1234-20260906T101112Z", previous, current);
+
+  assert.equal(diff.unchanged, 1);
+  assert.deepEqual(
+    diff.changes.map((change) => [change.caseId, change.what, change.previous, change.current]),
+    [
+      ["turn-2", "segments evicted", "1", "3"],
+      ["turn-2", "bytes sent", "1000", "1200"],
+      ["turn-2", "bytes forwarded", "500", "300"],
+    ],
+    "both body sizes are diffed: what the case was, and what the proxy made of it",
+  );
+  assert.equal(diff.totals?.previous.segmentsEvicted, 2);
+  assert.equal(diff.totals?.current.segmentsEvicted, 4);
+});
+
+test("a stub whose wording changed is a change, even when the sizes did not move", () => {
+  const previous = [outcome({ caseId: "turn-1" })];
+  const current = [
+    outcome({
+      caseId: "turn-1",
+      stubDigest: "bbbbbbbbbbbb",
+      stubExamples: ["[onepass: evicted a tool result of 600000 chars]"],
+    }),
+  ];
+
+  const diff = diffReplays("abc1234", previous, current);
+
+  assert.deepEqual(
+    diff.changes.map((change) => change.what),
+    ["stub text"],
+  );
+  assert.match(diff.changes[0]?.current ?? "", /a tool result of 600000 chars/);
+});
+
+test("a case list that drifted refuses the comparison rather than diffing what the two share", () => {
+  const previous = [outcome({ caseId: "turn-1" }), outcome({ caseId: "turn-2", segmentsEvicted: 9 })];
+  const current = [outcome({ caseId: "turn-1" }), outcome({ caseId: "turn-9" })];
+
+  const diff = diffReplays("abc1234", previous, current);
+
+  assert.deepEqual(diff.onlyInPrevious, ["turn-2"]);
+  assert.deepEqual(diff.onlyInCurrent, ["turn-9"]);
+  assert.deepEqual(diff.changes, [], "turn-1 is shared and unchanged, but nothing is reported at all");
+  assert.equal(diff.unchanged, 0);
+  assert.equal(diff.totals, null, "totals over two different sets of turns are not a comparison");
+});
+
+test("with no previous build to compare against, the diff says so rather than inventing one", () => {
+  const diff = diffReplays(null, null, [outcome({ caseId: "turn-1" })]);
+
+  assert.equal(diff.comparedWith, null);
+  assert.equal(diff.totals, null);
+  assert.deepEqual(diff.changes, []);
+});

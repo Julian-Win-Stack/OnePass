@@ -29,6 +29,8 @@ function aResult(overrides: Partial<RunResult> = {}): RunResult {
       },
     ],
     cases: [],
+    caseSelection: null,
+    replay: null,
     arms: [],
     problems: [],
     notes: [],
