@@ -16,8 +16,13 @@
 // and hands back a problems entry the report prints in full rather than counting.
 
 import type Anthropic from "@anthropic-ai/sdk";
-import type { BetaMessage, BetaToolUseBlock } from "@anthropic-ai/sdk/resources/beta";
-import { graderTools } from "./graderTools.js";
+import type {
+  BetaMessage,
+  BetaMessageParam,
+  BetaToolResultBlockParam,
+  BetaToolUseBlock,
+} from "@anthropic-ai/sdk/resources/beta";
+import { graderTools, type GraderTool } from "./graderTools.js";
 import { EvalError, messageOf } from "./errors.js";
 import type { Problem } from "./result.js";
 
@@ -141,8 +146,8 @@ export interface GradeOptions {
  */
 export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   const { client, model, effort, question, pair, repoPath } = options;
-  // A cap below one is not a cap: the runner treats a falsy `max_iterations` as no limit, so a
-  // caller who passed zero meaning "none" would get an uncapped call rather than a refusal.
+  // A cap below one is not a cap. Zero would mean the loop never runs and the call comes back
+  // Unknown having never asked the model anything, which is a refusal worth making out loud.
   const cap = options.maxTurns ?? GRADER_TURN_CAP;
   if (!Number.isInteger(cap) || cap < 1) {
     throw new EvalError(`a grader call has to be capped at one model turn or more, not ${cap}.`);
@@ -161,38 +166,48 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   const [a, b] = swap ? [second, first] : [first, second];
   const shownAs: ShownAs = { A: a.id, B: b.id };
 
+  const tools = graderTools(repoPath);
+  // The first breakpoint never moves. It sits after the question and the answers rather than on
+  // the tools because caching has a minimum size and system plus tool schemas is 465 tokens, well
+  // under it: a breakpoint up there would be accepted and silently do nothing.
+  const messages: BetaMessageParam[] = [
+    {
+      role: "user",
+      content: [{ type: "text", text: askFor(question, a, b), cache_control: { type: "ephemeral" } }],
+    },
+  ];
+  /** The moving breakpoint's current home, or null before the first tool call. See {@link mark}. */
+  let tail: BetaToolResultBlockParam | null = null;
+
   let turns = 0;
   let last: BetaMessage | null = null;
   let failure: string | null = null;
   let cacheRead = 0;
   let cacheCreation = 0;
   try {
-    const runner = client.beta.messages.toolRunner({
-      model,
-      max_tokens: MAX_OUTPUT_TOKENS,
-      stream: false,
-      max_iterations: cap,
-      system: SYSTEM,
-      messages: [
-        {
-          role: "user",
-          // The breakpoint sits here rather than on the tools because caching has a minimum size
-          // and system plus tool schemas is 465 tokens, well under it: a breakpoint there would be
-          // silently ignored. Question and answers carry the prefix over the line, and nothing
-          // above this point changes across the call's turns, so every turn after the first reads
-          // it back. The tool results accumulating below are not covered — moving a breakpoint
-          // down them each turn means `setMessagesParams`, which drops the runner's tool cache.
-          content: [{ type: "text", text: askFor(question, a, b), cache_control: { type: "ephemeral" } }],
-        },
-      ],
-      tools: graderTools(repoPath),
-      ...(effort === undefined ? {} : { output_config: { effort } }),
-    });
-    for await (const message of runner) {
+    while (turns < cap) {
+      const message = await client.beta.messages.create({
+        model,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        stream: false,
+        system: SYSTEM,
+        messages,
+        tools,
+        ...(effort === undefined ? {} : { output_config: { effort } }),
+      });
       turns += 1;
       last = message;
       cacheRead += message.usage.cache_read_input_tokens ?? 0;
       cacheCreation += message.usage.cache_creation_input_tokens ?? 0;
+      messages.push({ role: message.role, content: message.content });
+
+      const results = await answerToolCalls(tools, message);
+      // No tool call is the model saying it is done. Every other stop reason ends here too, which
+      // is right for all of them: this grader has no server-side tool, so there is no `pause_turn`
+      // to resume, and a call that ran out of output tokens has nothing more to send.
+      if (results === null) break;
+      tail = mark(results, tail);
+      messages.push({ role: "user", content: results });
     }
   } catch (err: unknown) {
     failure = `the call failed after ${turns} model turn${turns === 1 ? "" : "s"}: ${messageOf(err)}`;
@@ -225,6 +240,66 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   return call;
 }
 
+/**
+ * The tool results answering `message`, or null when it asked for none and the call is over.
+ *
+ * A tool that throws is answered with the error rather than ending the call, the same bargain
+ * the tools themselves make by returning a refusal as text: the grader reads it and asks for
+ * something else. A name that is not a tool is answered the same way, because a model that
+ * invented one is not helped by silence.
+ *
+ * The calls in one turn are run together. They are three read-only tools over a throwaway
+ * worktree, so nothing here is ordered against anything else.
+ */
+async function answerToolCalls(
+  tools: readonly GraderTool[],
+  message: BetaMessage,
+): Promise<BetaToolResultBlockParam[] | null> {
+  const calls = message.content.filter((block): block is BetaToolUseBlock => block.type === "tool_use");
+  if (calls.length === 0) return null;
+  return Promise.all(
+    calls.map(async (call): Promise<BetaToolResultBlockParam> => {
+      const tool = tools.find((candidate) => candidate.name === call.name);
+      if (tool === undefined) {
+        const named = tools.map((candidate) => candidate.name).join(", ");
+        return {
+          type: "tool_result",
+          tool_use_id: call.id,
+          content: `There is no tool called ${call.name}. The tools are: ${named}.`,
+          is_error: true,
+        };
+      }
+      try {
+        return { type: "tool_result", tool_use_id: call.id, content: await tool.run(tool.parse(call.input)) };
+      } catch (err: unknown) {
+        return { type: "tool_result", tool_use_id: call.id, content: `Error: ${messageOf(err)}`, is_error: true };
+      }
+    }),
+  );
+}
+
+/**
+ * Moves the second breakpoint onto the newest tool result and answers with its new home.
+ *
+ * This is what caching the call rather than caching its opening line comes to. Everything above a
+ * breakpoint is cached and everything below is not, so a breakpoint that stays put covers the
+ * question and the answers and nothing else — and the tool results are most of a long call's
+ * prompt, forty turns of files re-sent whole every turn. Marking the newest one instead means
+ * each turn reads back everything the turns before it accumulated and writes only what it added.
+ *
+ * The old mark is cleared before the new one is set. The API allows four breakpoints and a call
+ * may take forty turns, so leaving them behind would fail the call outright partway through.
+ */
+function mark(
+  results: BetaToolResultBlockParam[],
+  previous: BetaToolResultBlockParam | null,
+): BetaToolResultBlockParam {
+  if (previous !== null) delete previous.cache_control;
+  const newest = results[results.length - 1] as BetaToolResultBlockParam;
+  newest.cache_control = { type: "ephemeral" };
+  return newest;
+}
+
 interface Outcome {
   verdict: Verdict;
   /** Null exactly when the verdict is the grader's own answer rather than a call that stopped. */
@@ -236,12 +311,12 @@ interface Outcome {
  * What the call came to. A finished call ends its turn with a verdict and no tool call pending;
  * a capped one ends on a `tool_use` the runner never got to send back. That difference — the
  * final message's stop reason, and whether a tool call was left unanswered — is the whole of
- * how the two are told apart, and it is why the cap is enforced by the runner rather than by
- * counting requests here.
+ * how the two are told apart.
  *
- * The runner answers every tool call it sends, an unknown tool name included, so the cap is the
- * only thing that leaves one unanswered. The reason says which turn of which cap it stopped on
- * rather than asserting the cap was reached, so it stays true if that ever stops being so.
+ * {@link answerToolCalls} answers every tool call it is given, an unknown tool name included, so
+ * the cap is the only thing that leaves one unanswered. The reason says which turn of which cap
+ * it stopped on rather than asserting the cap was reached, so it stays true if that ever stops
+ * being so.
  */
 function outcomeOf(state: { cap: number; turns: number; last: BetaMessage | null; failure: string | null }): Outcome {
   if (state.failure !== null) return { verdict: "Unknown", reason: state.failure, waitingOn: null };

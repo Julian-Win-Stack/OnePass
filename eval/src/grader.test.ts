@@ -108,6 +108,18 @@ function aCall(usage: Pick<GraderCall, "promptTokens" | "cacheReadTokens" | "cac
 
 const says = (text: string): CannedTurn => ({ say: text });
 
+/** Where a request carries cache breakpoints, as `message:block type`, in the order sent. */
+function marked(body: any): string[] {
+  const found: string[] = [];
+  body.messages.forEach((message: any, m: number) => {
+    if (!Array.isArray(message.content)) return;
+    message.content.forEach((block: any, b: number) => {
+      if (block.cache_control !== undefined) found.push(`${m}:${b} ${block.type}`);
+    });
+  });
+  return found;
+}
+
 test("a finished call answers the question, and leaves nothing behind to explain", async () => {
   const { call, warnings } = await grade(() => says("A reads before it writes.\n\nVerdict: Yes"));
 
@@ -222,6 +234,36 @@ test("the question and the answers are sent behind a cache breakpoint", async ()
 
   assert.deepEqual(first.messages[0].content[0].cache_control, { type: "ephemeral" });
   assert.match(first.messages[0].content[0].text, /Read the eviction rules first/);
+});
+
+test("the second breakpoint follows the tool results down, one mark at a time", async () => {
+  // A breakpoint that only ever sat on the question would cache the opening line and nothing
+  // else, and the tool results below it — most of a long call's prompt — would be re-sent whole
+  // on every turn. Marking the newest result instead is what makes each turn read back the ones
+  // before it. The old mark has to go: the API allows four and a call may take forty turns, so
+  // marks left behind would fail the call outright partway through.
+  const { call, requests } = await grade((turn) => (turn < 3 ? { call: "list", input: {} } : says("Verdict: Yes")));
+
+  assert.equal(call.turns, 4);
+  assert.deepEqual(marked(sent(requests, 0)), ["0:0 text"]);
+  assert.deepEqual(marked(sent(requests, 1)), ["0:0 text", "2:0 tool_result"]);
+  assert.deepEqual(marked(sent(requests, 2)), ["0:0 text", "4:0 tool_result"]);
+  assert.deepEqual(marked(sent(requests, 3)), ["0:0 text", "6:0 tool_result"]);
+});
+
+test("a tool the grader invented is answered, not left to end the call", async () => {
+  // The grader is one model turn from a verdict when it misremembers a tool name, and a call that
+  // died there would be counted as an Unknown the grader chose. It is told what it may call
+  // instead, which is the same bargain the tools make by answering a bad path as text.
+  const { call, requests } = await grade((turn) =>
+    turn === 0 ? { call: "write_file", input: { path: "x" } } : says("Verdict: No"),
+  );
+
+  assert.equal(call.verdict, "No");
+  assert.equal(call.turns, 2);
+  const answer = sent(requests, 1).messages[2].content[0];
+  assert.equal(answer.is_error, true);
+  assert.equal(answer.content, "There is no tool called write_file. The tools are: read_file, search, list.");
 });
 
 test("a call records how full its context was when it finished", async () => {
@@ -345,7 +387,7 @@ test("the cap can be lowered, and a lowered cap says its own number", async () =
   assert.match(call.reason ?? "", /model turn 3 of its cap of 3/);
 });
 
-test("a cap below one model turn is refused, because the runner would read it as no cap", async () => {
+test("a cap below one model turn is refused, because a call that asks nothing is not a call", async () => {
   await assert.rejects(() => grade(() => says("Verdict: Yes"), { maxTurns: 0 }), /capped at one model turn or more/);
 });
 
