@@ -75,6 +75,16 @@ export interface GraderCall {
   shownAs: ShownAs;
   /** Model turns the call took. */
   turns: number;
+  /**
+   * The prompt the last turn sent, cached and uncached alike: how full the context was when the
+   * call finished. A verdict decided at the top of the window is worth less than one decided with
+   * room to spare, and without this the two are counted the same.
+   */
+  promptTokens: number;
+  /** Prompt tokens served from cache across the call. Zero means caching never fired. */
+  cacheReadTokens: number;
+  /** Prompt tokens written to cache across the call. */
+  cacheCreationTokens: number;
   /** Why nothing was decided, or null when the verdict is the grader's own answer. */
   reason: string | null;
   /** The tool call the grader was left waiting on, or null. Several, when it asked for several. */
@@ -125,6 +135,8 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   let turns = 0;
   let last: BetaMessage | null = null;
   let failure: string | null = null;
+  let cacheRead = 0;
+  let cacheCreation = 0;
   try {
     const runner = client.beta.messages.toolRunner({
       model,
@@ -132,13 +144,26 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
       stream: false,
       max_iterations: cap,
       system: SYSTEM,
-      messages: [{ role: "user", content: askFor(question, a, b) }],
+      messages: [
+        {
+          role: "user",
+          // The breakpoint sits here rather than on the tools because caching has a minimum size
+          // and system plus tool schemas is 465 tokens, well under it: a breakpoint there would be
+          // silently ignored. Question and answers carry the prefix over the line, and nothing
+          // above this point changes across the call's turns, so every turn after the first reads
+          // it back. The tool results accumulating below are not covered — moving a breakpoint
+          // down them each turn means `setMessagesParams`, which drops the runner's tool cache.
+          content: [{ type: "text", text: askFor(question, a, b), cache_control: { type: "ephemeral" } }],
+        },
+      ],
       tools: graderTools(repoPath),
       ...(effort === undefined ? {} : { output_config: { effort } }),
     });
     for await (const message of runner) {
       turns += 1;
       last = message;
+      cacheRead += message.usage.cache_read_input_tokens ?? 0;
+      cacheCreation += message.usage.cache_creation_input_tokens ?? 0;
     }
   } catch (err: unknown) {
     failure = `the call failed after ${turns} model turn${turns === 1 ? "" : "s"}: ${messageOf(err)}`;
@@ -152,6 +177,9 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
     verdict: outcome.verdict,
     shownAs,
     turns,
+    promptTokens: last === null ? 0 : promptSizeOf(last),
+    cacheReadTokens: cacheRead,
+    cacheCreationTokens: cacheCreation,
     reason: outcome.reason,
     waitingOn: outcome.waitingOn,
     problem: outcome.reason === null ? null : problemOf(pair, question, outcome, shownAs),
@@ -216,6 +244,54 @@ function outcomeOf(state: { cap: number; turns: number; last: BetaMessage | null
 function unanswered(message: BetaMessage): BetaToolUseBlock[] {
   if (message.stop_reason !== "tool_use") return [];
   return message.content.filter((block): block is BetaToolUseBlock => block.type === "tool_use");
+}
+
+/**
+ * The whole prompt a message was answered from: what was sent uncached, plus what the cache
+ * served, plus what it wrote. `input_tokens` alone is only the uncached part, so it *falls* as
+ * caching starts working — reading it by itself would make a call look smaller the better the
+ * cache did, and would quietly stop a size threshold from ever firing.
+ */
+function promptSizeOf(message: BetaMessage): number {
+  return (
+    message.usage.input_tokens +
+    (message.usage.cache_read_input_tokens ?? 0) +
+    (message.usage.cache_creation_input_tokens ?? 0)
+  );
+}
+
+/**
+ * Above this many prompt tokens, a call is big enough that caching should have fired. The API
+ * declines to cache prompts under about 1024 tokens and says nothing when it does, so the
+ * threshold sits clear of that line: under it, no cache read is correct rather than broken.
+ */
+export const CACHE_EXPECTED_ABOVE = 2_000;
+
+/**
+ * The run's caching problem, or null when there is nothing to say.
+ *
+ * Misconfigured caching is worse than none — a cache write costs more than an ordinary token, so
+ * a prefix that changes every call pays a premium to store something never read. Nothing in a
+ * run's numbers looks wrong when that happens: the verdicts are fine and only the bill moves.
+ *
+ * Asked once for the whole run rather than per call. If caching is broken it is broken for every
+ * call, and a warning printed a hundred times is one nobody reads. One read anywhere is enough to
+ * say it works; a single call missing is an expired entry, not a broken configuration.
+ */
+export function cachingProblem(calls: readonly GraderCall[]): Problem | null {
+  const big = calls.filter((call) => call.promptTokens > CACHE_EXPECTED_ABOVE);
+  if (big.length === 0) return null;
+  if (big.some((call) => call.cacheReadTokens > 0)) return null;
+
+  const written = big.reduce((total, call) => total + call.cacheCreationTokens, 0);
+  return {
+    what: `caching never fired across ${big.length} grader call${big.length === 1 ? "" : "s"}`,
+    detail:
+      `Every one of them sent more than ${CACHE_EXPECTED_ABOVE} prompt tokens and not one read ` +
+      `from the cache, so the breakpoint is misplaced or the prefix is not stable. ` +
+      `${written} tokens were written to the cache and none were read back, which costs more than ` +
+      `sending them uncached.`,
+  };
 }
 
 function textOf(message: BetaMessage): string {

@@ -42,7 +42,14 @@ export interface CannedToolCall {
  * A canned assistant turn: the text it ends on, or the tools it calls. A turn may call more than
  * one at a time, which is what a model does when it asks for two files at once.
  */
-export type CannedTurn = { say: string } | { call: string; input?: unknown } | { calls: CannedToolCall[] };
+export type CannedTurn = ({ say: string } | { call: string; input?: unknown } | { calls: CannedToolCall[] }) & {
+  /**
+   * What the turn reports as usage. The real API decides these and a caller cannot make it hit or
+   * miss on demand, so a fake that always says zero can only ever test the miss. `input` defaults
+   * to the measured body size and the two cache counts to zero, which is an uncached call.
+   */
+  usage?: { input?: number; cacheRead?: number; cacheCreation?: number };
+};
 
 export interface FakeUpstreamOptions {
   /**
@@ -123,9 +130,9 @@ function message(turn: CannedTurn, nextToolUseId: () => string, inputTokens: num
     content,
     stop_reason: calls === null ? "end_turn" : "tool_use",
     usage: {
-      input_tokens: inputTokens,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      input_tokens: turn.usage?.input ?? inputTokens,
+      cache_creation_input_tokens: turn.usage?.cacheCreation ?? 0,
+      cache_read_input_tokens: turn.usage?.cacheRead ?? 0,
       output_tokens: Math.max(1, Math.ceil(spoken.length / 4)),
     },
   };

@@ -12,7 +12,15 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFakeUpstream, type CannedTurn, type FakeUpstreamOptions, type RecordedRequest } from "./fakeUpstream.js";
-import { GRADER_TURN_CAP, gradePair, type GraderCall, type Pair, type GraderQuestion } from "./grader.js";
+import {
+  CACHE_EXPECTED_ABOVE,
+  GRADER_TURN_CAP,
+  cachingProblem,
+  gradePair,
+  type GraderCall,
+  type Pair,
+  type GraderQuestion,
+} from "./grader.js";
 
 /** The repository the answers were written against. */
 function aRepo(): string {
@@ -77,6 +85,24 @@ function sent(requests: RecordedRequest[], turn: number): any {
   return JSON.parse((requests[turn] as RecordedRequest).body);
 }
 
+/** A finished call, with the usage the test is about. Built whole: a partial fake would read
+ * `undefined` where the check compares numbers, and `undefined > 2000` is false, so a broken
+ * threshold would look like a quiet run. */
+function aCall(usage: Pick<GraderCall, "promptTokens" | "cacheReadTokens" | "cacheCreationTokens">): GraderCall {
+  return {
+    case: "planning-42",
+    pair: "proxied-vs-control-1",
+    question: "as-good-a-next-turn",
+    verdict: "Yes",
+    shownAs: { A: "proxied", B: "control-1" },
+    turns: 4,
+    reason: null,
+    waitingOn: null,
+    problem: null,
+    ...usage,
+  };
+}
+
 const says = (text: string): CannedTurn => ({ say: text });
 
 test("a finished call answers the question, and leaves nothing behind to explain", async () => {
@@ -93,18 +119,20 @@ test("a finished call answers the question, and leaves nothing behind to explain
   assert.deepEqual(warnings, []);
 });
 
-test("No is a verdict, and so is a grader that says Unknown having looked", async () => {
-  const no = await grade(() => says("Verdict: No"));
-  assert.equal(no.call.verdict, "No");
-  assert.equal(no.call.problem, null);
+test("No is a verdict", async () => {
+  const { call } = await grade(() => says("Verdict: No"));
+  assert.equal(call.verdict, "No");
+  assert.equal(call.problem, null);
+});
 
-  // An Unknown the grader chose is an answer to the question. Only a call that stopped early is
-  // a problem, and conflating the two is what would let stopping early hide inside the count.
-  const unknown = await grade(() => says("I read both and cannot separate them.\n\nVerdict: Unknown"));
-  assert.equal(unknown.call.verdict, "Unknown");
-  assert.equal(unknown.call.reason, null);
-  assert.equal(unknown.call.problem, null);
-  assert.deepEqual(unknown.warnings, []);
+test("an Unknown the grader chose after looking is a verdict, not a problem", async () => {
+  // Only a call that stopped early is a problem, and conflating the two is what would let
+  // stopping early hide inside the count of Unknowns the grader meant.
+  const { call, warnings } = await grade(() => says("I read both and cannot separate them.\n\nVerdict: Unknown"));
+  assert.equal(call.verdict, "Unknown");
+  assert.equal(call.reason, null);
+  assert.equal(call.problem, null);
+  assert.deepEqual(warnings, []);
 });
 
 test("the verdict is the last one the grader wrote, not the first it weighed", async () => {
@@ -114,12 +142,14 @@ test("the verdict is the last one the grader wrote, not the first it weighed", a
     says("Verdict: Yes would be right if A had read the rules first.\nIt did not.\n\nVerdict: No"),
   );
   assert.equal(call.verdict, "No");
+});
 
-  // "Verdict:" has to open a line. Prose that mentions one in passing is not an answer, and
-  // reading it as one would count a verdict the grader never gave.
-  const inPassing = await grade(() => says("They asked for a verdict: yes or no. I cannot give one."));
-  assert.equal(inPassing.call.verdict, "Unknown");
-  assert.ok(inPassing.call.problem !== null);
+test("a verdict mentioned in passing mid-line is not the grader's answer", async () => {
+  // "Verdict:" has to open a line. Reading prose as an answer would count a verdict the grader
+  // never gave, and it would count it silently, because a parsed verdict raises no problem.
+  const { call } = await grade(() => says("They asked for a verdict: yes or no. I cannot give one."));
+  assert.equal(call.verdict, "Unknown");
+  assert.ok(call.problem !== null, "a verdict was read out of prose that gave none");
 });
 
 test("the grader is given read file, search and list, and nothing else", async () => {
@@ -151,11 +181,106 @@ test("the pair is shown in an order chosen at random, and the order is recorded"
   assert.deepEqual(swapped.call.shownAs, { A: "control-1", B: "proxied" });
 
   // The recorded order is the order the model saw, not a label written beside an unchanged prompt.
+  // Both positions are checked before they are compared: indexOf answers -1 for an answer that
+  // never reached the model at all, and -1 sorts first, so comparing alone would call a prompt
+  // missing half the pair correctly ordered.
   const shown = JSON.stringify(sent(swapped.requests, 0).messages);
-  assert.ok(
-    shown.indexOf("Write the test first") < shown.indexOf("Read the eviction rules first"),
-    "the answers were recorded as swapped but sent in the original order",
+  const asA = shown.indexOf("Write the test first");
+  const asB = shown.indexOf("Read the eviction rules first");
+  assert.notEqual(asA, -1, "the answer recorded as A never reached the model");
+  assert.notEqual(asB, -1, "the answer recorded as B never reached the model");
+  assert.ok(asA < asB, "the answers were recorded as swapped but sent in the original order");
+});
+
+test("with nothing pinning it, the order is drawn afresh for each pair", async () => {
+  // Every other test here injects `random` to pin the order, which leaves the default free to
+  // become a constant without one of them going red. A grader that always sees the same arm as A
+  // is the position bias the noise floor exists to detect, so the signal would be gone while the
+  // run still looked healthy. Nothing is injected below: this is the default drawing the order.
+  const draws = 40;
+  const shownAsA = new Set<string>();
+  for (let draw = 0; draw < draws; draw += 1) {
+    const { call } = await grade(() => says("Verdict: Yes"));
+    shownAsA.add(call.shownAs.A);
+  }
+
+  // Forty draws landing the same way is about one run in 5e11, so a red here is the default
+  // having stopped varying rather than a coin that kept coming up heads.
+  assert.deepEqual([...shownAsA].sort(), ["control-1", "proxied"]);
+});
+
+
+test("the question and the answers are sent behind a cache breakpoint", async () => {
+  // System and tools come to 465 tokens, under the ~1024 the API will cache at all, so a
+  // breakpoint on the tools would be accepted and silently do nothing. It has to sit after the
+  // answers to cover a prefix big enough to cache.
+  const { requests } = await grade(() => says("Verdict: Yes"));
+  const first = sent(requests, 0);
+
+  assert.deepEqual(first.messages[0].content[0].cache_control, { type: "ephemeral" });
+  assert.match(first.messages[0].content[0].text, /Read the eviction rules first/);
+});
+
+test("a call records how full its context was when it finished", async () => {
+  // The last turn's prompt is the high-water mark, and the number a verdict decided at the top of
+  // the window would show. Reading input_tokens alone would call this prompt 900 tokens when 7000
+  // reached the model, and would read *smaller* the better the cache worked.
+  const { call } = await grade((turn) =>
+    turn === 0 ?
+      { call: "list", input: {}, usage: { input: 4_000, cacheCreation: 5_000 } }
+    : { say: "Verdict: Yes", usage: { input: 900, cacheRead: 6_000, cacheCreation: 100 } },
   );
+
+  assert.equal(call.promptTokens, 7_000);
+});
+
+test("cache reads are totalled across every turn of a call", async () => {
+  // A call reads the cache once per turn after the first, and only the total says what the cache
+  // saved. Keeping the last turn's figure alone would under-report a long call by its whole
+  // history — exactly the calls where caching matters most.
+  const { call } = await grade((turn) =>
+    turn < 2 ?
+      { call: "list", input: {}, usage: { cacheRead: 1_500, cacheCreation: 400 } }
+    : { say: "Verdict: Yes", usage: { cacheRead: 2_000, cacheCreation: 50 } },
+  );
+
+  assert.equal(call.turns, 3);
+  assert.equal(call.cacheReadTokens, 5_000);
+  assert.equal(call.cacheCreationTokens, 850);
+});
+
+test("a run whose big calls never read from cache raises one problem", async () => {
+  // Caching that never fires is invisible in the verdicts and shows only on the bill, and a cache
+  // written but never read costs more than not caching at all.
+  const problem = cachingProblem([
+    aCall({ promptTokens: 40_000, cacheReadTokens: 0, cacheCreationTokens: 12_000 }),
+    aCall({ promptTokens: 55_000, cacheReadTokens: 0, cacheCreationTokens: 18_000 }),
+  ]);
+
+  assert.equal(problem?.what, "caching never fired across 2 grader calls");
+  assert.match(problem?.detail ?? "", /30000 tokens were written to the cache and none were read back/);
+});
+
+test("a run where caching fired anywhere raises nothing", async () => {
+  // One read proves the breakpoint is placed right and the prefix is stable. A single call that
+  // missed is an expired entry, and warning about it would train the reader to ignore the line.
+  const problem = cachingProblem([
+    aCall({ promptTokens: 40_000, cacheReadTokens: 0, cacheCreationTokens: 12_000 }),
+    aCall({ promptTokens: 55_000, cacheReadTokens: 31_000, cacheCreationTokens: 0 }),
+  ]);
+
+  assert.equal(problem, null);
+});
+
+test("a run of calls too small to cache raises nothing", async () => {
+  // Under the API's minimum, no cache read is the correct outcome rather than a broken one, and a
+  // check that cannot tell those apart cries wolf on every short run.
+  const problem = cachingProblem([
+    aCall({ promptTokens: CACHE_EXPECTED_ABOVE, cacheReadTokens: 0, cacheCreationTokens: 0 }),
+    aCall({ promptTokens: 700, cacheReadTokens: 0, cacheCreationTokens: 0 }),
+  ]);
+
+  assert.equal(problem, null);
 });
 
 test("the grader is never told which arm wrote which answer", async () => {
