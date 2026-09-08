@@ -127,6 +127,66 @@ test("search does not follow a symlink out of the repository either", async () =
   assert.match(out, /no match/i);
 });
 
+test("search refuses a directory outside the repository, rather than searching it", async () => {
+  // Search checks its path argument the way read_file does, and nothing below it would: the walk
+  // only skips symlinks, and a directory reached by `..` is an ordinary directory it would read
+  // to the end. Take that check away and this is the test that notices.
+  const repo = aRepo();
+  const outside = mkdtempSync(join(tmpdir(), "onepass-eval-elsewhere-"));
+  writeFileSync(join(outside, "secret.txt"), "not the grader's business\n");
+
+  for (const path of [outside, "..", "src/../.."]) {
+    assert.equal(
+      await call(repo, "search", { pattern: "grader's business", path }),
+      `${path} is outside the repository being graded. Ask for a path inside it.`,
+    );
+  }
+});
+
+test("list refuses a directory outside the repository, however it is reached", async () => {
+  // Named outright, and reached through a link that looks like an ordinary directory from inside
+  // the repository. A check written on the path as it was typed would refuse the first and allow
+  // the second, and the grader would be handed the names of another arm's files.
+  const repo = aRepo();
+  const outside = mkdtempSync(join(tmpdir(), "onepass-eval-elsewhere-"));
+  writeFileSync(join(outside, "secret.txt"), "not the grader's business\n");
+  symlinkSync(outside, join(repo, "escape"));
+
+  for (const path of [outside, "escape"]) {
+    assert.equal(
+      await call(repo, "list", { path }),
+      `${path} is outside the repository being graded. Ask for a path inside it.`,
+    );
+  }
+});
+
+test("read_file refuses a file reached through a symlinked directory", async () => {
+  // The link is a directory here, not the file itself, so every part of the path the grader
+  // asked for is spelled like something inside the repository. Only resolving the whole path
+  // through its links before the check tells this apart from a file that really is inside.
+  const repo = aRepo();
+  const outside = mkdtempSync(join(tmpdir(), "onepass-eval-elsewhere-"));
+  writeFileSync(join(outside, "secret.txt"), "not the grader's business\n");
+  symlinkSync(outside, join(repo, "escape"));
+
+  assert.equal(
+    await call(repo, "read_file", { path: "escape/secret.txt" }),
+    "escape/secret.txt is outside the repository being graded. Ask for a path inside it.",
+  );
+});
+
+test("a repository reached through a symlink still contains its own files", async () => {
+  // The other side of the same rule, and the one that would go unnoticed: if the root is not
+  // resolved too, every path under it resolves past the link and lands outside a root that is
+  // still spelled with it, so the grader is refused its own repository and grades on nothing.
+  // Every other test here is handed a real path, which leaves this free to break in silence.
+  const real = aRepo();
+  const link = join(mkdtempSync(join(tmpdir(), "onepass-eval-link-")), "repo");
+  symlinkSync(real, link);
+
+  assert.equal(await call(link, "read_file", { path: "src/keep.ts" }), "1\texport const keep = true;\n2\t");
+});
+
 test("neither .git nor node_modules is code the answer was written against", async () => {
   const repo = aRepo();
   mkdirSync(join(repo, "node_modules", "left-pad"), { recursive: true });
