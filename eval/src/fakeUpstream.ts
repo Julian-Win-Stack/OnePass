@@ -58,6 +58,16 @@ export interface FakeUpstreamOptions {
    * streamed call always gets.
    */
   answer?: (turn: number) => CannedTurn | undefined;
+  /**
+   * The HTTP status an unstreamed `/v1/messages` is refused with, asked once per such call with
+   * the number already served, or undefined to answer it normally. A call the API refuses is an
+   * outcome a caller has to survive rather than throw over, and nothing else here can produce
+   * one: `answer` can only script a call that worked.
+   *
+   * A refused call is not offered to `answer`, so the two counters do not have to agree — a
+   * script written for the calls that succeed keeps its numbering whatever fails around it.
+   */
+  failWith?: (turn: number) => number | undefined;
 }
 
 export interface FakeUpstream {
@@ -71,6 +81,8 @@ export interface FakeUpstream {
 export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Promise<FakeUpstream> {
   const requests: RecordedRequest[] = [];
   let scripted = 0;
+  /** Unstreamed `/v1/messages` calls served, refused ones included. Counted for `failWith`. */
+  let unstreamed = 0;
   // Per server, not per process: two fakes running at once would otherwise hand out ids that
   // interleave, and a tool result is matched to its call by id alone.
   let toolUses = 0;
@@ -93,6 +105,15 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
         const tokens = countTokens(body);
         if (body.includes('"stream":true')) {
           streamedMessage(response, ANSWER, tokens);
+          return;
+        }
+        const status = options.failWith?.(unstreamed);
+        unstreamed += 1;
+        if (status !== undefined) {
+          json(response, status, {
+            type: "error",
+            error: { type: "api_error", message: "fake upstream refused this call" },
+          });
           return;
         }
         const turn = options.answer?.(scripted);

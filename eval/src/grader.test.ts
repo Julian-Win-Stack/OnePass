@@ -58,11 +58,13 @@ interface GradeRun {
   contextLimit?: number;
   /** Point the client somewhere other than the fake, which is how a failed call is tested. */
   baseUrl?: string;
+  /** Which of the grader's calls the upstream refuses, and with what status. */
+  failWith?: FakeUpstreamOptions["failWith"];
 }
 
 /** Grades one pair against a fake upstream running `answer`. */
 async function grade(answer: FakeUpstreamOptions["answer"], options: GradeRun = {}): Promise<Graded> {
-  const upstream = await startFakeUpstream({ answer });
+  const upstream = await startFakeUpstream({ answer, failWith: options.failWith });
   const warnings: string[] = [];
   try {
     const call = await gradePair({
@@ -339,7 +341,14 @@ test("an answer with no verdict line is Unknown, with the reason and a problem",
   const { call, warnings } = await grade(() => says("Both are fine, honestly."));
 
   assert.equal(call.verdict, "Unknown");
-  assert.match(call.reason ?? "", /no verdict/i);
+  // The whole reason, not a phrase out of it. Half of this line is the quote of what the grader
+  // actually wrote, and that half is the only thing that says *why* it never reached a verdict —
+  // a reason asserted by substring can lose it, or state the opposite, and stay green.
+  assert.equal(
+    call.reason,
+    "the grader's final message carries no verdict line (stop reason end_turn). " +
+      'It ended: "Both are fine, honestly."',
+  );
   assert.equal(call.waitingOn, null);
 
   assert.equal(warnings.length, 1);
@@ -376,9 +385,34 @@ test("a call that fails is Unknown with what failed, not a run that throws", asy
   const { call, warnings } = await grade(() => says("Verdict: Yes"), { baseUrl: "http://127.0.0.1:1" });
 
   assert.equal(call.verdict, "Unknown");
-  assert.match(call.reason ?? "", /failed/i);
+  // How far it got and what went wrong, both of them. `/failed/i` was satisfied by the word on
+  // its own, so a reason that had lost the turn count and the error alike still passed.
+  assert.equal(call.turns, 0);
+  assert.match(call.reason ?? "", /^the call failed after 0 model turns: \S/);
   assert.equal(call.problems.length, 1);
   assert.equal(warnings.length, 1);
+});
+
+test("a call that fails on its second turn says it failed after one", async () => {
+  // The turn count is what separates a grader that never started from one that died halfway, and
+  // every other test here dies on turn 0 — where the plural is right whatever the rule says.
+  const { call } = await grade(
+    () => ({ call: "list", input: {} }),
+    { failWith: (turn) => (turn === 1 ? 500 : undefined) },
+  );
+
+  assert.equal(call.turns, 1);
+  assert.match(call.reason ?? "", /^the call failed after 1 model turn: \S/);
+});
+
+test("a call the upstream refuses is not sent again", async () => {
+  // Nothing above the catch retries, and nothing should: a grader that spun for forty turns spends
+  // the same again to spin again, and a run grading hundreds of pairs pays it on every one.
+  const { call, requests } = await grade(() => says("Verdict: Yes"), { failWith: () => 500 });
+
+  assert.equal(requests.length, 1);
+  assert.equal(call.turns, 0);
+  assert.equal(call.verdict, "Unknown");
 });
 
 test("the cap can be lowered, and a lowered cap says its own number", async () => {
@@ -413,6 +447,35 @@ test("a final message with no text at all is Unknown, and says that is what it w
   assert.match(call.reason ?? "", /no text at all/);
   assert.equal(warnings.length, 1);
   assert.equal(call.problems.length, 1);
+});
+
+test("the reason quotes the last 200 characters of what the grader wrote", async () => {
+  // Written out rather than sliced in the test: `assert.equal(reason, ...text.slice(-200))` would
+  // agree with the code whatever number the code used, which is the one thing this pins.
+  const LAST_200 = "abcdefghij".repeat(20);
+  const dropped = "This opening is more than 200 characters from the end, so it is cut. ";
+
+  const { call } = await grade(() => says(dropped + LAST_200));
+
+  assert.equal(
+    call.reason,
+    'the grader\'s final message carries no verdict line (stop reason end_turn). It ended: "' +
+      LAST_200 +
+      '"',
+  );
+});
+
+test("a pending tool call with long arguments is quoted up to 300 characters", async () => {
+  // The warning names what the grader was waiting on, and a model can wait on a search whose
+  // pattern is longer than the warning. Uncut, one entry would fill the problems list; cut too
+  // short, the reader cannot tell which of forty identical searches it stopped on.
+  const { call } = await grade(() => ({ call: "search", input: { pattern: "0123456789".repeat(40) } }), {
+    maxTurns: 1,
+  });
+
+  // 300 characters of `{"pattern":"0123456789…`, which is the 12-character opening plus 288 of
+  // the pattern, then the ellipsis that says it was cut.
+  assert.equal(call.waitingOn, 'search({"pattern":"' + "0123456789".repeat(28) + "01234567" + "\u2026)");
 });
 
 // --- The context flag -------------------------------------------------------------------------
