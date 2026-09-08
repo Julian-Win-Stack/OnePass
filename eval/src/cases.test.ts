@@ -118,14 +118,17 @@ test("a compaction summary, a meta entry, a sidechain entry and a tool result ar
 });
 
 test("each case says whether its recorded answer used tools, and the groups are counted", async () => {
+  // The text-answered turn comes first on purpose. A label is what *this* turn's answer did, and
+  // the answer ends at the next turn I typed; with the tool turn first, a rule that read on past
+  // that boundary would still label every turn correctly and the fixture would prove nothing.
   const branch = branchOf(
     [
-      typed("u1", null, "answered with a tool"),
-      model("a1", "u1", { textOnly: false }),
-      toolResult("t1", "a1"),
-      model("a2", "t1", { textOnly: true }),
-      typed("u2", "a2", "answered in text"),
-      model("a3", "u2", { textOnly: true }),
+      typed("u1", null, "answered in text"),
+      model("a1", "u1", { textOnly: true }),
+      typed("u2", "a1", "answered with a tool"),
+      model("a2", "u2", { textOnly: false }),
+      toolResult("t1", "a2"),
+      model("a3", "t1", { textOnly: true }),
       typed("u3", "a3", "interrupted before an answer"),
       synthetic("x1", "u3"),
       typed("u4", "x1", "the last thing typed"),
@@ -138,8 +141,8 @@ test("each case says whether its recorded answer used tools, and the groups are 
   assert.deepEqual(
     list.cases.map((planningCase) => [planningCase.text, planningCase.answer]),
     [
-      ["answered with a tool", "tools"],
       ["answered in text", "text"],
+      ["answered with a tool", "tools"],
       ["interrupted before an answer", "none"],
       ["the last thing typed", "none"],
     ],
@@ -151,11 +154,21 @@ test("cases are listed in session order, with the turn index they were cut at", 
   const branch = deepBranch();
   const list = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
 
-  const indices = list.cases.map((planningCase) => planningCase.turnIndex);
-  assert.deepEqual([...indices].sort((a, b) => a - b), indices);
+  // A turn index is an index into the branch's turns, not a count of the ones I typed: the model
+  // turns and the tool result between them are turns of the branch too. The three typed turns of
+  // the fixture are its 1st, 3rd and 7th entries, so they are turns 0, 2 and 6 — and the index has
+  // to be that, because it is what finds the turn again in the transcript.
+  assert.deepEqual(
+    list.cases.map((planningCase) => planningCase.turnIndex),
+    [0, 2, 6],
+  );
   assert.deepEqual(
     list.cases.map((planningCase) => planningCase.id),
-    indices.map((index) => `turn-${index}`),
+    ["turn-0", "turn-2", "turn-6"],
+  );
+  assert.deepEqual(
+    list.cases.map((planningCase) => planningCase.typedIndex),
+    [0, 1, 2],
   );
 });
 
@@ -173,16 +186,24 @@ test("quick mode takes every second eligible case; full mode takes all of them",
 });
 
 test("the overhead is read from the first model turn's usage when it is not given", async () => {
+  // Two model turns at different depths, because reading the wrong one is the mistake worth
+  // catching: the overhead is a property of the system prompt and the tools, which do not grow,
+  // and a later turn's usage is mostly the conversation by then.
   const branch = branchOf(
-    [typed("u1", null, "start"), model("a1", "u1", { contextTokens: 54_000 }), typed("u2", "a1", "next")],
-    "u2",
+    [
+      typed("u1", null, "start"),
+      model("a1", "u1", { contextTokens: 54_000 }),
+      typed("u2", "a1", "next"),
+      model("a2", "u2", { contextTokens: 120_000 }),
+    ],
+    "a2",
   );
 
   const list = await extractCases(branch, byLength);
 
-  // The message list before the first model turn is one short user message, so the overhead is
-  // very nearly the whole of the 54,000 tokens that turn reported.
-  assert.ok(list.overheadTokens > 53_900 && list.overheadTokens < 54_000, `overhead was ${list.overheadTokens}`);
+  // What the first model turn was shown, less the messages it was shown: 54,000 tokens reported,
+  // against a message list of one 60-character user message, which `byLength` prices at 15.
+  assert.equal(list.overheadTokens, 53_985);
 });
 
 test("a branch whose model turns report no usage cannot be sized, and says so", async () => {

@@ -46,6 +46,13 @@ function scratch(prefix: string): string {
 }
 
 /**
+ * The one turn of the fixture whose answer calls a tool, so the case list holds both answer groups
+ * and not just the one. Its answer is the model turn the loop writes on this iteration, which is
+ * the answer to the turn typed on the one before — so the `tools` case is the 5th, not the 6th.
+ */
+const TOOL_ANSWER_TURN = 5;
+
+/**
  * A planning session small enough to write here and deep enough to be worth replaying: one large
  * tool result, then enough turns after it that the proxy's age gate has let go of it. The fake
  * upstream counts four characters to the token, so 400,000 characters is a prefix past the
@@ -59,8 +66,16 @@ function planningTranscript(): Line[] {
   ];
   let parent = "t1";
   for (let turn = 0; turn < 12; turn += 1) {
-    lines.push(model(`a${turn + 2}`, parent, { textOnly: true, contextTokens: 130_000 + turn * 1_000 }));
-    lines.push(typed(`u${turn + 2}`, `a${turn + 2}`, `carry on, ${turn}`));
+    const contextTokens = 130_000 + turn * 1_000;
+    if (turn === TOOL_ANSWER_TURN) {
+      lines.push(model(`a${turn + 2}`, parent, { textOnly: false, contextTokens }));
+      lines.push(toolResult(`t${turn + 2}`, `a${turn + 2}`));
+      lines.push(model(`b${turn + 2}`, `t${turn + 2}`, { textOnly: true, contextTokens }));
+      lines.push(typed(`u${turn + 2}`, `b${turn + 2}`, `carry on, ${turn}`));
+    } else {
+      lines.push(model(`a${turn + 2}`, parent, { textOnly: true, contextTokens }));
+      lines.push(typed(`u${turn + 2}`, `a${turn + 2}`, `carry on, ${turn}`));
+    }
     parent = `u${turn + 2}`;
   }
   lines.push(model("aLast", parent, { textOnly: true, contextTokens: 150_000 }));
@@ -165,19 +180,29 @@ test("the case list records the turn index, the prefix size and the tool label",
   const run = await runCli(["full"]);
   const result = resultOf(run);
 
+  // The fixture answers one turn with a tool and every other in text, so the list has to hold both
+  // groups and put the `tools` label on the right turn. A run that labelled them all the same, or
+  // labelled the wrong one, would still be a list of twelve plausible cases.
+  assert.deepEqual(result.caseSelection?.answers, { tools: 1, text: 11, none: 0 });
+  assert.deepEqual(
+    result.cases.map((one) => one.answer),
+    ["text", "text", "text", "text", "tools", "text", "text", "text", "text", "text", "text", "text"],
+  );
+  // Turn indices are indices into the branch, so they are not the case's position in the list and
+  // they are not evenly spaced: the tool-answered turn puts three extra entries on the branch.
+  assert.deepEqual(
+    result.cases.map((one) => one.turnIndex),
+    [4, 6, 8, 10, 12, 16, 18, 20, 22, 24, 26, 28],
+  );
   for (const record of result.cases) {
-    assert.equal(typeof record.turnIndex, "number");
     assert.ok(record.prefixTokens > 110_000, `${record.id} is ${record.prefixTokens} tokens, under the threshold`);
-    assert.ok(["tools", "text", "none"].includes(record.answer), `${record.id} has answer ${record.answer}`);
   }
   assert.equal(result.caseSelection?.selected, result.cases.length, "full mode takes all of them");
 
   // Every mode prints the list, not only replay: a scored run is about to spend money on these
   // turns and the person starting it should see which ones without waiting for the document.
-  const first = result.cases[0];
-  assert.ok(first !== undefined);
-  assert.equal(first.id, `turn-${first.turnIndex}`, "a case is named by the turn it was cut at");
-  assert.match(run.stdout, new RegExp(`${first.id}\\s+\\d+k\\s+(tools|text|none)`));
+  assert.match(run.stdout, /turn-4\s+154k\s+text/);
+  assert.match(run.stdout, /turn-12\s+154k\s+tools/, "the tool label is printed, not only recorded");
 });
 
 test("what I typed is printed but never recorded: a result document is committed", async () => {
@@ -223,6 +248,7 @@ test("the result names the control baseline for both kinds of arm", async () => 
 test("replay serves its own upstream to the children, is not scored, and needs no baseline", async () => {
   // No Claude Code version: the check run after every proxy fix has to work with nothing set up
   // but a corpus.
+  const before = upstream.requests.length;
   const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
   assert.equal(run.code, 0, run.stderr);
 
@@ -230,6 +256,13 @@ test("replay serves its own upstream to the children, is not scored, and needs n
   assert.equal(result.scored, false);
   assert.match(result.upstream, /^http:\/\/127\.0\.0\.1:\d+$/, "replay must not reach the real API");
   assert.notEqual(result.upstream, upstream.url, "the children forward to replay's own fake, not the run's");
+
+  // Two upstreams, and only the children's is replay's own. The eval's own sizing calls still go
+  // to the run's upstream — which is the real API outside a test — because a replay that measured
+  // its cases against a fake would not be listing the cases a scored run covers.
+  const paths = upstream.requests.slice(before).map((request) => request.url.split("?")[0]);
+  assert.deepEqual([...new Set(paths)], ["/v1/messages/count_tokens"], "the run's upstream sized the cases");
+
   assert.deepEqual(result.baselines, [], "replay has no control to compare against");
 });
 

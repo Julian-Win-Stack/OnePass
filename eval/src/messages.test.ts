@@ -142,6 +142,9 @@ test("history starts at the branch root when nothing was compacted before the ca
 });
 
 test("history starts after the last compaction the case sits past", () => {
+  // Two compactions, because the corpus branch has two and one of them cannot tell the last from
+  // the first. A case past both opens with the second summary; opening with the first would carry
+  // back every turn the second compaction threw away.
   const branch = branchOf(
     [
       typed("u1", null, "first"),
@@ -149,17 +152,22 @@ test("history starts after the last compaction the case sits past", () => {
       typed("u2", "a1", "second"),
       model("a2", "u2", { contextTokens: 9_000 }),
       typed("u3", "a2", "third"),
-      model("a3", "u3", { contextTokens: 12_000 }),
+      model("a3", "u3", { contextTokens: 180_000 }),
+      typed("u4", "a3", "fourth"),
+      model("a4", "u4", { contextTokens: 11_000 }),
       compactBoundary("c1", "a1"),
       compactSummary("cs1", "c1"),
+      compactBoundary("c2", "a3"),
+      compactSummary("cs2", "c2"),
     ],
-    "a3",
+    "a4",
   );
+  assert.equal(branch.compactions.length, 2, "both boundaries were matched to the branch");
 
   const start = historyStart(branch, branch.turns.length - 1);
 
-  assert.equal(start.fromIndex, 2, "the turn straight after the one the compaction preserved");
-  assert.equal(start.compaction?.uuid, "c1");
+  assert.equal(start.compaction?.uuid, "c2", "the last compaction the case sits past, not the first");
+  assert.equal(start.fromIndex, 6, "the turn straight after the one that compaction preserved");
   assert.equal(start.opensWithCompactionSummary, true);
 });
 

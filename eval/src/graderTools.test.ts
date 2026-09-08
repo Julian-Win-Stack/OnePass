@@ -4,7 +4,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { graderTools } from "./graderTools.js";
@@ -17,6 +17,20 @@ function aRepo(): string {
   writeFileSync(join(dir, "src", "evict.ts"), "export function evict(): void {\n  // evicts a tool result\n}\n");
   writeFileSync(join(dir, "src", "keep.ts"), "export const keep = true;\n");
   return dir;
+}
+
+/** Every file under `dir` with its bytes, so the repository can be compared before and after. */
+function treeOf(dir: string): Record<string, string> {
+  const tree: Record<string, string> = {};
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const [below, text] of Object.entries(treeOf(path))) tree[`${entry.name}/${below}`] = text;
+    } else if (entry.isFile()) {
+      tree[entry.name] = readFileSync(path, "utf8");
+    }
+  }
+  return tree;
 }
 
 /** Runs a tool by name the way the runner does, through its own parse. */
@@ -60,10 +74,20 @@ test("search answers with the file, the line number and the line", async () => {
   assert.doesNotMatch(out, /keep\.ts/);
 });
 
-test("search takes a regular expression, and says so when nothing matched", async () => {
+test("search takes a regular expression, not a literal string", async () => {
   const repo = aRepo();
-  assert.match(await call(repo, "search", { pattern: "ev(ict|ade)" }), /src\/evict\.ts:1:/);
-  assert.match(await call(repo, "search", { pattern: "compaction" }), /no match/i);
+  assert.match(await call(repo, "search", { pattern: "ev(ict|ade)" }), /^src\/evict\.ts:1:/m);
+});
+
+test("search says so when nothing matched", async () => {
+  const repo = aRepo();
+  assert.equal(await call(repo, "search", { pattern: "compaction" }), "No match for compaction.");
+});
+
+test("a pattern that is not a regular expression is said so, rather than thrown", async () => {
+  const repo = aRepo();
+  const out = await call(repo, "search", { pattern: "ev(ict" });
+  assert.match(out, /^ev\(ict is not a regular expression: /);
 });
 
 test("a path outside the repository is refused, not read", async () => {
@@ -122,15 +146,35 @@ test("neither .git nor node_modules is code the answer was written against", asy
 
 test("a file that is not there is said so, rather than thrown", async () => {
   const repo = aRepo();
-  assert.match(await call(repo, "read_file", { path: "src/nowhere.ts" }), /no file at src\/nowhere\.ts/);
-  assert.match(await call(repo, "list", { path: "nowhere" }), /no directory at nowhere/);
+  assert.equal(await call(repo, "read_file", { path: "src/nowhere.ts" }), "There is no file at src/nowhere.ts.");
+});
+
+test("a directory that is not there is said so, rather than thrown", async () => {
+  const repo = aRepo();
+  assert.equal(await call(repo, "list", { path: "nowhere" }), "There is no directory at nowhere.");
 });
 
 test("nothing the tools do writes to the repository", async () => {
   const repo = aRepo();
-  // The tools take no argument that could name something to write, which is what makes them
-  // read-only: the schema is the guarantee, not a check inside run.
-  for (const tool of graderTools(repo)) {
+  const before = treeOf(repo);
+
+  await call(repo, "read_file", { path: "src/evict.ts" });
+  await call(repo, "list", {});
+  await call(repo, "search", { pattern: "evict" });
+  // A refusal, a miss and a bad pattern each run their own code, and any of the three could
+  // leave something behind on the way to answering with text.
+  await call(repo, "read_file", { path: "../secret.txt" });
+  await call(repo, "read_file", { path: "src/nowhere.ts" });
+  await call(repo, "list", { path: "nowhere" });
+  await call(repo, "search", { pattern: "ev(ict" });
+
+  assert.deepEqual(treeOf(repo), before, "a tool changed the repository it was grading");
+});
+
+test("no tool takes an argument that could name something to write", () => {
+  // The schemas are the second guarantee, and the one the model is bound by: a tool it cannot
+  // ask to write is one it cannot be talked into writing with.
+  for (const tool of graderTools(aRepo())) {
     const properties = Object.keys((tool.input_schema as { properties?: object }).properties ?? {});
     assert.deepEqual(
       properties.filter((name) => /content|text|write|data/.test(name)),
