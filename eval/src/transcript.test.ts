@@ -393,3 +393,26 @@ test("a file that holds more than one session id says which ones the branch runs
   assert.deepEqual(branch.sessionIds, ["ancestor", "resumed"]);
   assert.deepEqual(branch.file.sessionIds, ["ancestor", "resumed"]);
 });
+
+test("puts the result of a parallel tool call on the branch though the walk misses it", () => {
+  // Claude Code forks the file at a parallel call: the chain runs on through the second call, and
+  // the first call's result hangs off the first entry as a childless leaf. The walk follows the
+  // chain, so without adoption the branch carries one result for two calls.
+  const path = write([
+    typed("u1", null, "start"),
+    model("a1", "u1", { textOnly: false, toolUseId: "call-A" }),
+    model("a2", "a1", { textOnly: false, toolUseId: "call-B" }),
+    toolResult("rA", "a1", { toolUseId: "call-A" }),
+    toolResult("rB", "a2", { toolUseId: "call-B" }),
+    typed("u2", "rB", "next"),
+  ]);
+
+  const branch = readTranscript(path, { tip: "u2" });
+
+  assert.equal(branch.counts.toolResult, 2, "two calls were made, so two results were sent back");
+  assert.deepEqual(
+    branch.turns.map((turn) => turn.uuid),
+    ["u1", "a1", "a2", "rA", "rB", "u2"],
+    "the adopted result sits with the results, not after the call that made it",
+  );
+});

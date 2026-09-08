@@ -35,8 +35,14 @@ test("the deep Fable branch reads as the corpus decisions describe it", (t) => {
 
   // 57 typed turns on the branch, against the 95 the same file shows when it is read flat.
   assert.equal(branch.counts.typed, 57);
-  assert.equal(branch.file.pathLength, 918);
-  assert.equal(branch.file.entriesOffPath, 961);
+  // 918 entries are reachable by parent links alone. The other 4 are results of parallel tool
+  // calls, which Claude Code hangs off the call entry they answer rather than off the chain — so
+  // the walk passes them by and they have to be adopted back. The API saw all 922: every
+  // `tool_use` on the path is answered in the message after it. The two numbers partition the
+  // file, so adopting 4 takes 4 off the other side.
+  assert.equal(branch.file.pathLength, 918 + 4);
+  assert.equal(branch.file.entriesOffPath, 961 - 4);
+  assert.equal(branch.file.pathLength + branch.file.entriesOffPath, branch.file.entries);
   assert.equal(branch.file.branches, 25);
   assert.equal(branch.file.duplicateWrites, 294);
 

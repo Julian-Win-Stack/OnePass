@@ -191,3 +191,90 @@ test("a compaction whose summary the file does not hold is reported, not silentl
   const messages = buildMessages(branch, cut.index) as { content: { text?: string }[] }[];
   assert.equal(messages.length, 1, "the turn typed after the compaction, and nothing standing in for it");
 });
+
+// A parallel tool call is the one place the transcript is not a line. Claude Code writes the two
+// calls as two entries and hangs the first call's result off the first entry as a childless leaf,
+// so the walk reaches the second call's result and no other. Every test below is one half of what
+// putting the missed result back has to get right: the request carries it, and carrying it does
+// not change the message shape the session sent.
+
+/** The `tool_use` ids of a message, in the order it stored them. */
+function callIds(message: { content: unknown[] }): string[] {
+  return message.content
+    .filter((block): block is { type: string; id: string } => (block as { type?: string })?.type === "tool_use")
+    .map((block) => block.id);
+}
+
+/** The calls a message answers, in the order it stored them. */
+function answeredIds(message: { content: unknown[] }): string[] {
+  return message.content
+    .filter((block): block is { type: string; tool_use_id: string } =>
+      (block as { type?: string })?.type === "tool_result")
+    .map((block) => block.tool_use_id);
+}
+
+/**
+ * Two calls in one answer. `call-A` is answered on a childless leaf hanging off `a1`, which the
+ * walk to `u2` never visits; `call-B` is answered on the chain the walk follows.
+ */
+const parallelCall = [
+  typed("u1", null, "start"),
+  model("a1", "u1", { textOnly: false, toolUseId: "call-A" }),
+  model("a2", "a1", { textOnly: false, toolUseId: "call-B" }),
+  toolResult("rA", "a1", { toolUseId: "call-A" }),
+  toolResult("rB", "a2", { toolUseId: "call-B" }),
+  model("a3", "rB", { textOnly: true }),
+  typed("u2", "a3", "next"),
+];
+
+test("answers both calls of a parallel tool call, including the one off the walked path", () => {
+  const branch = branchOf(parallelCall, "u2");
+
+  const messages = buildMessages(branch, branch.turns.length - 1) as { role: string; content: unknown[] }[];
+
+  assert.deepEqual(
+    answeredIds(messages[2] as { content: unknown[] }),
+    ["call-A", "call-B"],
+    "the API requires every call of a message to be answered in the message that follows it",
+  );
+});
+
+test("keeps a parallel tool call to the one assistant message the API saw", () => {
+  const branch = branchOf(parallelCall, "u2");
+
+  const messages = buildMessages(branch, branch.turns.length - 1) as { role: string; content: unknown[] }[];
+
+  assert.deepEqual(roles(messages), ["user", "assistant", "user", "assistant", "user"]);
+  assert.deepEqual(
+    callIds(messages[1] as { content: unknown[] }),
+    ["call-A", "call-B"],
+    "both calls are one message; splitting them would double the assistant count the age gate reads",
+  );
+});
+
+test("leaves the tool result of an abandoned branch out of the request", () => {
+  // `call-X` was made on a branch the session rewound out of, so neither it nor its result was in
+  // the request. A result is carried because the call it answers is on the branch, not because the
+  // result is a dead end — every parallel call's result is a dead end too.
+  const branch = branchOf(
+    [
+      typed("u1", null, "start"),
+      model("a1", "u1", { textOnly: true }),
+      typed("u2", "a1", "second"),
+      model("dead1", "u2", { textOnly: false, toolUseId: "call-X" }),
+      toolResult("dead2", "dead1", { toolUseId: "call-X" }),
+      model("a2", "u2", { textOnly: true }),
+      typed("u3", "a2", "third"),
+    ],
+    "u3",
+  );
+
+  const messages = buildMessages(branch, branch.turns.length - 1) as { role: string; content: unknown[] }[];
+
+  assert.deepEqual(roles(messages), ["user", "assistant", "user", "assistant", "user"]);
+  assert.equal(
+    JSON.stringify(messages).includes("call-X"),
+    false,
+    "the call was rewound out of, so neither it nor its result was ever sent",
+  );
+});

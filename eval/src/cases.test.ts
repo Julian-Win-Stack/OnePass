@@ -69,8 +69,10 @@ test("only turns past the trip threshold are cases; below it both arms would sen
   assert.equal(list.typedTurns, 3);
   assert.equal(list.belowThreshold, 2);
   // Written out rather than imported: comparing the constant with itself would hold for any value
-  // it was ever changed to, and the number is a claim about the client's compaction point.
-  assert.equal(list.thresholdTokens, 110_000);
+  // it was ever changed to. The number is deliberately under the proxy's 110k trip point, because a
+  // rebuilt prefix measures smaller than the request the session sent and sizing at 110k drops
+  // turns that were over it in life.
+  assert.equal(list.thresholdTokens, 80_000);
 });
 
 test("the fixed system-and-tools overhead counts towards the threshold", async () => {

@@ -46,11 +46,13 @@ export function typed(uuid: string, parentUuid: string | null, text: string, ext
 export interface ToolResultOptions extends Common {
   /** How big the result is. A case only trips the proxy when its prefix is large. */
   chars?: number;
+  /** The call this answers. Set it to pair a result with a `model` entry's `toolUseId`. */
+  toolUseId?: string;
 }
 
 /** A `user` entry carrying tool results back to the model. */
 export function toolResult(uuid: string, parentUuid: string | null, extra: Line & ToolResultOptions = {}): Line {
-  const { chars, ...rest } = extra;
+  const { chars, toolUseId, ...rest } = extra;
   return {
     ...common(extra),
     type: "user",
@@ -58,7 +60,13 @@ export function toolResult(uuid: string, parentUuid: string | null, extra: Line 
     parentUuid,
     message: {
       role: "user",
-      content: [{ type: "tool_result", tool_use_id: `tool-${uuid}`, content: chars === undefined ? "ok" : "x".repeat(chars) }],
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId ?? `tool-${uuid}`,
+          content: chars === undefined ? "ok" : "x".repeat(chars),
+        },
+      ],
     },
     ...rest,
   };
@@ -73,12 +81,14 @@ export interface ModelOptions extends Common {
   textOnly?: boolean;
   /** True when the turn belongs to a subagent's conversation rather than the user's. */
   isSidechain?: boolean;
+  /** The id of the `tool_use` block, for pairing it with the `toolResult` that answers it. */
+  toolUseId?: string;
 }
 
 export function model(uuid: string, parentUuid: string | null, options: ModelOptions = {}): Line {
   const context = options.contextTokens ?? 1_000;
   const content = options.textOnly === false
-    ? [{ type: "tool_use", id: `tool-${uuid}`, name: "Read", input: { file_path: "/tmp/a" } }]
+    ? [{ type: "tool_use", id: options.toolUseId ?? `tool-${uuid}`, name: "Read", input: { file_path: "/tmp/a" } }]
     : [{ type: "text", text: "answer" }];
   return {
     ...common(options),

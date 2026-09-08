@@ -21,16 +21,24 @@
 // one's rather than as a stale file nobody re-reads.
 
 import type { Mode } from "./args.js";
-import { EvalError } from "./errors.js";
+import { EvalError, messageOf } from "./errors.js";
 import { buildMessages, historyStart, type CaseMessage } from "./messages.js";
 import { isRealModelTurn, isTypedTurn, type Branch, type ModelTurn, type Stretch, type UserTurn } from "./transcript.js";
 
 /**
- * T, the proxy's default trip threshold. A turn whose prefix is under this evicts nothing, so both
- * arms would send the same bytes. Held here rather than imported because the eval measures a proxy
- * it builds from source and must not silently follow a threshold that build changed.
+ * The prefix size a turn has to reach to be worth covering. Held here rather than imported because
+ * the eval measures a proxy it builds from source and must not silently follow a threshold that
+ * build changed.
+ *
+ * Set below the proxy's own trip threshold of 110k on purpose. A rebuilt prefix measures smaller
+ * than the request the session really sent — the transcript's attachment and hook-summary entries
+ * carry content the rebuild does not put back, and the shortfall grew from 17k on the shallowest
+ * corpus case to 54k on the deepest. Sizing at 110k therefore drops turns that were over 110k in
+ * life, and drops them silently: the case list just comes back shorter. Cutting low is the cheap
+ * side to be wrong on, because a case under the proxy's threshold only costs a call that evicts
+ * nothing, while a case wrongly dropped is never measured at all.
  */
-export const TRIP_THRESHOLD_TOKENS = 110_000;
+export const TRIP_THRESHOLD_TOKENS = 80_000;
 
 /** What the recorded answer to a case did. The two groups the report separates are the first two. */
 export type AnswerLabel =
@@ -112,7 +120,7 @@ export async function extractCases(
 
   for (const [typedIndex, turn] of typedTurns.entries()) {
     const messages = buildMessages(branch, turn.index);
-    const messageTokens = await countTokens(messages);
+    const messageTokens = await sizeOf(countTokens, messages, `turn ${turn.index}, typed turn ${typedIndex}`);
     const prefixTokens = messageTokens + overheadTokens;
     if (prefixTokens <= TRIP_THRESHOLD_TOKENS) {
       belowThreshold += 1;
@@ -146,6 +154,25 @@ export async function extractCases(
       none: cases.filter((planningCase) => planningCase.answer === "none").length,
     },
   };
+}
+
+/**
+ * Sizes one message list, naming the turn if the endpoint refuses it.
+ *
+ * A rebuilt list the API rejects is a bug in the rebuild, and the endpoint reports it against a
+ * message index of its own — which says nothing about where in a 12MB session to look. The turn is
+ * the only thing that does.
+ */
+async function sizeOf(
+  countTokens: (messages: readonly CaseMessage[]) => Promise<number>,
+  messages: readonly CaseMessage[],
+  where: string,
+): Promise<number> {
+  try {
+    return await countTokens(messages);
+  } catch (err: unknown) {
+    throw new EvalError(`sizing ${where} (${messages.length} messages) failed: ${messageOf(err)}`);
+  }
 }
 
 /**
