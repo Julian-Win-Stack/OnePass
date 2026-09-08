@@ -27,6 +27,19 @@ import type { Problem } from "./result.js";
  */
 export const GRADER_TURN_CAP = 40;
 
+/**
+ * Above this many prompt tokens, a call is flagged as one whose verdict may be degraded. The
+ * verdict still counts: the call answered, and discarding it would throw away a probably-good
+ * answer and inflate the Unknowns, which mean the grader gave up rather than the grader ran hot.
+ * What the flag buys is that a verdict decided at the top of the window is visible as one instead
+ * of being counted beside a verdict decided with room to spare.
+ *
+ * Cached tokens count towards it, which is what {@link promptSizeOf} is for. Caching buys price
+ * and latency, never attention: a prompt the cache served in full is exactly as long to read as
+ * the same prompt sent whole.
+ */
+export const GRADER_CONTEXT_LIMIT = 200_000;
+
 /** Room for the reasoning behind a verdict, and nowhere near room to recite a repository. */
 const MAX_OUTPUT_TOKENS = 16_000;
 
@@ -89,8 +102,13 @@ export interface GraderCall {
   reason: string | null;
   /** The tool call the grader was left waiting on, or null. Several, when it asked for several. */
   waitingOn: string | null;
-  /** The run's problems entry, or null when nothing stopped early. */
-  problem: Problem | null;
+  /**
+   * What this call owes the run's problems list: nothing when it finished with room to spare, and
+   * as many as two — a call that stopped early can also have run hot, and dropping either would
+   * hide it. Never collapsed to one, for the reason the report prints problems instead of
+   * counting them.
+   */
+  problems: readonly Problem[];
 }
 
 export interface GradeOptions {
@@ -105,6 +123,11 @@ export interface GradeOptions {
   repoPath: string;
   /** Model turns this call may take. Defaults to {@link GRADER_TURN_CAP}. */
   maxTurns?: number;
+  /**
+   * Prompt tokens above which the call is flagged. Defaults to {@link GRADER_CONTEXT_LIMIT}.
+   * Injected so a test can trip the flag without building a prompt the size of the real one.
+   */
+  contextLimit?: number;
   /** Chooses which answer is shown as A. Injected so a test can pin the order. */
   random?: () => number;
   /** Where a stopped call is announced. Defaults to `console.warn`. */
@@ -123,6 +146,12 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   const cap = options.maxTurns ?? GRADER_TURN_CAP;
   if (!Number.isInteger(cap) || cap < 1) {
     throw new EvalError(`a grader call has to be capped at one model turn or more, not ${cap}.`);
+  }
+  // NaN is the trap here: every `promptTokens > limit` against it is false, so a limit that is
+  // not a number turns the flag off entirely and says nothing about having done so.
+  const contextLimit = options.contextLimit ?? GRADER_CONTEXT_LIMIT;
+  if (!Number.isInteger(contextLimit) || contextLimit < 1) {
+    throw new EvalError(`a grader context limit has to be a positive whole number, not ${contextLimit}.`);
   }
   const random = options.random ?? Math.random;
   const warn = options.warn ?? ((line: string) => console.warn(line));
@@ -170,6 +199,14 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
   }
 
   const outcome = outcomeOf({ cap, turns, last, failure });
+  const promptTokens = last === null ? 0 : promptSizeOf(last);
+
+  const problems: Problem[] = [];
+  if (outcome.reason !== null) problems.push(problemOf(pair, question, outcome, shownAs));
+  if (promptTokens > contextLimit) {
+    problems.push(contextProblemOf(pair, question, outcome.verdict, promptTokens, contextLimit));
+  }
+
   const call: GraderCall = {
     case: pair.case,
     pair: pair.id,
@@ -177,14 +214,14 @@ export async function gradePair(options: GradeOptions): Promise<GraderCall> {
     verdict: outcome.verdict,
     shownAs,
     turns,
-    promptTokens: last === null ? 0 : promptSizeOf(last),
+    promptTokens,
     cacheReadTokens: cacheRead,
     cacheCreationTokens: cacheCreation,
     reason: outcome.reason,
     waitingOn: outcome.waitingOn,
-    problem: outcome.reason === null ? null : problemOf(pair, question, outcome, shownAs),
+    problems,
   };
-  if (call.problem !== null) warn(warningOf(call.problem));
+  for (const problem of problems) warn(warningOf(problem));
   return call;
 }
 
@@ -335,6 +372,27 @@ function problemOf(
     detail:
       `${outcome.reason} Waiting on ${outcome.waitingOn ?? "nothing"}. ` +
       `Shown as A: ${shownAs.A}, as B: ${shownAs.B}.`,
+  };
+}
+
+/**
+ * A finished call that ran hot, put into words. Worded so a reader can tell it at a glance from
+ * the entry above: that one says no verdict was reached, this one says a verdict was reached and
+ * should be read with suspicion. Collapsing the two into one wording would leave the report
+ * unable to say which had happened.
+ */
+function contextProblemOf(
+  pair: Pair,
+  question: GraderQuestion,
+  verdict: Verdict,
+  promptTokens: number,
+  limit: number,
+): Problem {
+  return {
+    what: `grader context high: case ${pair.case}, pair ${pair.id}, question ${question.id}`,
+    detail:
+      `the call finished at ${promptTokens.toLocaleString("en-US")} prompt tokens, over the limit ` +
+      `of ${limit.toLocaleString("en-US")}. The verdict (${verdict}) stands and may be degraded.`,
   };
 }
 

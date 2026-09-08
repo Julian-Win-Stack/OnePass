@@ -21,6 +21,7 @@ import {
   type Pair,
   type GraderQuestion,
 } from "./grader.js";
+import type { Problem } from "./result.js";
 
 /** The repository the answers were written against. */
 function aRepo(): string {
@@ -54,6 +55,7 @@ interface Graded {
 interface GradeRun {
   random?: () => number;
   maxTurns?: number;
+  contextLimit?: number;
   /** Point the client somewhere other than the fake, which is how a failed call is tested. */
   baseUrl?: string;
 }
@@ -71,6 +73,7 @@ async function grade(answer: FakeUpstreamOptions["answer"], options: GradeRun = 
       pair: aPair(),
       repoPath: aRepo(),
       maxTurns: options.maxTurns,
+      contextLimit: options.contextLimit,
       random: options.random,
       warn: (line) => warnings.push(line),
     });
@@ -98,7 +101,7 @@ function aCall(usage: Pick<GraderCall, "promptTokens" | "cacheReadTokens" | "cac
     turns: 4,
     reason: null,
     waitingOn: null,
-    problem: null,
+    problems: [],
     ...usage,
   };
 }
@@ -110,7 +113,7 @@ test("a finished call answers the question, and leaves nothing behind to explain
 
   assert.equal(call.verdict, "Yes");
   assert.equal(call.reason, null);
-  assert.equal(call.problem, null);
+  assert.deepEqual(call.problems, []);
   assert.equal(call.waitingOn, null);
   assert.equal(call.turns, 1);
   assert.equal(call.case, "planning-42");
@@ -122,7 +125,7 @@ test("a finished call answers the question, and leaves nothing behind to explain
 test("No is a verdict", async () => {
   const { call } = await grade(() => says("Verdict: No"));
   assert.equal(call.verdict, "No");
-  assert.equal(call.problem, null);
+  assert.deepEqual(call.problems, []);
 });
 
 test("an Unknown the grader chose after looking is a verdict, not a problem", async () => {
@@ -131,7 +134,7 @@ test("an Unknown the grader chose after looking is a verdict, not a problem", as
   const { call, warnings } = await grade(() => says("I read both and cannot separate them.\n\nVerdict: Unknown"));
   assert.equal(call.verdict, "Unknown");
   assert.equal(call.reason, null);
-  assert.equal(call.problem, null);
+  assert.deepEqual(call.problems, []);
   assert.deepEqual(warnings, []);
 });
 
@@ -149,7 +152,7 @@ test("a verdict mentioned in passing mid-line is not the grader's answer", async
   // never gave, and it would count it silently, because a parsed verdict raises no problem.
   const { call } = await grade(() => says("They asked for a verdict: yes or no. I cannot give one."));
   assert.equal(call.verdict, "Unknown");
-  assert.ok(call.problem !== null, "a verdict was read out of prose that gave none");
+  assert.equal(call.problems.length, 1, "a verdict was read out of prose that gave none");
 });
 
 test("the grader is given read file, search and list, and nothing else", async () => {
@@ -302,9 +305,10 @@ test("an answer with no verdict line is Unknown, with the reason and a problem",
   for (const named of ["planning-42", "proxied-vs-control-1", "as-good-a-next-turn"]) {
     assert.ok(warning.includes(named), `the warning does not name ${named}: ${warning}`);
   }
-  assert.ok(call.problem !== null, "an Unknown that stopped early is not in the problems list");
-  assert.ok(warning.includes(call.problem.what), "the warning and the problem say different things");
-  assert.ok(warning.includes(call.problem.detail), "the warning and the problem say different things");
+  assert.equal(call.problems.length, 1, "an Unknown that stopped early is not in the problems list");
+  const raised = call.problems[0] as Problem;
+  assert.ok(warning.includes(raised.what), "the warning and the problem say different things");
+  assert.ok(warning.includes(raised.detail), "the warning and the problem say different things");
 });
 
 test("a grader that never stops calling tools is cut off at forty model turns", async () => {
@@ -322,7 +326,7 @@ test("a grader that never stops calling tools is cut off at forty model turns", 
   assert.match(call.waitingOn ?? "", /evict/);
   assert.equal(warnings.length, 1);
   assert.ok((warnings[0] as string).includes(call.waitingOn as string));
-  assert.ok(call.problem !== null);
+  assert.equal(call.problems.length, 1);
 });
 
 test("a call that fails is Unknown with what failed, not a run that throws", async () => {
@@ -331,7 +335,7 @@ test("a call that fails is Unknown with what failed, not a run that throws", asy
 
   assert.equal(call.verdict, "Unknown");
   assert.match(call.reason ?? "", /failed/i);
-  assert.ok(call.problem !== null);
+  assert.equal(call.problems.length, 1);
   assert.equal(warnings.length, 1);
 });
 
@@ -366,5 +370,103 @@ test("a final message with no text at all is Unknown, and says that is what it w
   assert.equal(call.verdict, "Unknown");
   assert.match(call.reason ?? "", /no text at all/);
   assert.equal(warnings.length, 1);
-  assert.ok(call.problem !== null);
+  assert.equal(call.problems.length, 1);
+});
+
+// --- The context flag -------------------------------------------------------------------------
+//
+// A call can finish, answer, and still be worth doubting: the model attends worse across a full
+// window than an empty one, and nothing about a returned verdict says which it was. These drive
+// the size through the fake's usage rather than by building a real 200k prompt, which is why the
+// numbers below are exact rather than approximate.
+
+test("a call that finishes at the limit is not flagged", async () => {
+  // Exactly at the limit is not over it. The boundary is the whole of the rule, and a check
+  // written with >= instead of > would flag a call that was inside its budget.
+  const { call, warnings } = await grade(() => ({ say: "Verdict: Yes", usage: { input: 200_000 } }));
+
+  assert.equal(call.promptTokens, 200_000);
+  assert.deepEqual(call.problems, []);
+  assert.deepEqual(warnings, []);
+});
+
+test("a call one token over the limit is flagged", async () => {
+  const { call } = await grade(() => ({ say: "Verdict: Yes", usage: { input: 200_001 } }));
+
+  assert.equal(call.promptTokens, 200_001);
+  assert.equal(call.problems.length, 1);
+});
+
+test("a flagged call keeps the verdict it reached", async () => {
+  // The call answered. Turning that into Unknown would throw away a probably-good verdict and
+  // count it among the ones where the grader gave up, which is the one number Unknown means.
+  const { call } = await grade(() => ({ say: "A reads first.\n\nVerdict: Yes", usage: { input: 250_000 } }));
+
+  assert.equal(call.verdict, "Yes");
+  assert.equal(call.reason, null);
+  assert.equal(call.waitingOn, null);
+});
+
+test("a flagged call tells the report how big it got and what it was measured against", async () => {
+  const { call } = await grade(() => ({ say: "Verdict: No", usage: { input: 214_003 } }));
+
+  assert.deepEqual(call.problems, [
+    {
+      what: "grader context high: case planning-42, pair proxied-vs-control-1, question as-good-a-next-turn",
+      detail:
+        "the call finished at 214,003 prompt tokens, over the limit of 200,000. " +
+        "The verdict (No) stands and may be degraded.",
+    },
+  ]);
+});
+
+test("a flagged call is announced the moment it happens", async () => {
+  const { warnings } = await grade(() => ({ say: "Verdict: Yes", usage: { input: 250_000 } }));
+
+  assert.deepEqual(warnings, [
+    "[onepass-eval] grader context high: case planning-42, pair proxied-vs-control-1, " +
+      "question as-good-a-next-turn — the call finished at 250,000 prompt tokens, over the limit " +
+      "of 200,000. The verdict (Yes) stands and may be degraded.",
+  ]);
+});
+
+test("prompt tokens the cache served count towards the limit", async () => {
+  // Caching buys price and latency, never attention: a prompt read back from the cache is exactly
+  // as long for the model to attend across as the same prompt sent whole. Thresholding on
+  // `input_tokens` alone would leave this call — 25 uncached tokens — looking like a small one.
+  const { call } = await grade(() => ({
+    say: "Verdict: Yes",
+    usage: { input: 25, cacheRead: 240_000, cacheCreation: 10_000 },
+  }));
+
+  assert.equal(call.promptTokens, 250_025);
+  assert.equal(call.problems.length, 1);
+});
+
+test("a stopped call that also ran hot reports both problems", async () => {
+  // Two different facts about one call: it never answered, and it was full when it stopped.
+  // Keeping only the first would lose the reason it was reading forty times in the first place.
+  const { call, warnings } = await grade(
+    () => ({ call: "search", input: { pattern: "evict" }, usage: { input: 250_000 } }),
+    { maxTurns: 2 },
+  );
+
+  assert.equal(call.verdict, "Unknown");
+  assert.deepEqual(
+    call.problems.map((problem) => problem.what),
+    [
+      "grader Unknown: case planning-42, pair proxied-vs-control-1, question as-good-a-next-turn",
+      "grader context high: case planning-42, pair proxied-vs-control-1, question as-good-a-next-turn",
+    ],
+  );
+  assert.equal(warnings.length, 2, "one of the two problems was never announced");
+});
+
+test("a context limit that is not a whole number is refused", async () => {
+  // NaN is the one that matters: every `promptTokens > NaN` is false, so a limit that is not a
+  // number switches the flag off for the whole run without a word about having done so.
+  await assert.rejects(
+    () => grade(() => says("Verdict: Yes"), { contextLimit: Number.NaN }),
+    /a grader context limit has to be a positive whole number, not NaN\./,
+  );
 });
