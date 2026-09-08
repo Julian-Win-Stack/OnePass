@@ -112,6 +112,23 @@ test("the tip defaults to the last entry written and can be named", () => {
   assert.deepEqual(textOf(path, "a2a"), ["start", "the branch that was kept"]);
 });
 
+test("a rewrite on the last line of the file is the last entry written", () => {
+  // The default tip is the last entry *written*, not the last entry first written. A rewrite is
+  // the newest thing in the file even though its uuid appeared earlier, so it is the tip.
+  const path = write([
+    typed("u1", null, "start"),
+    model("a1", "u1"),
+    typed("u2", "a1", "first draft"),
+    model("a2", "u2"),
+    typed("u2", "a1", "rewritten after the model answered"),
+  ]);
+
+  const branch = readTranscript(path);
+  assert.equal(branch.tipUuid, "u2");
+  assert.equal(branch.tipChosen, "default");
+  assert.deepEqual(textOf(path), ["start", "rewritten after the model answered"]);
+});
+
 test("refuses a tip that is not in the file, and a file with nothing to walk", () => {
   const path = write([typed("u1", null, "start")]);
   assert.throws(
