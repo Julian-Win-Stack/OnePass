@@ -81,6 +81,11 @@ _Avoid_: A/A, baseline variance
 The model that scores a pair, seeing the full history including evicted content.
 _Avoid_: judge, LLM-as-judge, evaluator
 
+**Verdict**:
+What one grader call answers: Yes, No or Unknown. A call that stopped early — capped at its turn
+limit, or ending with no verdict to read — is Unknown *and* a problem, never just an Unknown.
+_Avoid_: score, rating, label (a *hand label* is mine, a verdict is the grader's)
+
 **Tail**:
 A forked continuation of a recorded implementation session from its trip point to the end.
 _Avoid_: suffix, resume run

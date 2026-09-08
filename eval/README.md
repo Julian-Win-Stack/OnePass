@@ -29,8 +29,9 @@ node dist/main.js import <transcript.jsonl> --tip <uuid>   # copy one session in
 
 **No arm is measured yet.** What exists is the spine the arms are written into — the command and
 its modes, the corpus directory, the control baseline, the proxy child, and the result document
-every later ticket writes into — and the corpus import that gives them a session to read. A run
-today builds the proxy, starts a child, and writes a result document with no cases in it.
+every later ticket writes into — the corpus import that gives them a session to read, and the
+grader runtime the arms will call once they have pairs to grade. A run today builds the proxy,
+starts a child, and writes a result document with no cases in it.
 
 - **The corpus.** `ONEPASS_EVAL_CORPUS` names one directory holding every byte of session
   content: transcript copies, fork and grader outputs, hand labels, the control baseline and the
@@ -54,6 +55,28 @@ today builds the proxy, starts a child, and writes a result document with no cas
 - **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
   can be driven with no key and no money. Replay mode serves its own fake upstream to the proxy
   child; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+
+## The grader
+
+One call answers one yes/no question about one pair of answers, and returns Yes, No or Unknown.
+It is a direct API call through the Anthropic SDK's tool runner, not a Claude Code session, so
+every model call the eval makes for itself sits behind the same HTTP boundary the tests fake.
+
+- **Three tools, all read-only** — read a file, search, list — over the repository the answers
+  were written against: the case worktree for planning, the finished tail worktrees for
+  implementation. Every path is resolved through symlinks and refused if it lands outside that
+  repository, and there is no tool that writes.
+- **One call per pair, in a random order.** The two answers are shown as A and B in an order
+  chosen at random for the pair, and the order is recorded. The grader is never told which arm
+  wrote which. Position bias, if there is any, shows in the control-versus-control noise floor
+  drifting off an even split — that is what pays for grading each pair once instead of twice.
+- **Nothing that stopped early hides inside an Unknown.** A call is capped at 40 model turns. A
+  capped call is told from a finished one by the final message's stop reason and whether a tool
+  call was left unanswered; that call, and one whose text carries no `Verdict:` line, are both
+  Unknown *with the reason*. Each prints a warning naming the case, the pair, the question and
+  the tool call it was waiting on, and hands back the same words as an entry for the run's
+  problems list, which the report prints in full rather than counting. An Unknown the grader
+  chose after looking is a verdict, not a problem, and the two are never merged.
 
 ## Importing a session
 

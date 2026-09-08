@@ -8,8 +8,9 @@
 // gitignored, because a gitignore is a rule someone can edit and this is not.
 
 import { mkdirSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { EvalError } from "./errors.js";
+import { isInside, resolveThroughSymlinks } from "./paths.js";
 
 export const CORPUS_ENV = "ONEPASS_EVAL_CORPUS";
 
@@ -74,30 +75,4 @@ export function resolveCorpus(env: NodeJS.ProcessEnv, repoRoot: string): Corpus 
     mkdirSync(path, { recursive: true });
   }
   return corpus;
-}
-
-/** True when `path` is `parent` itself or below it. Both are expected to be resolved already. */
-function isInside(parent: string, path: string): boolean {
-  const step = relative(parent, path);
-  return step !== "" && !step.startsWith("..") && !isAbsolute(step);
-}
-
-/**
- * `realpathSync` of the deepest part of `path` that exists, with the rest appended. A corpus
- * directory that has not been created yet still has to be checked against the repository, and
- * the check is only sound on resolved paths.
- */
-function resolveThroughSymlinks(path: string): string {
-  const missing: string[] = [];
-  let head = path;
-  for (;;) {
-    try {
-      return join(realpathSync(head), ...missing.reverse());
-    } catch {
-      const parent = dirname(head);
-      if (parent === head) return path;
-      missing.push(basename(head));
-      head = parent;
-    }
-  }
 }

@@ -8,6 +8,11 @@
 //
 // It is not test-only code. Replay mode makes no model calls by definition, so it serves its
 // own fake upstream to the proxy child it starts and reads what the proxy sent.
+//
+// A caller can script what `/v1/messages` answers, which is how the grader is driven with no
+// model: canned verdicts, canned tool calls, and a grader that never stops calling tools so the
+// turn cap can be reached for nothing. Only unstreamed calls are scripted. Claude Code's own
+// requests through a proxy child stream, and they must not eat the grader's script.
 
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -24,8 +29,20 @@ function countTokens(body: string): number {
   return Math.ceil(body.length / 4);
 }
 
-/** What a `/v1/messages` call is answered with, so a caller can tell the fake from the real. */
+/** What an unscripted `/v1/messages` call is answered with, so a caller can tell fake from real. */
 const ANSWER = "fake upstream";
+
+/** A canned assistant turn: the text it ends on, or a call to one of the caller's tools. */
+export type CannedTurn = { say: string } | { call: string; input?: unknown };
+
+export interface FakeUpstreamOptions {
+  /**
+   * What an unstreamed `/v1/messages` is answered with, asked once per such call with the number
+   * already served. Returning undefined serves the default one-line answer, which is also what a
+   * streamed call always gets.
+   */
+  answer?: (turn: number, request: RecordedRequest) => CannedTurn | undefined;
+}
 
 export interface FakeUpstream {
   url: string;
@@ -35,8 +52,9 @@ export interface FakeUpstream {
   close(): Promise<void>;
 }
 
-export async function startFakeUpstream(): Promise<FakeUpstream> {
+export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Promise<FakeUpstream> {
   const requests: RecordedRequest[] = [];
+  let scripted = 0;
 
   const server = http.createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -57,7 +75,9 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
           streamedMessage(response, ANSWER, tokens);
           return;
         }
-        json(response, 200, message(ANSWER, tokens));
+        const turn = options.answer?.(scripted, requests[requests.length - 1] as RecordedRequest);
+        if (turn !== undefined) scripted += 1;
+        json(response, 200, message(turn ?? { say: ANSWER }, tokens));
         return;
       }
       json(response, 404, { type: "error", error: { type: "not_found_error", message: `fake upstream has no ${path}` } });
@@ -74,19 +94,27 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
   };
 }
 
-function message(text: string, inputTokens: number): unknown {
+let toolUseId = 0;
+
+function message(turn: CannedTurn, inputTokens: number): unknown {
+  const calling = "call" in turn;
+  const content =
+    calling ?
+      [{ type: "tool_use", id: `toolu_fake_${(toolUseId += 1)}`, name: turn.call, input: turn.input ?? {} }]
+    : [{ type: "text", text: turn.say }];
+  const spoken = calling ? JSON.stringify(content) : turn.say;
   return {
     id: "msg_fake",
     type: "message",
     role: "assistant",
     model: "fake-upstream",
-    content: [{ type: "text", text }],
-    stop_reason: "end_turn",
+    content,
+    stop_reason: calling ? "tool_use" : "end_turn",
     usage: {
       input_tokens: inputTokens,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
-      output_tokens: Math.max(1, Math.ceil(text.length / 4)),
+      output_tokens: Math.max(1, Math.ceil(spoken.length / 4)),
     },
   };
 }
@@ -99,7 +127,7 @@ function json(response: http.ServerResponse, status: number, value: unknown): vo
 /** The proxy reads usage out of `message_start`, so a streamed answer has to carry one. */
 function streamedMessage(response: http.ServerResponse, text: string, inputTokens: number): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
-  const started = message(text, inputTokens) as { usage: unknown };
+  const started = message({ say: text }, inputTokens) as { usage: unknown };
   response.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: started.usage } })}\n\n`);
   response.write(
     `event: content_block_delta\ndata: ${JSON.stringify({
