@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
 import type { RunResult } from "./result.js";
+import { model, typed, writeTranscript } from "./transcriptFixture.js";
 
 const execFileAsync = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -50,7 +51,9 @@ interface RunOptions {
 /** Runs the command with a corpus and a results directory of its own. */
 async function runCli(args: string[], options: RunOptions = {}): Promise<Run & { results: string }> {
   const { env = {}, results = scratch("onepass-eval-results-") } = options;
-  const full = args.includes("--help") ? [...args] : [...args, "--results-dir", results];
+  // Only a run writes a result document, so only a run is given somewhere to put one.
+  const isRun = !args.includes("--help") && args[0] !== "import";
+  const full = isRun ? [...args, "--results-dir", results] : [...args];
   try {
     const { stdout, stderr } = await execFileAsync(process.execPath, [cli, ...full], {
       env: {
@@ -178,6 +181,39 @@ test("it compares against a run that was", async () => {
   const second = await runCli(["quick", "--compare", previous.label], { results });
   assert.equal(second.code, 0, second.stderr);
   assert.equal(resultOf(second).comparedWith, previous.label);
+});
+
+test("import copies a transcript into the corpus and prints the branch it holds", async () => {
+  const corpus = scratch("onepass-eval-corpus-");
+  const source = writeTranscript(scratch("onepass-projects-"), "62d8de7e.jsonl", [
+    typed("u1", null, "plan the work"),
+    model("a1", "u1", { contextTokens: 120_000 }),
+    typed("u2a", "a1", "the branch that was rewound out of"),
+    model("a2a", "u2a", { contextTokens: 150_000 }),
+    typed("u2b", "a1", "the branch written last"),
+    model("a2b", "u2b", { contextTokens: 130_000 }),
+  ]);
+
+  const run = await runCli(["import", source, "--tip", "a2a"], { env: { ONEPASS_EVAL_CORPUS: corpus } });
+  assert.equal(run.code, 0, run.stderr);
+  assert.match(run.stdout, /typed by the user\s+2/);
+  assert.match(run.stdout, /branches in the file\s+2/);
+  assert.match(run.stdout, /entries off the path\s+2 of 6/);
+  assert.match(run.stdout, /peak 150k/);
+
+  const copy = join(realpathSync(corpus), "transcripts", "62d8de7e.jsonl");
+  assert.equal(readFileSync(copy, "utf8"), readFileSync(source, "utf8"), "the copy is not the source's bytes");
+});
+
+test("import refuses without a corpus, and says what it cannot read", async () => {
+  const missingCorpus = await runCli(["import", "/tmp/nowhere.jsonl"], { env: { ONEPASS_EVAL_CORPUS: "" } });
+  assert.equal(missingCorpus.code, 1);
+  assert.match(missingCorpus.stderr, /ONEPASS_EVAL_CORPUS is unset/);
+
+  const missingFile = await runCli(["import", join(scratch("onepass-projects-"), "nowhere.jsonl")]);
+  assert.equal(missingFile.code, 1);
+  assert.match(missingFile.stderr, /cannot read the transcript/);
+  assert.doesNotMatch(missingFile.stderr, /at Object\./, "a refusal prints a message, not a stack");
 });
 
 test("--help prints the usage and runs nothing", async () => {

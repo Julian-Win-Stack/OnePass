@@ -103,3 +103,59 @@ _Avoid_: run id, tag, version
 The JSON one run writes inside the repository, with the rendered table beside it. It is the
 whole record of a run: a stranger reads it without reading the code.
 _Avoid_: report file, output, results json
+
+### Transcript
+
+A session transcript is a JSONL file under Claude Code's projects directory. These words are for
+reading one; both the proxy and the eval read them, and neither ever writes one.
+
+**Branch**:
+One path through a transcript file, from a tip back to a root, following each entry's parent. A
+session is one branch; a file holds many, because a rewind leaves the path it abandoned in the
+file with nothing marking it. Every measurement over a session is made along one branch. The
+parent links themselves are the chain, and walking one is what yields a branch.
+_Avoid_: thread, timeline, history
+
+**Tip**:
+The last entry of a branch, which the reader walks back from. Naming one is how a particular
+branch is chosen; unnamed, it is the last entry written to the file.
+_Avoid_: head, leaf, latest entry
+
+**Typed turn**:
+A turn the user typed: a `user` entry that is not sidechain, not `isMeta`, not a compaction
+summary, and carries no tool result. The other four are turns too, and are never counted as this
+one.
+_Avoid_: user turn, prompt, human turn
+
+**Spine**:
+The line of conversation a branch's parent links run along, as against the roots that hang off to
+one side of it — a compaction boundary and its summary. The spine runs through a compaction
+unbroken, which is why a compaction is usually not on the branch that passes through it.
+_Avoid_: main line, trunk, backbone
+
+**Compaction boundary**:
+Where a compaction cut the conversation. It is written as a root of its own, off the branch, and
+is tied back to it only by the entry it names as the last one it preserved.
+_Avoid_: compact point, summary point
+
+**Stretch**:
+The run of turns between two compaction boundaries, or between one and an end of the branch.
+Each is recorded on some model at some effort.
+_Avoid_: segment, phase, era, era of the session
+
+**Usage drop**:
+A fall in the context a model turn reports against the turn before it. On the branch this is all
+a compaction looks like, so drops and boundaries are matched; a drop with no boundary is reported
+unexplained, never assumed to be one.
+_Avoid_: context reset, token cliff
+
+**Synthetic turn**:
+An `assistant` entry whose model is `<synthetic>`: an interrupt or an error notice written by
+Claude Code, not an API turn. It reports zeroes for every token class, so it is counted apart and
+contributes nothing to the token trajectory.
+_Avoid_: fake turn, stub turn, empty turn
+
+**Import**:
+Copying one session transcript into the corpus and reading the branch it holds. The copy is what
+later stages fork; the original is only ever read.
+_Avoid_: ingest, load, snapshot

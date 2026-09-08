@@ -1,6 +1,10 @@
-// The entry command's argument surface: one mode, and the label of a previous run to compare
-// against. Kept apart from the run itself so the whole surface can be checked without a proxy,
-// a corpus or a model.
+// The entry command's argument surface: one place that knows the whole of it, so it can be checked
+// without a proxy, a corpus or a model.
+//
+// Two commands, because they are two different jobs. A run measures a build and writes a result
+// document; an import copies one session into the corpus and prints what it holds. A run is named
+// by its mode alone — `onepass-eval quick` — because that is the command anyone types twenty times
+// a day, and import is named because it is not.
 
 import { UsageError } from "./errors.js";
 
@@ -9,7 +13,8 @@ export type Mode = "replay" | "quick" | "full";
 
 export const MODES: readonly Mode[] = ["replay", "quick", "full"];
 
-export interface Options {
+export interface RunCommand {
+  kind: "run";
   mode: Mode;
   /** Label of a previous run this one is reported against, or null for none. */
   compareWith: string | null;
@@ -17,7 +22,20 @@ export interface Options {
   resultsDir: string | null;
 }
 
+export interface ImportCommand {
+  kind: "import";
+  /** The transcript to read. Only ever opened for reading. */
+  transcript: string;
+  /** The tip of the branch to import, or null for the last entry written. */
+  tip: string | null;
+  /** What the copy is filed under in the corpus, or null for the source file's own name. */
+  name: string | null;
+}
+
+export type Command = RunCommand | ImportCommand;
+
 export const USAGE = `onepass-eval <replay|quick|full> [options]
+onepass-eval import <transcript.jsonl> [options]
 
 Modes
   replay   Push the stored prefixes through a fresh proxy child against a fake upstream.
@@ -25,9 +43,20 @@ Modes
   quick    Three proxied tails and every second eligible planning case.
   full     Five proxied tails and every eligible planning case.
 
-Options
+Run options
   --compare <label>      Report this run against a previous run's label.
   --results-dir <path>   Write the result document here instead of the repo's eval/results.
+
+Import
+  Copies a session transcript into the corpus and prints the branch it holds: turn counts,
+  compaction points and the token trajectory. The source is never opened for writing.
+
+  --tip <uuid>           Walk back from this entry. A transcript file is a tree and a session is
+                         one branch of it; without this, the branch ending at the last entry
+                         written is the one imported.
+  --name <name>          File the copy under this name instead of the source file's.
+
+Anywhere
   --help                 Show this text.
 
 Environment
@@ -43,41 +72,75 @@ Environment
                                       serves its own fake upstream.`;
 
 /**
- * `argv` is the arguments after the program name. Throws `UsageError` on anything it cannot
- * read, so callers report one kind of failure rather than inspecting a result.
+ * `argv` is the arguments after the program name. Throws `UsageError` on anything it cannot read,
+ * so callers report one kind of failure rather than inspecting a result.
  */
-export function parseArgs(argv: readonly string[]): Options {
-  let mode: Mode | null = null;
-  let compareWith: string | null = null;
-  let resultsDir: string | null = null;
+export function parseArgs(argv: readonly string[]): Command {
+  return argv[0] === "import" ? parseImport(argv.slice(1)) : parseRun(argv);
+}
+
+function parseRun(argv: readonly string[]): RunCommand {
+  const { positionals, values } = splitArgs(argv, ["--compare", "--results-dir"]);
+  if (positionals.length === 0) throw new UsageError(`no mode given (expected ${MODES.join(", ")}, or import)`);
+  if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
+
+  const mode = positionals[0] as string;
+  if (!isMode(mode)) throw new UsageError(`unknown mode: ${mode} (expected ${MODES.join(", ")})`);
+  return {
+    kind: "run",
+    mode,
+    compareWith: values.get("--compare") ?? null,
+    resultsDir: values.get("--results-dir") ?? null,
+  };
+}
+
+function parseImport(argv: readonly string[]): ImportCommand {
+  const { positionals, values } = splitArgs(argv, ["--tip", "--name"]);
+  if (positionals.length === 0) throw new UsageError("import needs the path of a transcript to read");
+  if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
+
+  return {
+    kind: "import",
+    transcript: positionals[0] as string,
+    tip: values.get("--tip") ?? null,
+    name: values.get("--name") ?? null,
+  };
+}
+
+/**
+ * Splits `argv` into the arguments that are not options and the options that are, taking the value
+ * of each option named in `takesValue` — `--tip x` and `--tip=x` alike. Any other option is a
+ * mistake, and is refused by name.
+ */
+function splitArgs(
+  argv: readonly string[],
+  takesValue: readonly string[],
+): { positionals: string[]; values: Map<string, string> } {
+  const positionals: string[] = [];
+  const values = new Map<string, string>();
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
-    if (arg.startsWith("-")) {
-      const equals = arg.indexOf("=");
-      const name = equals === -1 ? arg : arg.slice(0, equals);
-      const inlineValue = equals === -1 ? null : arg.slice(equals + 1);
-      const takeValue = (): string => {
-        if (inlineValue !== null) return inlineValue;
-        const next = argv[i + 1];
-        if (next === undefined || next.startsWith("-")) {
-          throw new UsageError(`${name} needs a value`);
-        }
-        i += 1;
-        return next;
-      };
-      if (name === "--compare") compareWith = takeValue();
-      else if (name === "--results-dir") resultsDir = takeValue();
-      else throw new UsageError(`unknown option: ${name}`);
+    if (!arg.startsWith("-")) {
+      positionals.push(arg);
       continue;
     }
-    if (mode !== null) throw new UsageError(`unexpected argument: ${arg}`);
-    if (!isMode(arg)) throw new UsageError(`unknown mode: ${arg} (expected ${MODES.join(", ")})`);
-    mode = arg;
-  }
+    const equals = arg.indexOf("=");
+    const name = equals === -1 ? arg : arg.slice(0, equals);
+    if (!takesValue.includes(name)) throw new UsageError(`unknown option: ${name}`);
 
-  if (mode === null) throw new UsageError(`no mode given (expected ${MODES.join(", ")})`);
-  return { mode, compareWith, resultsDir };
+    if (equals !== -1) {
+      values.set(name, arg.slice(equals + 1));
+      continue;
+    }
+    // An option whose value is missing would otherwise swallow the next option, so a value that
+    // looks like one is refused instead.
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith("-")) throw new UsageError(`${name} needs a value`);
+    values.set(name, next);
+    i += 1;
+  }
+  return { positionals, values };
 }
 
 /** True when the arguments ask for the usage text rather than a run. */
