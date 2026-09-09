@@ -79,6 +79,12 @@ interface TurnBase {
    * manufacture a fall that looks like a compaction.
    */
   sidechain: boolean;
+  /**
+   * The entry's `message.content`, exactly as the transcript stored it. Kept because a case's
+   * request body is rebuilt out of these blocks, and a rebuild from anything but the stored
+   * bytes would be a request the session never sent.
+   */
+  content: unknown;
 }
 
 export interface UserTurn extends TurnBase {
@@ -132,6 +138,21 @@ export interface Compaction {
   afterIndex: number;
   /** The fall in reported usage this boundary explains, or null when none straddles it. */
   drop: UsageDrop | null;
+  /**
+   * The summary the compaction wrote, which hangs off the boundary and so is never on the branch
+   * itself. It is what the conversation after the boundary actually opened with, so rebuilding a
+   * request from that point has to start here. Null when the file holds no summary for it.
+   */
+  summary: CompactionSummary | null;
+}
+
+/** The compaction summary, read off the boundary's own root rather than out of the branch. */
+export interface CompactionSummary {
+  uuid: string;
+  /** The `message.content` of the summary entry, as stored. */
+  content: unknown;
+  /** How big the summary is, so a manifest can say so without carrying the whole of it. */
+  chars: number;
 }
 
 /** A run of turns between two compactions, or between a compaction and an end of the branch. */
@@ -210,6 +231,20 @@ export interface Branch {
   unexplainedDrops: UsageDrop[];
   stretches: Stretch[];
   file: FileShape;
+}
+
+/** A turn the user typed, narrowed so callers stop re-testing what they have already filtered. */
+export function isTypedTurn(turn: Turn): turn is UserTurn {
+  return turn.kind === "typed";
+}
+
+/**
+ * A model turn of this branch that was a real API turn: not a subagent's, and not an interrupt or
+ * error notice Claude Code wrote for itself. Everything that reads the token trajectory or asks
+ * what answered a turn wants this one, so it is written once.
+ */
+export function isRealModelTurn(turn: Turn): turn is ModelTurn {
+  return turn.kind === "model" && !turn.sidechain && !turn.synthetic;
 }
 
 export interface ReadOptions {
@@ -383,6 +418,7 @@ function buildTurns(path: Entry[]): Turn[] {
       sessionId: stringOr(entry.sessionId, null),
       version: stringOr(entry.version, null),
       sidechain: entry.isSidechain === true,
+      content: messageContent(entry),
     };
     turns.push(type === "user" ? readUserTurn(entry, base) : readModelTurn(entry, base));
   });
@@ -524,6 +560,7 @@ function locateCompactions(
       logicalParentUuid,
       afterIndex: lastTurnAtOrBefore(turns, position),
       drop: null,
+      summary: summaryOf(byUuid, stringOr(entry.uuid, "")),
     });
   }
   compactions.sort((a, b) => a.afterIndex - b.afterIndex);
@@ -542,6 +579,28 @@ function locateCompactions(
     }
   }
   return { compactions, unexplained: drops.filter((drop) => !claimed.has(drop)) };
+}
+
+/**
+ * The compaction summary hanging off a boundary. It is a `user` entry whose parent is the boundary
+ * and which says so with `isCompactSummary`, and it is found by scanning the file rather than the
+ * branch, because the branch runs past the boundary and never through the summary.
+ */
+function summaryOf(byUuid: Map<string, Entry>, boundaryUuid: string): CompactionSummary | null {
+  for (const entry of byUuid.values()) {
+    if (stringOr(entry.parentUuid, null) !== boundaryUuid || entry.isCompactSummary !== true) continue;
+    const content = messageContent(entry);
+    return { uuid: stringOr(entry.uuid, ""), content, chars: measureChars(content) };
+  }
+  return null;
+}
+
+function measureChars(content: unknown): number {
+  try {
+    return JSON.stringify(content)?.length ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** The last conversation turn at or before a position on the walked path, or -1 if there is none. */

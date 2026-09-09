@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
 import type { RunResult } from "./result.js";
-import { model, typed, writeTranscript } from "./transcriptFixture.js";
+import { model, toolResult, typed, writeTranscript, type Line } from "./transcriptFixture.js";
 
 const execFileAsync = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -23,9 +23,12 @@ const cli = join(here, "main.js");
 const repoRoot = resolve(here, "..", "..");
 
 let upstream: FakeUpstream;
+/** A corpus with a planning session already imported, which is what every run needs. */
+let corpus: string;
 
 before(async () => {
   upstream = await startFakeUpstream();
+  corpus = await preparedCorpus();
 });
 
 after(async () => {
@@ -40,6 +43,52 @@ interface Run {
 
 function scratch(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+/**
+ * The one turn of the fixture whose answer calls a tool, so the case list holds both answer groups
+ * and not just the one. Its answer is the model turn the loop writes on this iteration, which is
+ * the answer to the turn typed on the one before — so the `tools` case is the 5th, not the 6th.
+ */
+const TOOL_ANSWER_TURN = 5;
+
+/**
+ * A planning session small enough to write here and deep enough to be worth replaying: one large
+ * tool result, then enough turns after it that the proxy's age gate has let go of it. The fake
+ * upstream counts four characters to the token, so 400,000 characters is a prefix past the
+ * 110,000-token trip threshold.
+ */
+function planningTranscript(): Line[] {
+  const lines: Line[] = [
+    typed("u1", null, "plan the work"),
+    model("a1", "u1", { contextTokens: 54_000, textOnly: false }),
+    toolResult("t1", "a1", { chars: 400_000 }),
+  ];
+  let parent = "t1";
+  for (let turn = 0; turn < 12; turn += 1) {
+    const contextTokens = 130_000 + turn * 1_000;
+    if (turn === TOOL_ANSWER_TURN) {
+      lines.push(model(`a${turn + 2}`, parent, { textOnly: false, contextTokens }));
+      lines.push(toolResult(`t${turn + 2}`, `a${turn + 2}`));
+      lines.push(model(`b${turn + 2}`, `t${turn + 2}`, { textOnly: true, contextTokens }));
+      lines.push(typed(`u${turn + 2}`, `b${turn + 2}`, `carry on, ${turn}`));
+    } else {
+      lines.push(model(`a${turn + 2}`, parent, { textOnly: true, contextTokens }));
+      lines.push(typed(`u${turn + 2}`, `a${turn + 2}`, `carry on, ${turn}`));
+    }
+    parent = `u${turn + 2}`;
+  }
+  lines.push(model("aLast", parent, { textOnly: true, contextTokens: 150_000 }));
+  return lines;
+}
+
+/** A corpus with that session imported under the name a run reads its cases from. */
+async function preparedCorpus(): Promise<string> {
+  const dir = scratch("onepass-eval-corpus-");
+  const source = writeTranscript(scratch("onepass-projects-"), "62d8de7e.jsonl", planningTranscript());
+  const run = await runCli(["import", source, "--name", "planning"], { env: { ONEPASS_EVAL_CORPUS: dir } });
+  assert.equal(run.code, 0, run.stderr);
+  return dir;
 }
 
 interface RunOptions {
@@ -59,7 +108,7 @@ async function runCli(args: string[], options: RunOptions = {}): Promise<Run & {
       env: {
         PATH: process.env.PATH,
         HOME: process.env.HOME,
-        ONEPASS_EVAL_CORPUS: scratch("onepass-eval-corpus-"),
+        ONEPASS_EVAL_CORPUS: corpus ?? scratch("onepass-eval-corpus-"),
         ONEPASS_EVAL_CLAUDE_CODE_VERSION: "2.1.261",
         ONEPASS_EVAL_UPSTREAM: upstream.url,
         ...env,
@@ -89,8 +138,8 @@ test("a scored run writes a result document and a table, labelled by the build a
   assert.match(result.label, /^[0-9a-f]{7,}(-dirty)?-\d{8}T\d{6}Z$/);
   assert.ok(result.label.startsWith(result.proxy.shortSha));
   assert.equal(result.upstream, upstream.url);
-  assert.deepEqual(result.cases, []);
   assert.deepEqual(result.problems, []);
+  assert.ok(result.cases.length > 0, "a quick run lists the eligible cases");
 
   const table = readFileSync(join(run.results, `${result.label}.md`), "utf8");
   assert.match(table, new RegExp(`# Onepass eval — ${result.label}`));
@@ -105,11 +154,83 @@ test("a judge key in the environment around the run does not reach the proxy chi
   assert.equal(resultOf(run).proxy.judge, "off");
 });
 
-test("the spine spends nothing: no request of its own reaches the model API", async () => {
+test("listing the cases costs nothing: the eval's own calls are count-tokens and no more", async () => {
   const before = upstream.requests.length;
   const run = await runCli(["quick"]);
   assert.equal(run.code, 0, run.stderr);
-  assert.deepEqual(upstream.requests.slice(before), [], "a run with no cases must call no model");
+
+  const paths = new Set(upstream.requests.slice(before).map((request) => request.url.split("?")[0]));
+  assert.deepEqual([...paths], ["/v1/messages/count_tokens"], "sizing a case must not sample a model");
+});
+
+test("quick mode takes every second eligible case, and says which ones it took", async () => {
+  const result = resultOf(await runCli(["quick"]));
+  const selection = result.caseSelection;
+  assert.ok(selection !== null);
+
+  assert.equal(selection.selected, Math.ceil(selection.eligible / 2));
+  assert.deepEqual(
+    result.cases.filter((one) => one.selected).map((one) => one.id),
+    result.cases.filter((_, index) => index % 2 === 0).map((one) => one.id),
+  );
+  assert.equal(selection.eligible + selection.belowThreshold, selection.typedTurns);
+});
+
+test("the case list records the turn index, the prefix size and the tool label", async () => {
+  const run = await runCli(["full"]);
+  const result = resultOf(run);
+
+  // The fixture answers one turn with a tool and every other in text, so the list has to hold both
+  // groups and put the `tools` label on the right turn. A run that labelled them all the same, or
+  // labelled the wrong one, would still be a list of twelve plausible cases.
+  assert.deepEqual(result.caseSelection?.answers, { tools: 1, text: 11, none: 0 });
+  assert.deepEqual(
+    result.cases.map((one) => one.answer),
+    ["text", "text", "text", "text", "tools", "text", "text", "text", "text", "text", "text", "text"],
+  );
+  // Turn indices are indices into the branch, so they are not the case's position in the list and
+  // they are not evenly spaced: the tool-answered turn puts three extra entries on the branch.
+  assert.deepEqual(
+    result.cases.map((one) => one.turnIndex),
+    [4, 6, 8, 10, 12, 16, 18, 20, 22, 24, 26, 28],
+  );
+  for (const record of result.cases) {
+    assert.ok(record.prefixTokens > 110_000, `${record.id} is ${record.prefixTokens} tokens, under the threshold`);
+  }
+  assert.equal(result.caseSelection?.selected, result.cases.length, "full mode takes all of them");
+
+  // Every mode prints the list, not only replay: a scored run is about to spend money on these
+  // turns and the person starting it should see which ones without waiting for the document.
+  assert.match(run.stdout, /turn-4\s+154k\s+text/);
+  assert.match(run.stdout, /turn-12\s+154k\s+tools/, "the tool label is printed, not only recorded");
+});
+
+test("what I typed is printed but never recorded: a result document is committed", async () => {
+  const run = await runCli(["quick"]);
+  const result = resultOf(run);
+
+  assert.match(run.stdout, /carry on, 0/, "the list reads as a session while it runs");
+  const document = readFileSync(join(run.results, `${result.label}.json`), "utf8");
+  assert.doesNotMatch(document, /carry on, 0/, "my session's words are corpus content, not repository content");
+});
+
+test("comparing a replay with a run that never replayed says so rather than reporting against nothing", async () => {
+  const results = scratch("onepass-eval-results-");
+  const scored = resultOf(await runCli(["quick"], { results }));
+
+  const replay = resultOf(await runCli(["replay", "--compare", scored.label], { results }));
+
+  assert.equal(replay.replay?.diff.comparedWith, scored.label);
+  assert.equal(replay.replay?.diff.totals, null);
+  const table = readFileSync(join(results, `${replay.label}.md`), "utf8");
+  assert.match(table, new RegExp(`\`${scored.label}\` replayed nothing`));
+});
+
+test("a run refuses when no planning session has been imported", async () => {
+  const run = await runCli(["quick"], { env: { ONEPASS_EVAL_CORPUS: scratch("onepass-eval-corpus-") } });
+  assert.equal(run.code, 1);
+  assert.match(run.stderr, /no session filed under planning/);
+  assert.match(run.stderr, /onepass-eval import/);
 });
 
 test("the result names the control baseline for both kinds of arm", async () => {
@@ -124,24 +245,71 @@ test("the result names the control baseline for both kinds of arm", async () => 
   assert.equal(result.baselines[0]?.directory, "claude-opus-5--xhigh--cc2.1.261");
 });
 
-test("replay serves its own upstream, is not scored, and needs nothing pointed at it", async () => {
-  // No upstream and no Claude Code version: the check run after every proxy fix has to work
-  // with nothing set up but a corpus.
-  const run = await runCli(["replay"], { env: { ONEPASS_EVAL_UPSTREAM: "", ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
+test("replay serves its own upstream to the children, is not scored, and needs no baseline", async () => {
+  // No Claude Code version: the check run after every proxy fix has to work with nothing set up
+  // but a corpus.
+  const before = upstream.requests.length;
+  const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
   assert.equal(run.code, 0, run.stderr);
 
   const result = resultOf(run);
   assert.equal(result.scored, false);
   assert.match(result.upstream, /^http:\/\/127\.0\.0\.1:\d+$/, "replay must not reach the real API");
+  assert.notEqual(result.upstream, upstream.url, "the children forward to replay's own fake, not the run's");
+
+  // Two upstreams, and only the children's is replay's own. The eval's own sizing calls still go
+  // to the run's upstream — which is the real API outside a test — because a replay that measured
+  // its cases against a fake would not be listing the cases a scored run covers.
+  const paths = upstream.requests.slice(before).map((request) => request.url.split("?")[0]);
+  assert.deepEqual([...new Set(paths)], ["/v1/messages/count_tokens"], "the run's upstream sized the cases");
+
   assert.deepEqual(result.baselines, [], "replay has no control to compare against");
 });
 
-test("session content has a home under the corpus, and the result document is not in the repository", async () => {
-  const corpus = scratch("onepass-eval-corpus-");
-  const run = await runCli(["quick"], { env: { ONEPASS_EVAL_CORPUS: corpus } });
+test("replay pushes every case through a proxy child and reports what came out", async () => {
+  const run = await runCli(["replay"]);
+  assert.equal(run.code, 0, run.stderr);
   const result = resultOf(run);
 
-  assert.equal(result.corpusDir, realpathSync(corpus));
+  const replay = result.replay;
+  assert.ok(replay !== null, "a replay run reports a replay");
+  assert.equal(replay.outcomes.length, result.cases.length, "replay is free, so it covers every case");
+  assert.ok(replay.totals.trips > 0, "every case is past the threshold, so every case trips");
+  assert.ok(replay.totals.segmentsEvicted > 0, `nothing was evicted: ${JSON.stringify(replay.totals)}`);
+  assert.ok(
+    replay.totals.forwardedBytes < replay.totals.sentBytes,
+    "the proxy forwarded no less than it was given",
+  );
+
+  // The forwarded bodies are session content, so they live in the corpus and not in the repository.
+  const body = replay.outcomes.find((one) => one.segmentsEvicted > 0)?.bodyPath;
+  assert.ok(body !== undefined && body.startsWith(result.corpusDir), `${body} is not under the corpus`);
+  assert.ok(readFileSync(body, "utf8").includes("[onepass: evicted"));
+
+  const table = readFileSync(join(run.results, `${result.label}.md`), "utf8");
+  assert.match(table, /## Cases/);
+  assert.match(table, /## Replay/);
+  assert.match(run.stdout, /replay 1\/\d+ {2}turn-\d+/, "replay lists each case as it goes");
+});
+
+test("a second replay of the same build diffs against the first and finds nothing moved", async () => {
+  const results = scratch("onepass-eval-results-");
+  const first = resultOf(await runCli(["replay"], { results }));
+  const second = resultOf(await runCli(["replay"], { results }));
+
+  const diff = second.replay?.diff;
+  assert.equal(diff?.comparedWith, first.label);
+  assert.deepEqual(diff?.changes, [], "the same build on the same cases has to come out the same");
+  assert.equal(diff?.unchanged, second.replay?.outcomes.length);
+  assert.deepEqual(second.problems, [], "an unchanged case list is not a problem");
+});
+
+test("session content has a home under the corpus, and the result document is not in the repository", async () => {
+  const own = await preparedCorpus();
+  const run = await runCli(["quick"], { env: { ONEPASS_EVAL_CORPUS: own } });
+  const result = resultOf(run);
+
+  assert.equal(result.corpusDir, realpathSync(own));
   for (const name of ["transcripts", "baselines", "worktrees", "hand-labels", "runs"]) {
     assert.ok(existsSync(join(result.corpusDir, name)), `the corpus has no ${name}`);
   }

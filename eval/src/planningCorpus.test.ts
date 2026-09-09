@@ -16,7 +16,8 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readTranscript } from "./transcript.js";
+import { buildMessages, historyStart } from "./messages.js";
+import { isRealModelTurn, isTypedTurn, readTranscript } from "./transcript.js";
 
 const TRANSCRIPT = join(
   homedir(),
@@ -79,4 +80,63 @@ test("the deep Fable branch reads as the corpus decisions describe it", (t) => {
   assert.equal(branch.counts.synthetic, 2);
   assert.equal(branch.trajectory.length, branch.counts.model);
   assert.equal(branch.peakContextTokens, 290_591);
+});
+
+test("the branch carries the 37 eligible turns the corpus decision was made on", (t) => {
+  if (!existsSync(TRANSCRIPT)) {
+    t.skip(`no transcript at ${TRANSCRIPT}; this check runs where the planning corpus lives`);
+    return;
+  }
+
+  const branch = readTranscript(TRANSCRIPT, { tip: TIP });
+
+  // The figure in eval/decision.md was measured against recorded usage: a turn's depth is what the
+  // last model turn before it reported it was shown. A run measures the same prefixes with
+  // count-tokens instead, which needs a key — this is the check that the branch itself still holds
+  // the turns that measurement found. If it stops holding them, the decision is wrong, not the run.
+  const depthAt = (index: number): number => {
+    const before = [...branch.turns.slice(0, index)].reverse().find(isRealModelTurn);
+    return before?.usage?.contextTokens ?? 0;
+  };
+  const deep = branch.turns.filter(isTypedTurn).filter((turn) => depthAt(turn.index) > 110_000);
+  assert.equal(deep.length, 37, "57 typed turns, 37 of them past the trip threshold");
+  const depths = deep.map((turn) => depthAt(turn.index));
+  assert.equal(Math.min(...depths), 131_411);
+  assert.equal(Math.max(...depths), 290_591);
+});
+
+test("a case's request is rebuilt as the session sent it: merged turns, and history from the compaction", (t) => {
+  if (!existsSync(TRANSCRIPT)) {
+    t.skip(`no transcript at ${TRANSCRIPT}; this check runs where the planning corpus lives`);
+    return;
+  }
+
+  const branch = readTranscript(TRANSCRIPT, { tip: TIP });
+  const typedTurns = branch.turns.filter(isTypedTurn);
+
+  // Both compaction summaries hang off their boundary's own root, so neither is on the branch and
+  // neither can be found by walking it. They are what a request made after the compaction opened
+  // with, so a rebuild that could not find them would carry history the model never saw.
+  assert.deepEqual(
+    branch.compactions.map((compaction) => compaction.summary?.chars),
+    [14_215, 19_024],
+  );
+
+  const first = typedTurns[1] as { index: number };
+  const last = typedTurns[typedTurns.length - 1] as { index: number };
+  assert.equal(historyStart(branch, first.index).opensWithCompactionSummary, false, "the session's own start");
+  assert.equal(historyStart(branch, last.index).opensWithCompactionSummary, true, "the second compaction's summary");
+
+  // Claude Code writes one entry per content block, so a rebuild that did not merge them would
+  // count several assistant messages where the API saw one — and the proxy's age gate counts
+  // assistant messages.
+  for (const turn of [first, last]) {
+    const messages = buildMessages(branch, turn.index);
+    assert.ok(messages.length > 0);
+    assert.ok(
+      messages.every((message, index) => index === 0 || messages[index - 1]?.role !== message.role),
+      "two messages of the same role in a row are one message the rebuild failed to merge",
+    );
+    assert.equal(messages[messages.length - 1]?.role, "user", "a case ends on the turn it was cut at");
+  }
 });

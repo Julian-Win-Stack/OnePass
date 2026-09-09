@@ -20,17 +20,20 @@ npm install
 npm test
 npm run build
 
-node dist/main.js replay                      # no model calls, no score, free
+# one session has to be in the corpus before a run has anything to read
+node dist/main.js import <transcript.jsonl> --tip <uuid> --name planning
+
+node dist/main.js replay                      # every case, no model calls, no score, free
 node dist/main.js quick                       # three proxied tails, every second planning case
 node dist/main.js full --compare a001c2b-20260906T101112Z
-
-node dist/main.js import <transcript.jsonl> --tip <uuid>   # copy one session into the corpus
 ```
 
 **No arm is measured yet.** What exists is the spine the arms are written into — the command and
 its modes, the corpus directory, the control baseline, the proxy child, and the result document
-every later ticket writes into — and the corpus import that gives them a session to read. A run
-today builds the proxy, starts a child, and writes a result document with no cases in it.
+every later ticket writes into — the corpus import that gives them a session to read, the case
+list every mode covers, the replay that checks a build's eviction on those cases for nothing, and
+the grader runtime the arms will call once they have pairs to grade. A run today builds the proxy,
+lists its cases, replays them if asked, and writes a result document with no scores in it.
 
 - **The corpus.** `ONEPASS_EVAL_CORPUS` names one directory holding every byte of session
   content: transcript copies, fork and grader outputs, hand labels, the control baseline and the
@@ -53,7 +56,90 @@ today builds the proxy, starts a child, and writes a result document with no cas
   never is.
 - **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
   can be driven with no key and no money. Replay mode serves its own fake upstream to the proxy
-  child; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+  children; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`.
+
+## Cases
+
+A case is a turn I typed whose full prefix is past the proxy's trip threshold of 110k tokens.
+Below that the proxy evicts nothing, both arms send byte-identical requests, and the model call
+buys no information — so those turns are listed and left alone.
+
+Every mode lists them by rule at run time, in session order, and records the list in the result
+document with each turn's index, prefix size and answer label. **There is no case manifest.**
+Eligibility is recomputed each run, so a change to the rule shows up as a run whose case list
+differs from the last one's rather than as a stale file nobody re-reads. Quick mode takes every
+second case; full and replay take all of them.
+
+- **A turn I typed** is a `user` entry that is not sidechain, not `isMeta`, not a compaction
+  summary, and carries no `tool_result` block. The rule is spelled out because getting it wrong
+  is silently destructive: a compaction summary selected as a case would be typed at the fork as
+  though I had written it, and the run would look normal while measuring nothing.
+- **Size is measured, not estimated.** The message list goes through the count-tokens endpoint,
+  and the fixed system-and-tools overhead — read from what the first model turn reported it was
+  shown, less the messages it was shown — is added to it. Estimating would not do: the corpus
+  branch carries 1.8M characters of pasted screenshots, which price out at a few thousand tokens,
+  so a chars-per-token estimate reads the deepest stretch as three times its real size. The
+  endpoint is free, which is why replay measures its cases the same way a scored run does; it
+  needs `ANTHROPIC_API_KEY`.
+- **The request is rebuilt as the session sent it.** Claude Code writes one entry per content
+  block, so consecutive entries of one role are merged back into the one message the API saw — a
+  rebuild that did not merge them would count several assistant messages where there was one, and
+  the proxy's age gate counts assistant messages. History starts at the last compaction the case
+  sits past and opens with that compaction's summary, which hangs off the boundary's own root and
+  is never on the branch.
+- **Whether the recorded answer used tools does not decide eligibility.** It is a label, and the
+  result document reports the groups apart. A third group carries the turns with no recorded
+  answer at all — interrupted turns, and Claude Code's own local-command entries, which the
+  typed-turn rule admits.
+
+## Replay
+
+```
+node dist/main.js replay
+```
+
+The check to run after every proxy fix. It makes no model calls and costs nothing: each case's
+message list goes into a request body with a placeholder system prompt — eviction acts on
+messages, not on the system prompt — and through a proxy child of its own against the fake
+upstream. One child per case, torn down after, because a child that has already evicted something
+is carrying state the next case did not put there.
+
+It prints each case and its size as it goes, so it doubles as the look at what a scored run would
+cover before one is started. What it writes is a diff against the last run that replayed: trips,
+segments evicted, stub text, body sizes and rebuild count, per case. **It is not scored and the
+bar rule ignores it** — a diff is read, not passed. A case list that has drifted between the two
+runs **refuses the comparison outright** and says which cases moved: eligibility is recomputed every
+run, so drift is a real possibility, and a total over one set of turns against a total over another
+is not a comparison but two numbers side by side.
+
+The forwarded bodies are session content, so they are written under
+`$ONEPASS_EVAL_CORPUS/runs/<label>/replay/`, never into the repository. The result document keeps
+a digest of each case's stub text and the first few stubs: enough to detect a wording change and
+to read it, without hundreds of kilobytes of near-identical text in git. For the same reason the
+case table names a case by its turn index and never carries what I typed — the words of a session
+are corpus content, and a result document is committed.
+
+## The grader
+
+One call answers one yes/no question about one pair of answers, and returns Yes, No or Unknown.
+It is a direct API call through the Anthropic SDK's tool runner, not a Claude Code session, so
+every model call the eval makes for itself sits behind the same HTTP boundary the tests fake.
+
+- **Three tools, all read-only** — read a file, search, list — over the repository the answers
+  were written against: the case worktree for planning, the finished tail worktrees for
+  implementation. Every path is resolved through symlinks and refused if it lands outside that
+  repository, and there is no tool that writes.
+- **One call per pair, in a random order.** The two answers are shown as A and B in an order
+  chosen at random for the pair, and the order is recorded. The grader is never told which arm
+  wrote which. Position bias, if there is any, shows in the control-versus-control noise floor
+  drifting off an even split — that is what pays for grading each pair once instead of twice.
+- **Nothing that stopped early hides inside an Unknown.** A call is capped at 40 model turns. A
+  capped call is told from a finished one by the final message's stop reason and whether a tool
+  call was left unanswered; that call, and one whose text carries no `Verdict:` line, are both
+  Unknown *with the reason*. Each prints a warning naming the case, the pair, the question and
+  the tool call it was waiting on, and hands back the same words as an entry for the run's
+  problems list, which the report prints in full rather than counting. An Unknown the grader
+  chose after looking is a verdict, not a problem, and the two are never merged.
 
 ## Importing a session
 
@@ -62,6 +148,9 @@ node dist/main.js import \
   ~/.claude/projects/-Users-...-chp99-takehome/62d8de7e-c2f3-448d-829f-9d25b23123eb.jsonl \
   --tip b7881712-2e5c-4b77-a409-02ceb65f496f --name planning
 ```
+
+A run takes its cases from the session filed under `planning`, so that is the name to import it
+under; without it, a run refuses and says so rather than measuring nothing.
 
 That copies the transcript into `$ONEPASS_EVAL_CORPUS/transcripts/` and prints the branch it
 holds: turn counts, compaction points and the token trajectory, then what the file held around the

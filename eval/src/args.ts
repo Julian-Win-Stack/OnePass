@@ -38,10 +38,15 @@ export const USAGE = `onepass-eval <replay|quick|full> [options]
 onepass-eval import <transcript.jsonl> [options]
 
 Modes
-  replay   Push the stored prefixes through a fresh proxy child against a fake upstream.
-           No model calls, no score, costs nothing.
+  replay   Push every eligible case through a fresh proxy child against a fake upstream, and
+           diff what it evicted against the previous build. No model calls, no score, costs
+           nothing. It lists the cases as it goes, so it also shows what a scored run covers.
   quick    Three proxied tails and every second eligible planning case.
   full     Five proxied tails and every eligible planning case.
+
+Every mode lists the eligible cases by rule: the turns of the planning session whose full prefix
+is past the proxy's trip threshold. There is no case manifest — the list is recomputed each run
+and recorded in the result document.
 
 Run options
   --compare <label>      Report this run against a previous run's label.
@@ -50,6 +55,9 @@ Run options
 Import
   Copies a session transcript into the corpus and prints the branch it holds: turn counts,
   compaction points and the token trajectory. The source is never opened for writing.
+
+  A run takes its cases from the session filed under \`planning\`, so import it under that name:
+    onepass-eval import <transcript.jsonl> --tip <uuid> --name planning
 
   --tip <uuid>           Walk back from this entry. A transcript file is a tree and a session is
                          one branch of it; without this, the branch ending at the last entry
@@ -67,9 +75,13 @@ Environment
                                       committed.
   ONEPASS_EVAL_CLAUDE_CODE_VERSION    The Claude Code version the control baseline is keyed by.
                                       Read from \`claude --version\` when unset.
-  ONEPASS_EVAL_UPSTREAM               Where the proxy child sends requests in a scored run.
-                                      Defaults to the Anthropic API. Replay ignores it and
-                                      serves its own fake upstream.`;
+  ONEPASS_EVAL_UPSTREAM               Where requests go. The proxy children use it in a scored
+                                      run; replay serves its own fake upstream to them instead.
+                                      The eval's own count-tokens calls go here in every mode,
+                                      replay included, so a replay lists the same cases a scored
+                                      run would. Defaults to the Anthropic API.
+  ANTHROPIC_API_KEY                   Used for count-tokens and, later, the graders. Never for
+                                      the proxy's judge, which stays off in every arm.`;
 
 /**
  * `argv` is the arguments after the program name. Throws `UsageError` on anything it cannot read,
