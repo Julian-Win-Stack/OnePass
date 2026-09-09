@@ -162,10 +162,26 @@ $6.02 — moved the five-hour window by about **3 percentage points**. `build-po
 12000s and `sam-cell-seg` at 7200s. Forty trials do not fit in one window, and the original
 "~2 h per arm" estimate was wall clock, which is not the binding constraint.
 
-So the first pass is run in batches, one batch per window, **both arms of a batch inside the same
-window** so the two arms never sit under different service conditions. The lists live in
+There are two ways to spend that, and which one is right is the operator's call, not this file's.
+
+**One shot, both arms at once** — what the recorded run did. Accepts that a window may be
+exhausted mid-run, in exchange for finishing in one sitting. Running the two arms *simultaneously*
+rather than back to back halves the wall clock and has a real methodological benefit: both arms
+meet the service at the same instant under the same conditions, which sequential arms never do.
+Wall clock then floors out at the longest single task (`build-pov-ray`, 12000s) instead of the sum.
+
+```
+ONEPASS_N_CONCURRENT=10 ./run.sh first-pass proxied &
+ONEPASS_N_CONCURRENT=10 ./run.sh first-pass control &
+```
+
+Pair it with `python3 triage.py`, which separates trials that failed because the window ran out
+from trials that genuinely failed. Without that separation a truncated run is indistinguishable
+from a bad result, and the whole thing has to be thrown away.
+
+**In batches, one per window** — slower by a day, but no trial can be truncated. The lists live in
 `batches/`, cover `tasks.txt` exactly, and are ordered cheapest-first so the early batches
-calibrate the cost of the later ones:
+calibrate the cost of the later ones. Both arms of a batch go inside one window:
 
 ```
 ONEPASS_TASKS_FILE=batches/batch1.txt ./run.sh first-pass proxied

@@ -35,6 +35,12 @@ JOBS_DIR="${ONEPASS_JOBS_DIR:-$HOME/onepass-corpus/harbor/jobs}"
 # normally done in batches, one batch per rate-limit window (see README, "Running it in batches"),
 # and each batch names its own file here. Both arms of a batch must use the same file.
 TASKS_FILE="${ONEPASS_TASKS_FILE:-$HERE/tasks.txt}"
+# Keep every request body the proxy is handed, for replay (eval/src/replay.ts reads exactly this).
+# The proxy writes them pre-eviction and untouched, so a replay sees what the session really sent —
+# a body rebuilt from a transcript does not, because Claude Code stores its injected content as
+# records of its own rather than as the text it renders them into. Bodies are the session in the
+# clear: they land under the scratch dir and must never be committed. Proxied arm only.
+CAPTURE_BODIES="${ONEPASS_CAPTURE_BODIES:-0}"
 # The proxied arm builds proxy/ from this repo inside each container. Pin the commit so a rerun
 # builds the same proxy; the default is this checkout's HEAD.
 ONEPASS_REF="${ONEPASS_REF:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
@@ -113,6 +119,11 @@ if [[ "$ARM" == "proxied" ]]; then
   AGENT_FLAGS+=(--ak "onepass_repo_url=$ONEPASS_REPO_URL")
   AGENT_FLAGS+=(--ak "onepass_ref=$ONEPASS_REF")
   AGENT_FLAGS+=(--ak "onepass_trip_tokens=$TRIP_TOKENS")
+  case "$CAPTURE_BODIES" in
+    1|true|yes|on) AGENT_FLAGS+=(--ak "onepass_capture_bodies=true") ;;
+    0|false|no|off|"") ;;
+    *) echo "run.sh: ONEPASS_CAPTURE_BODIES must be a boolean, got: $CAPTURE_BODIES" >&2; exit 2 ;;
+  esac
 else
   AGENT_FLAGS+=(--agent claude-code)
 fi
@@ -141,6 +152,11 @@ declare -a SHARED_ENV=(
 mkdir -p "$JOBS_DIR"
 
 echo "arm=$ARM  mode=$MODE  model=$MODEL  env=$HARBOR_ENV  trip=$TRIP_TOKENS  job=$JOB_NAME"
+if [[ "$ARM" == "proxied" ]]; then
+  case "$CAPTURE_BODIES" in
+    1|true|yes|on) echo "capture: request bodies -> <trial>/agent/onepass/bodies/ (replay corpus)" ;;
+  esac
+fi
 if [[ "$MODE" != "smoke" ]]; then
   echo "tasks: $TASKS_FILE ($(( ${#TASK_FLAGS[@]} / 2 )) tasks)"
 fi

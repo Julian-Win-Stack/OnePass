@@ -51,6 +51,10 @@ DEFAULT_TRIP_TOKENS = 30_000
 AGENT_LOGS = "/logs/agent"
 PROXY_LOG_DIR = f"{AGENT_LOGS}/onepass"
 PROXY_STDOUT = f"{AGENT_LOGS}/onepass-proxy.stdout.log"
+# Raw request bodies, when capture is on. Inside the collected tree so they come back with the
+# run. This is the input format eval/replay.ts reads: one file per transformable request, named
+# for the instant the proxy received it, because replay depends on that order.
+PROXY_BODY_DIR = f"{PROXY_LOG_DIR}/bodies"
 BUILD_RECORD = f"{AGENT_LOGS}/onepass-build.txt"
 
 PROXY_READY_TIMEOUT_SEC = 60
@@ -67,6 +71,26 @@ def _int_kwarg(value: Any, name: str, default: int) -> int:
     if parsed < 0:
         raise ValueError(f"{name} must be non-negative, got {parsed}")
     return parsed
+
+
+def _bool_kwarg(value: Any, name: str, default: bool) -> bool:
+    """Coerce a ``--ak name=value`` string (or a real bool) to a bool.
+
+    Harbor hands every ``--ak`` through as a string, so ``onepass_capture_bodies=false`` arrives as
+    the non-empty string ``"false"`` and would be truthy if taken at face value. Anything not
+    recognised is rejected rather than guessed: silently reading ``--ak capture_bodies=no`` as True
+    would fill the run with gigabytes nobody asked for.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
 class OnepassClaudeCode(ClaudeCode):
@@ -92,6 +116,7 @@ class OnepassClaudeCode(ClaudeCode):
         onepass_evict_after_turns: Any = None,
         onepass_protect_last_turns: Any = None,
         onepass_min_saved_chars: Any = None,
+        onepass_capture_bodies: Any = None,
         **kwargs,
     ):
         # Popped before super(), which forwards unknown kwargs to BaseAgent and would reject them.
@@ -102,6 +127,9 @@ class OnepassClaudeCode(ClaudeCode):
         self._trip_tokens = _int_kwarg(
             onepass_trip_tokens, "onepass_trip_tokens", DEFAULT_TRIP_TOKENS
         )
+        # Capture every body the proxy is handed, for replay. Off unless asked for: it is not
+        # part of the measurement, and the bodies are the session in the clear.
+        self._capture_bodies = _bool_kwarg(onepass_capture_bodies, "onepass_capture_bodies", False)
         # None means "leave the proxy's own default alone", so the eval only ever states the
         # knobs it actually moved.
         self._evict_after_turns = (
@@ -205,6 +233,8 @@ class OnepassClaudeCode(ClaudeCode):
             env["ONEPASS_PROTECT_LAST_TURNS"] = str(self._protect_last_turns)
         if self._min_saved_chars is not None:
             env["ONEPASS_MIN_SAVED_CHARS"] = str(self._min_saved_chars)
+        if self._capture_bodies:
+            env["ONEPASS_DUMP_DIR"] = PROXY_BODY_DIR
         return env
 
     def _start_proxy_command(self) -> str:
@@ -215,12 +245,16 @@ class OnepassClaudeCode(ClaudeCode):
             [
                 "set -euo pipefail",
                 f"mkdir -p {PROXY_LOG_DIR}",
+                *([f"mkdir -p {PROXY_BODY_DIR}"] if self._capture_bodies else []),
                 'home="${HOME:-/root}"',
                 'rm -rf "$home/.onepass"',
                 f'ln -s {PROXY_LOG_DIR} "$home/.onepass"',
                 # -u ONEPASS_JUDGE_API_KEY: the judge is off for this eval. It is measured at
                 # 1.1% of eviction for ~$3 a session (docs/findings.md §17) and would put a
                 # second model's spend inside a benchmark number.
+                # ONEPASS_DUMP_DIR is cleared from the inherited environment and then set from
+                # _proxy_env() only when capture was asked for, so an operator's stray value can
+                # never redirect the bodies somewhere the run does not collect.
                 f"setsid env -u ONEPASS_JUDGE_API_KEY -u ONEPASS_DUMP_DIR {assignments}"
                 f" {NODE_BIN} {PROXY_ENTRY} > {PROXY_STDOUT} 2>&1 < /dev/null &",
             ]
