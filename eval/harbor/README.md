@@ -164,6 +164,30 @@ $6.02 — moved the five-hour window by about **3 percentage points**. `build-po
 
 There are two ways to spend that, and which one is right is the operator's call, not this file's.
 
+**The Daytona account allows 3 concurrent sandboxes, and that governs everything below.** Ask for
+more and the surplus trials do not queue — they sit in `_create_sandbox` retries until Harbor's
+600s environment-start timeout fires and they die as `EnvironmentStartTimeoutError`, with no agent
+ever launched and no token spent. Two arms at `--n-concurrent 10` means 20 requested against 3
+available, so nearly every trial dies; two arms at 3 each still means 6 against 3, so half die. The
+failure looks alarming and reads like a broken agent, but it is only arithmetic. Check the ceiling
+before sizing a run:
+
+```
+python3 - <<'PY'
+import os, pathlib
+for line in pathlib.Path(".env").read_text().splitlines():
+    if line.strip() and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1); os.environ.setdefault(k.strip(), v.strip())
+from daytona import Daytona, DaytonaConfig
+print(len(list(Daytona(DaytonaConfig(api_key=os.environ["DAYTONA_API_KEY"])).list())))
+PY
+```
+
+Two consequences. **Run the arms sequentially**, so each gets the whole quota rather than half of
+it. And **never kill Harbor mid-flight**: it deletes a trial's sandbox when the trial ends, so a
+killed run leaves sandboxes `STARTED`, still billing and still holding slots, and the next run
+fails for a reason that has nothing to do with the next run. Clear them first.
+
 **One shot, both arms at once** — what the recorded run did. Accepts that a window may be
 exhausted mid-run, in exchange for finishing in one sitting. Running the two arms *simultaneously*
 rather than back to back halves the wall clock and has a real methodological benefit: both arms
@@ -171,8 +195,8 @@ meet the service at the same instant under the same conditions, which sequential
 Wall clock then floors out at the longest single task (`build-pov-ray`, 12000s) instead of the sum.
 
 ```
-ONEPASS_N_CONCURRENT=10 ./run.sh first-pass proxied &
-ONEPASS_N_CONCURRENT=10 ./run.sh first-pass control &
+ONEPASS_N_CONCURRENT=3 ./run.sh first-pass proxied
+ONEPASS_N_CONCURRENT=3 ./run.sh first-pass control
 ```
 
 Pair it with `python3 triage.py`, which separates trials that failed because the window ran out
