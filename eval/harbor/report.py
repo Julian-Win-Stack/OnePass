@@ -30,7 +30,7 @@ import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 RECALL_TOOLS = ("recall_search", "recall_get")
 
@@ -63,6 +63,9 @@ class TrialRecord:
 class Arm:
     label: str
     job_dir: Path
+    # An arm may be spread over several Harbor jobs: the run is batched to stay inside a
+    # rate-limit window, so each batch is its own job directory.
+    job_dirs: list[Path] = field(default_factory=list)
     trials: list[TrialRecord] = field(default_factory=list)
 
     def by_task(self) -> dict[str, list[TrialRecord]]:
@@ -149,11 +152,23 @@ def _recall_calls(trial_dir: Path) -> int:
     return count
 
 
-def load_arm(label: str, job_dir: Path) -> Arm:
-    if not job_dir.is_dir():
-        raise SystemExit(f"{label}: not a directory: {job_dir}")
-    arm = Arm(label=label, job_dir=job_dir)
-    for results_path in sorted(job_dir.glob("*/results.json")):
+def _trial_results_paths(job_dir: Path) -> list[Path]:
+    """Every per-trial result file under a job directory.
+
+    Harbor 0.22.0 writes `<job>/<trial>/result.json` (singular). Earlier drafts of this script
+    globbed `results.json`, which matches nothing on a real job — the fixture it was tested
+    against used the plural name. Both are accepted so a rerun against either layout works.
+    """
+    paths = sorted(job_dir.glob("*/result.json")) + sorted(job_dir.glob("*/results.json"))
+    return [p for p in paths if p.parent != job_dir]
+
+
+def load_arm(label: str, job_dirs: Sequence[Path]) -> Arm:
+    for job_dir in job_dirs:
+        if not job_dir.is_dir():
+            raise SystemExit(f"{label}: not a directory: {job_dir}")
+    arm = Arm(label=label, job_dir=job_dirs[0], job_dirs=list(job_dirs))
+    for results_path in [p for d in job_dirs for p in _trial_results_paths(d)]:
         trial_dir = results_path.parent
         try:
             results = json.loads(results_path.read_text())
@@ -190,7 +205,8 @@ def load_arm(label: str, job_dir: Path) -> Arm:
             record.pressure_trips = stats["pressure_trips"]
         arm.trials.append(record)
     if not arm.trials:
-        raise SystemExit(f"{label}: no trials with a results.json under {job_dir}")
+        joined = ", ".join(str(d) for d in job_dirs)
+        raise SystemExit(f"{label}: no trials with a result.json under {joined}")
     return arm
 
 
@@ -287,8 +303,14 @@ def render(proxied: Arm, control: Arm) -> str:
 
     w("# Onepass on Terminal-Bench 2.0")
     w("")
-    w(f"- proxied job: `{proxied.job_dir}`")
-    w(f"- control job: `{control.job_dir}`")
+    for arm in (proxied, control):
+        dirs = arm.job_dirs or [arm.job_dir]
+        if len(dirs) == 1:
+            w(f"- {arm.label} job: `{dirs[0]}`")
+        else:
+            w(f"- {arm.label} jobs ({len(dirs)} batches):")
+            for d in dirs:
+                w(f"  - `{d}`")
     w(f"- agent: {', '.join(p['agent'])} (proxied) vs {', '.join(c['agent'])} (control)")
     w(f"- Claude Code: {', '.join(p['cli_version'])} (proxied), {', '.join(c['cli_version'])} (control)")
     w(f"- model: {', '.join(p['model'] or ['—'])}")
@@ -397,8 +419,12 @@ def render(proxied: Arm, control: Arm) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--proxied", type=Path, required=True, help="proxied arm job directory")
-    parser.add_argument("--control", type=Path, required=True, help="control arm job directory")
+    parser.add_argument(
+        "--proxied", type=Path, required=True, nargs="+",
+        help="proxied arm job directory (repeatable: the run is batched across windows)")
+    parser.add_argument(
+        "--control", type=Path, required=True, nargs="+",
+        help="control arm job directory (repeatable)")
     parser.add_argument("--out", type=Path, help="write markdown here instead of stdout")
     args = parser.parse_args()
 

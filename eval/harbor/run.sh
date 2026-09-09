@@ -31,6 +31,10 @@ TRIP_TOKENS="${ONEPASS_TRIP_TOKENS:-30000}"
 # the run then records the version it got, and both arms still resolve it on the same day.
 CLAUDE_VERSION="${ONEPASS_CLAUDE_VERSION:-}"
 JOBS_DIR="${ONEPASS_JOBS_DIR:-$HOME/onepass-corpus/harbor/jobs}"
+# Which task list a first-pass/full run uses. The default is the full committed set. The run is
+# normally done in batches, one batch per rate-limit window (see README, "Running it in batches"),
+# and each batch names its own file here. Both arms of a batch must use the same file.
+TASKS_FILE="${ONEPASS_TASKS_FILE:-$HERE/tasks.txt}"
 # The proxied arm builds proxy/ from this repo inside each container. Pin the commit so a rerun
 # builds the same proxy; the default is this checkout's HEAD.
 ONEPASS_REF="${ONEPASS_REF:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
@@ -88,13 +92,18 @@ case "$MODE" in
   full)       N_ATTEMPTS=3 ;;
 esac
 if [[ "$MODE" != "smoke" ]]; then
+  [[ -f "$TASKS_FILE" ]] || { echo "run.sh: no such task file: $TASKS_FILE" >&2; exit 2; }
   while read -r task; do
     [[ -z "$task" || "$task" == \#* ]] && continue
     TASK_FLAGS+=(-i "$task")
-  done < "$HERE/tasks.txt"
+  done < "$TASKS_FILE"
 fi
 
-JOB_NAME="${ONEPASS_JOB_NAME:-onepass-$MODE-$ARM-$(date -u +%Y%m%dT%H%M%SZ)}"
+BATCH_TAG=""
+if [[ "$MODE" != "smoke" && "$TASKS_FILE" != "$HERE/tasks.txt" ]]; then
+  BATCH_TAG="-$(basename "$TASKS_FILE" .txt)"
+fi
+JOB_NAME="${ONEPASS_JOB_NAME:-onepass-$MODE$BATCH_TAG-$ARM-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 # ---------------------------------------------------------------------------- the two arms
 declare -a AGENT_FLAGS=()
@@ -132,6 +141,9 @@ declare -a SHARED_ENV=(
 mkdir -p "$JOBS_DIR"
 
 echo "arm=$ARM  mode=$MODE  model=$MODEL  env=$HARBOR_ENV  trip=$TRIP_TOKENS  job=$JOB_NAME"
+if [[ "$MODE" != "smoke" ]]; then
+  echo "tasks: $TASKS_FILE ($(( ${#TASK_FLAGS[@]} / 2 )) tasks)"
+fi
 harbor run \
   --dataset "$DATASET" \
   "${TASK_FLAGS[@]}" \

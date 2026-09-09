@@ -1,0 +1,7 @@
+# batch 1 — the six cheapest of the 20, by [agent] timeout_sec. Run first to calibrate what a
+# task actually costs against the 5-hour window before committing to the expensive ones.
+path-tracing
+make-mips-interpreter
+feal-differential-cryptanalysis
+feal-linear-cryptanalysis
+compile-compcert

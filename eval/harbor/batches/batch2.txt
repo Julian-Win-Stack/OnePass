@@ -1,0 +1,6 @@
+# batch 2 — 3600s caps, medium difficulty.
+schemelike-metacircular-eval
+mteb-leaderboard
+reshard-c4-data
+winning-avg-corewars
+portfolio-optimization

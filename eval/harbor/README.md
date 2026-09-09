@@ -146,7 +146,44 @@ python3 report.py --proxied <job-dir> --control <job-dir> --out RESULT.md
 Every knob is an environment variable with a default, listed at the top of `run.sh`:
 `ONEPASS_MODEL`, `ONEPASS_HARBOR_ENV` (default `daytona`; `docker` runs on the local daemon),
 `ONEPASS_N_CONCURRENT`, `ONEPASS_TRIP_TOKENS`, `ONEPASS_CLAUDE_VERSION`, `ONEPASS_REF`,
-`ONEPASS_JOBS_DIR`.
+`ONEPASS_JOBS_DIR`, `ONEPASS_TASKS_FILE`.
+
+### Running it in batches, and why you have to
+
+A subscription meters two rolling windows, and the account this was run on has **no overage**
+(`overageStatus: "rejected"`, `overageDisabledReason: "org_level_disabled"`). Reaching 100% is a
+hard refusal, not a slowdown. That is worse than it sounds: Claude Code retries a refusal with
+backoff, the backoff burns the *task's* own timer, the task times out and scores **0**, and the
+table then reads "the proxy failed these tasks" when it means "we ran out of allowance". The two
+are indistinguishable afterwards, so a truncated run is a discarded run.
+
+The measured rate is the problem. `path-tracing` — the **shortest** of the twenty, 13 minutes,
+$6.02 — moved the five-hour window by about **3 percentage points**. `build-pov-ray` is capped at
+12000s and `sam-cell-seg` at 7200s. Forty trials do not fit in one window, and the original
+"~2 h per arm" estimate was wall clock, which is not the binding constraint.
+
+So the first pass is run in batches, one batch per window, **both arms of a batch inside the same
+window** so the two arms never sit under different service conditions. The lists live in
+`batches/`, cover `tasks.txt` exactly, and are ordered cheapest-first so the early batches
+calibrate the cost of the later ones:
+
+```
+ONEPASS_TASKS_FILE=batches/batch1.txt ./run.sh first-pass proxied
+ONEPASS_TASKS_FILE=batches/batch1.txt ./run.sh first-pass control
+python3 usage.py          # gate: check headroom before starting the next batch
+```
+
+`usage.py` reads the `rate_limit_event` lines Claude Code writes into `agent/claude-code.txt`.
+That is the only readout available — there is no endpoint to poll — so it reports the state as of
+the last request a trial made, not as of now.
+
+Batch job names carry the batch tag (`onepass-first-pass-batch1-proxied-<ts>`), and `report.py`
+takes every batch directory for an arm at once:
+
+```
+python3 report.py --proxied <b1-proxied> <b2-proxied> ... \
+                  --control <b1-control> <b2-control> ... --out RESULT.md
+```
 
 The smoke run passes only if the proxy log shows **at least one trip with segments evicted**, and
 the sent context stays under the trip line afterwards. If nothing trips, either the base URL is not

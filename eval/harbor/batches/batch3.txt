@@ -1,0 +1,6 @@
+# batch 3 — 3600s caps, hard.
+distribution-search
+install-windows-3.11
+video-processing
+bn-fit-modify
+circuit-fibsqrt
