@@ -256,9 +256,12 @@ class OnepassClaudeCode(ClaudeCode):
             try:
                 await self.exec_as_agent(
                     environment,
+                    # The bracket in `mai[n]` is not decoration: this command's own shell
+                    # carries the pattern in its argv, so a literal pattern makes pkill match
+                    # the shell running it and kill that instead of the proxy.
                     command=(
                         "sleep 2; "
-                        "pkill -TERM -f 'onepass/repo/proxy/dist/main.js' || true; "
+                        "pkill -TERM -f 'onepass/repo/proxy/dist/mai[n][.]js' || true; "
                         "true"
                     ),
                 )
