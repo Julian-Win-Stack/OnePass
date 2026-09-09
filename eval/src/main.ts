@@ -5,10 +5,20 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { parseArgs, USAGE, wantsHelp, type ImportCommand, type RunCommand } from "./args.js";
+import {
+  parseArgs,
+  USAGE,
+  wantsHelp,
+  type ImportCommand,
+  type ImportRecordingsCommand,
+  type PromptsCommand,
+  type RunCommand,
+} from "./args.js";
 import { resolveCorpus } from "./corpus.js";
 import { EvalError, messageOf, UsageError } from "./errors.js";
-import { importSession, renderImport } from "./importSession.js";
+import { openImported, PLANNING_SESSION, importSession, renderImport } from "./importSession.js";
+import { readPrompts, renderPrompts, writePrompts } from "./prompts.js";
+import { importRecordings, renderRecordingsImport } from "./recordings.js";
 import { runEval } from "./run.js";
 
 async function main(argv: string[]): Promise<number> {
@@ -17,7 +27,10 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   const command = parseArgs(argv);
-  return command.kind === "import" ? importOne(command) : run(command);
+  if (command.kind === "import") return importOne(command);
+  if (command.kind === "import-recordings") return importRecordingsCommand(command);
+  if (command.kind === "prompts") return promptsCommand(command);
+  return run(command);
 }
 
 async function run(options: RunCommand): Promise<number> {
@@ -35,6 +48,21 @@ function importOne(command: ImportCommand): number {
   const corpus = resolveCorpus(process.env, repositoryRoot());
   const imported = importSession(corpus, command.transcript, { tip: command.tip, name: command.name });
   console.log(renderImport(imported));
+  return 0;
+}
+
+function importRecordingsCommand(command: ImportRecordingsCommand): number {
+  const corpus = resolveCorpus(process.env, repositoryRoot());
+  console.log(renderRecordingsImport(importRecordings(corpus, command.dumpDir, { name: command.name })));
+  return 0;
+}
+
+function promptsCommand(command: PromptsCommand): number {
+  const corpus = resolveCorpus(process.env, repositoryRoot());
+  const { branch } = openImported(corpus, command.session ?? PLANNING_SESSION);
+  const list = readPrompts(branch);
+  writePrompts(list, command.outDir);
+  console.log(renderPrompts(list, command.outDir));
   return 0;
 }
 

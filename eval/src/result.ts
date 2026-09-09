@@ -6,9 +6,9 @@
 // state — because the result has to be judgeable by someone who has not read this code.
 //
 // A run is labelled by the proxy's short SHA and the time it started, so two runs of the same
-// build never collide and a label sorts by build then by time. A build with uncommitted changes
-// under `proxy/` says so in its own label, since the SHA alone would be a claim about code that
-// is not what ran.
+// build never collide and a label sorts by build then by time. A repository with uncommitted
+// changes says so in its own label, since the SHA alone would be a claim about code that is not
+// what ran — and the eval decides what is replayed as much as the proxy decides what is evicted.
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -16,7 +16,13 @@ import type { Mode } from "./args.js";
 import type { BaselineKey } from "./baseline.js";
 import type { AnswerLabel } from "./cases.js";
 import { EvalError, messageOf } from "./errors.js";
-import { describeAnswerGroups, describeEligibility, describeSizing, formatTokens } from "./format.js";
+import {
+  describeAnswerGroups,
+  describeEligibility,
+  describeNonCases,
+  describeSizing,
+  formatTokens,
+} from "./format.js";
 import type { ReplayDiff, ReplayOutcome, ReplayTotals } from "./replay.js";
 
 /** Bumped when a field older result documents carry stops meaning what it did. */
@@ -46,11 +52,11 @@ export interface Problem {
 export interface CaseRecord {
   id: string;
   turnIndex: number;
-  typedIndex: number;
+  /** Which prompt of the session this is, counting from the start of the branch. */
+  promptIndex: number;
   stretchIndex: number;
-  /** The message list plus the fixed system-and-tools overhead. */
+  /** The whole request, as the model turn that answered it reported being shown. */
   prefixTokens: number;
-  messageTokens: number;
   /** Whether the recorded answer used tools. Not a criterion — a label the groups are read by. */
   answer: AnswerLabel;
   /** True when the request opened with a compaction summary rather than the session's own start. */
@@ -65,20 +71,31 @@ export interface CaseRecord {
 
 /** How the case list came out, before any arm ran. */
 export interface CaseSelection {
-  /** Turns on the branch that I typed, cases and non-cases alike. */
+  /** Turns on the branch that sit in the user slot, prompts and Claude Code's own entries alike. */
   typedTurns: number;
+  /** Of those, the ones Claude Code wrote itself: interrupts and slash-command echoes. */
+  notPrompts: number;
   eligible: number;
   selected: number;
   belowThreshold: number;
+  /** Prompts with no model turn after them, so no recorded depth. */
+  unanswered: number;
   thresholdTokens: number;
-  overheadTokens: number;
   /** Eligible cases per answer group. */
   answers: Record<AnswerLabel, number>;
 }
 
 /** What replay did. Absent on a scored run, which does not replay. */
 export interface ReplayReport {
+  /** The recording it replayed, and how much of it. */
+  recording: { name: string; dir: string; requests: number; messages: number; countTokens: number };
+  /**
+   * Every recorded request, in order. All of them, not only the reported ones: the sequence is what
+   * the diff is over, because a change the report does not print is still a change in the build.
+   */
   outcomes: ReplayOutcome[];
+  /** The ids the rendered table covers: the deepest requests, which are the ones eviction acts on. */
+  reported: string[];
   totals: ReplayTotals;
   diff: ReplayDiff;
 }
@@ -179,8 +196,10 @@ function renderCases(result: RunResult): string[] {
     return lines;
   }
   lines.push(
-    `${describeEligibility(selection)}. The other ${selection.belowThreshold} buy no information: below the ` +
-      `threshold the proxy evicts nothing and both arms send the same bytes.`,
+    `${describeEligibility(selection)}. A prefix under the threshold buys no information: the proxy ` +
+      `evicts nothing there and both arms send the same bytes.`,
+    "",
+    describeNonCases(selection),
     "",
     describeSizing(selection),
     "",
@@ -189,11 +208,15 @@ function renderCases(result: RunResult): string[] {
   );
   if (result.cases.length === 0) return lines;
 
-  lines.push("| case | turn | stretch | prefix | answer | opens on | ran |", "| --- | --- | --- | --- | --- | --- | --- |");
+  lines.push(
+    "| case | turn | prompt | stretch | prefix | answer | opens on | ran |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+  );
   for (const record of result.cases) {
     lines.push(
-      `| ${record.id} | ${record.turnIndex} | ${record.stretchIndex} | ${formatTokens(record.prefixTokens)} | ` +
-        `${record.answer} | ${record.opensWithCompactionSummary ? "a compaction summary" : "the session start"} | ` +
+      `| ${record.id} | ${record.turnIndex} | ${record.promptIndex} | ${record.stretchIndex} | ` +
+        `${formatTokens(record.prefixTokens)} | ${record.answer} | ` +
+        `${record.opensWithCompactionSummary ? "a compaction summary" : "the session start"} | ` +
         `${record.selected ? "yes" : "no"} |`,
     );
   }
@@ -204,10 +227,15 @@ function renderCases(result: RunResult): string[] {
 /** What replay did, and what moved since the build before it. */
 function renderReplay(result: RunResult): string[] {
   if (result.replay === null) return [];
-  const { totals, diff } = result.replay;
+  const { recording, totals, diff, outcomes } = result.replay;
   const lines: string[] = ["## Replay", ""];
   lines.push(
-    "No model calls and no score: each case went through a fresh proxy child against a fake upstream.",
+    `No model calls and no score. Every one of the ${recording.requests} requests the recording ` +
+      `\`${recording.name}\` holds went through **one** proxy child, in the order the session sent them — ` +
+      `${recording.messages} a model answered and ${recording.countTokens} it only counted. Eviction is ` +
+      `monotonic, so what the proxy does at one request depends on everything it took before it; a ` +
+      `fresh child per request, or a run over only the deep ones, would be answering about a session ` +
+      `that never happened.`,
     "",
   );
   const before = diff.totals?.previous ?? null;
@@ -216,20 +244,26 @@ function renderReplay(result: RunResult): string[] {
   const row = (name: string, was: string | number | null, now: string | number): void => {
     lines.push(`| ${name} | ${was === null ? "" : `${was} | `}${now} |`);
   };
-  row("cases replayed", before?.cases ?? null, totals.cases);
-  row("tripped", before?.trips ?? null, totals.trips);
-  row("segments evicted", before?.segmentsEvicted ?? null, totals.segmentsEvicted);
-  row("bytes sent", before === null ? null : formatBytes(before.sentBytes), formatBytes(totals.sentBytes));
+  row("requests replayed", before?.requests ?? null, totals.requests);
+  row("over the threshold", before?.overThreshold ?? null, totals.overThreshold);
+  row(
+    "over it with nothing evicted",
+    before?.overThresholdNothingEvicted ?? null,
+    totals.overThresholdNothingEvicted,
+  );
+  row("blocks evicted, first time", before?.newlyEvicted ?? null, totals.newlyEvicted);
+  row("stubs sent", before?.stubbed ?? null, totals.stubbed);
   row("bytes forwarded", before === null ? null : formatBytes(before.forwardedBytes), formatBytes(totals.forwardedBytes));
-  row("rebuilds", before?.rebuilds ?? null, totals.rebuilds);
   lines.push("");
+
+  lines.push(...renderReported(result.replay.reported, outcomes));
 
   lines.push("### Against the previous build", "");
   if (diff.onlyInPrevious.length > 0 || diff.onlyInCurrent.length > 0) {
     lines.push(
-      `**Refused.** The case list drifted since \`${diff.comparedWith ?? "the previous run"}\`: ` +
-        `${diff.onlyInPrevious.length} case(s) it covered are gone and ${diff.onlyInCurrent.length} are new. ` +
-        `Totals over two different sets of turns are not a comparison, so none is shown.`,
+      `**Refused.** The recording drifted since \`${diff.comparedWith ?? "the previous run"}\`: ` +
+        `${diff.onlyInPrevious.length} request(s) it replayed are gone and ${diff.onlyInCurrent.length} are new. ` +
+        `Totals over two different sequences are not a comparison, so none is shown.`,
       "",
     );
     return lines;
@@ -239,21 +273,47 @@ function renderReplay(result: RunResult): string[] {
     lines.push(`Nothing to compare against${named}.`, "");
     return lines;
   }
-  lines.push(`Compared with \`${diff.comparedWith ?? "the previous run"}\`.`, "");
+  lines.push(`Compared with \`${diff.comparedWith ?? "the previous run"}\`, over every replayed request.`, "");
   if (diff.changes.length === 0) {
-    lines.push(`No case came out differently; ${diff.unchanged} were identical.`, "");
+    lines.push(`No request came out differently; ${diff.unchanged} were identical.`, "");
   } else {
-    lines.push("| case | what | previous | now |", "| --- | --- | --- | --- |");
+    lines.push("| request | what | previous | now |", "| --- | --- | --- | --- |");
     for (const change of diff.changes) {
-      lines.push(`| ${change.caseId} | ${change.what} | ${change.previous} | ${change.current} |`);
+      lines.push(`| ${change.id} | ${change.what} | ${change.previous} | ${change.current} |`);
     }
-    lines.push("", `${diff.unchanged} case(s) came out the same.`, "");
+    lines.push("", `${diff.unchanged} request(s) came out the same.`, "");
   }
   return lines;
 }
 
+/**
+ * The deepest requests, in the order they were sent. Every request is replayed and every one is in
+ * the JSON; a table of several hundred near-identical rows is one nobody reads, and eviction only
+ * does anything near the threshold, so the shallow ones all say the same thing.
+ */
+function renderReported(reported: readonly string[], outcomes: readonly ReplayOutcome[]): string[] {
+  const shown = new Set(reported);
+  const rows = outcomes.filter((outcome) => shown.has(outcome.id));
+  if (rows.length === 0) return [];
+  const lines: string[] = [`### The ${rows.length} deepest requests`, ""];
+  lines.push(
+    "| request | of | est. before | est. sent | forwarded | over T | new | stubs | stub |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+  );
+  for (const outcome of rows) {
+    lines.push(
+      `| ${outcome.id} | ${outcome.position} | ${formatTokens(outcome.estimatedTokensBefore)} | ` +
+        `${formatTokens(outcome.estimatedTokensSent)} | ${formatBytes(outcome.forwardedBytes)} | ` +
+        `${outcome.overThreshold ? "yes" : "no"} | ${outcome.newlyEvicted} | ${outcome.stubbed} | ` +
+        `${outcome.stubbed === 0 ? "none" : `\`${outcome.stubDigest}\``} |`,
+    );
+  }
+  lines.push("");
+  return lines;
+}
+
 function formatBytes(bytes: number): string {
-  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB` : `${Math.round(bytes / 1_000)} kB`;
 }
 
 /**
@@ -286,7 +346,7 @@ export function renderRunResult(result: RunResult): string {
   lines.push(`${result.mode} mode, ${result.scored ? "scored" : "not scored"}, started ${result.startedAt}.`, "");
 
   lines.push("| | |", "| --- | --- |");
-  lines.push(`| proxy build | \`${result.proxy.shortSha}\`${result.proxy.dirty ? " **with uncommitted changes**" : ""} |`);
+  lines.push(`| build | \`${result.proxy.shortSha}\`${result.proxy.dirty ? " **with uncommitted changes**" : ""} |`);
   lines.push(`| proxy version | ${result.proxy.version} |`);
   lines.push(`| judge | ${result.proxy.judge} |`);
   lines.push(`| upstream | ${result.upstream} |`);

@@ -3,18 +3,17 @@
 // It resolves the corpus, opens the planning session that was imported into it, builds the proxy
 // under test, labels the run by that build, opens the control baseline for the two worlds the arms
 // run in, starts a proxy child the way every arm will start one, lists the eligible cases by rule,
-// and writes the result document and its table. In replay mode it also pushes every case through a
-// fresh proxy child and diffs what came out against the previous build.
+// and writes the result document and its table. In replay mode it also pushes every recorded
+// request through one proxy child and diffs what came out against the previous build.
 //
 // The order matters. Everything that can refuse — an unset corpus, a planning session that was
-// never imported, a proxy that does not build, a previous run named for a report that was never
-// written — refuses before a child is started or a byte is written, so a run that is going to fail
-// costs nothing but the build.
+// never imported, a recording that was never imported, a proxy that does not build, a previous run
+// named for a report that was never written — refuses before a child is started or a byte is
+// written, so a run that is going to fail costs nothing but the build.
 //
-// Two upstreams, and they are not the same thing. The proxy children forward to one: the real API
-// on a scored run, the fake on a replay, so a replay never reaches the network. The eval's own
-// count-tokens calls go to the other, which is the API in every mode — replay measures its cases
-// the same way a scored run does, or the list it prints would not be the list a scored run covers.
+// A run reaches the network only where it has to. Replay serves its own fake upstream and makes no
+// model call at all, so it costs nothing and needs no key: the case list is read out of the
+// transcript, and what replay sends is a file on disk.
 
 import { isScored } from "./args.js";
 import type { RunCommand } from "./args.js";
@@ -26,13 +25,21 @@ import {
   type BaselineKey,
 } from "./baseline.js";
 import { extractCases, selectCases, type CaseList, type PlanningCase } from "./cases.js";
-import { API_KEY_ENV, createTokenCounter } from "./countTokens.js";
 import { resolveCorpus } from "./corpus.js";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
-import { describeAnswerGroups, describeEligibility, describeSizing, formatTokens } from "./format.js";
+import { describeAnswerGroups, describeEligibility, describeNonCases, formatTokens } from "./format.js";
 import { openImported, PLANNING_SESSION } from "./importSession.js";
 import { buildProxyUnderTest, withProxyChild, type ProxyBuild } from "./proxy.js";
-import { diffReplays, replayCases, totalsOf, type ReplayOutcome } from "./replay.js";
+import {
+  conversationRequests,
+  approximateTokens,
+  deepest,
+  REPORTED_REQUESTS,
+  readRecordings,
+  PLANNING_RECORDING,
+  type RecordingSet,
+} from "./recordings.js";
+import { diffReplays, replayRecordings, totalsOf, type ReplayOutcome } from "./replay.js";
 import {
   freeLabel,
   latestReplayedRun,
@@ -84,9 +91,12 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
     );
   }
 
-  // The session every case is cut from. Opened before the build, because a corpus with nothing
-  // imported into it is the one mistake that costs nothing at all to catch.
+  // The session every case is cut from, and the recording replay sends. Both are read before the
+  // build and before anything is started: a corpus with nothing in it is the one mistake that
+  // costs nothing at all to catch, and a refusal after a fake upstream is listening would leave
+  // the run holding an open server it never gets to close.
   const planning = openImported(corpus, PLANNING_SESSION);
+  const recordings = options.mode === "replay" ? readRecordings(corpus, PLANNING_RECORDING) : null;
 
   // Replay is the check run after every proxy fix, so it depends on as little as it can: no
   // control to compare against means no baseline, and no baseline means no reason to ask an
@@ -101,8 +111,7 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
   // never reach the network. A scored run points at the real API unless a test redirects it.
   // Having one is what says a run replays: no other mode has one, and no other mode may.
   const replayUpstream = options.mode === "replay" ? await startFakeUpstream() : null;
-  const sizingUpstream = env[UPSTREAM_ENV] ?? DEFAULT_UPSTREAM;
-  const upstream = replayUpstream?.url ?? sizingUpstream;
+  const upstream = replayUpstream?.url ?? env[UPSTREAM_ENV] ?? DEFAULT_UPSTREAM;
 
   const problems: Problem[] = [];
   try {
@@ -114,29 +123,27 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       logFilePath: started.logFilePath,
     }));
 
-    const caseList = await extractCases(
-      planning.branch,
-      createTokenCounter({ baseUrl: sizingUpstream, apiKey: env[API_KEY_ENV] }),
-    );
+    const caseList = extractCases(planning.branch);
     const selected = selectCases(caseList.cases, options.mode);
     const caseSelection: CaseSelection = {
       typedTurns: caseList.typedTurns,
+      notPrompts: caseList.notPrompts,
       eligible: caseList.cases.length,
       selected: selected.length,
       belowThreshold: caseList.belowThreshold,
+      unanswered: caseList.unanswered,
       thresholdTokens: caseList.thresholdTokens,
-      overheadTokens: caseList.overheadTokens,
       answers: caseList.answers,
     };
     for (const line of renderCaseList(caseList, caseSelection, selected, options.mode)) say(line);
     problems.push(...caseProblems(caseList, planning.record.transcriptPath));
 
     const replay =
-      replayUpstream === null
+      replayUpstream === null || recordings === null
         ? null
         : await runReplay({
             build,
-            cases: selected,
+            recordings,
             upstream: replayUpstream,
             runDir,
             resultsDir,
@@ -170,7 +177,7 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       replay,
       arms: [],
       problems,
-      notes: notesFor(options.mode, caseList, caseSelection),
+      notes: notesFor(options.mode, caseList, replay),
     };
     return { result, written: writeRunResult(resultsDir, result) };
   } finally {
@@ -180,8 +187,9 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
 
 interface ReplayContext {
   build: ProxyBuild;
-  cases: readonly PlanningCase[];
-  /** The children forward here, so replay never reaches the network. */
+  /** The recorded requests, in the order the session sent them. */
+  recordings: RecordingSet;
+  /** The child forwards here, so replay never reaches the network. */
   upstream: FakeUpstream;
   runDir: string;
   resultsDir: string;
@@ -192,16 +200,25 @@ interface ReplayContext {
 
 /** Replay, and the comparison with whichever earlier run this one is reported against. */
 async function runReplay(context: ReplayContext): Promise<ReplayReport> {
-  const outcomes = await replayCases({
+  const requests = context.recordings.requests;
+  const reported = deepest(requests, REPORTED_REQUESTS);
+  const reportedIds = new Set(reported.map((request) => request.id));
+
+  const outcomes = await replayRecordings({
     build: context.build,
-    cases: context.cases,
+    recordings: context.recordings,
     upstream: context.upstream,
     runDir: context.runDir,
-    onCase: (planningCase, position, total) =>
+    reported: reportedIds,
+    // One line per request would be several hundred lines of scroll for a check run on a whim, so
+    // the progress ticks and the requests the report covers are named as they go past.
+    onRequest: (recording, position, total) => {
+      if (!reportedIds.has(recording.id) && position % 25 !== 0 && position !== total) return;
       context.say(
-        `[onepass-eval] replay ${position + 1}/${total}  ${planningCase.id}  ` +
-          `${formatTokens(planningCase.prefixTokens)}  ${planningCase.answer}`,
-      ),
+        `[onepass-eval] replay ${position}/${total}  ${recording.id}  ` +
+          `${formatTokens(approximateTokens(recording.bytes))}${reportedIds.has(recording.id) ? "  *" : ""}`,
+      );
+    },
   });
 
   // A scored run holds no replay outcomes, so a comparison with one has nothing to read. Naming it
@@ -213,7 +230,15 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
       : readRunResult(context.resultsDir, context.compareWith);
   const previous: ReplayOutcome[] | null = against?.replay?.outcomes ?? null;
   return {
+    recording: {
+      name: context.recordings.name,
+      dir: context.recordings.dir,
+      requests: requests.length,
+      messages: conversationRequests(requests).length,
+      countTokens: requests.length - conversationRequests(requests).length,
+    },
     outcomes,
+    reported: reported.map((request) => request.id),
     totals: totalsOf(outcomes),
     diff: diffReplays(against?.label ?? null, previous, outcomes),
   };
@@ -230,39 +255,48 @@ function caseProblems(list: CaseList, transcriptPath: string): Problem[] {
         `${list.thresholdTokens}-token trip threshold, so this run covered nothing.`,
     });
   }
-  // The typed-turn rule admits three shapes Claude Code writes for itself — `[Request interrupted
-  // by user]`, a slash command's `<command-name>` echo, and its `<local-command-stdout>` — and
-  // those are exactly the eligible turns with nothing recorded as an answer. A case cut at one
-  // would be typed at the fork as though I had written it, which is the failure the rule is
-  // spelled out to prevent, arriving by another door. It is reported rather than filtered: the
-  // rule is the spec's, and narrowing it here would change the corpus without saying so.
-  if (list.answers.none > 0) {
+  // Three shapes sit in the user slot that nobody typed — `[Request interrupted by user]`, a slash
+  // command's `<command-name>` echo, and its `<local-command-stdout>`. A case cut at one would be
+  // typed at the fork as though I had written it, buying a paid call and no information, so they
+  // are held out of the case list. Held out, not silent: they are part of what the branch holds and
+  // a reader comparing this count with the transcript's own would otherwise be short by seven.
+  if (list.notPrompts > 0) {
     problems.push({
-      what: "cases with no recorded answer",
+      what: "typed turns Claude Code wrote itself",
       detail:
-        `${list.answers.none} of ${list.cases.length} eligible turns have no model answer recorded after them. ` +
-        `These are interrupted turns and Claude Code's own local-command entries, which the typed-turn rule as ` +
-        `written admits. They carry no tool label and are counted apart from the two answer groups.`,
+        `${list.notPrompts} of the ${list.typedTurns} turns in the user slot on ${transcriptPath} are Claude ` +
+        `Code's own entries: interrupt notices, slash-command echoes and their output. They are not prompts, ` +
+        `so they are neither cases nor fed to a recording session.`,
     });
   }
   return problems;
 }
 
 /**
- * A case list that has drifted is a problem, not a diff line. The whole point of reporting one
- * build against another is that both covered the same turns, and a reader comparing totals across
- * two different case lists would be comparing nothing.
+ * A recording that has drifted is a problem, not a diff line. The whole point of reporting one
+ * build against another is that both sent the same requests, and a reader comparing totals across
+ * two different sequences would be comparing nothing.
  */
 function driftProblems(replay: ReplayReport): Problem[] {
   const { diff } = replay;
-  if (diff.onlyInPrevious.length === 0 && diff.onlyInCurrent.length === 0) return [];
+  if (diff.onlyInPrevious.length === 0 && diff.onlyInCurrent.length === 0 && diff.unnamedInPrevious === 0) return [];
+  const few = (ids: readonly string[]): string =>
+    ids.length === 0 ? "none" : `${ids.slice(0, 5).join(", ")}${ids.length > 5 ? ", …" : ""}`;
+  const previousRun = diff.comparedWith ?? "the previous run";
+  // A document that names none of its requests is not drift a reader can act on by re-recording —
+  // it is an older eval's document — so it is said as itself rather than folded into the counts.
+  const unnamed =
+    diff.unnamedInPrevious === 0
+      ? ""
+      : ` ${diff.unnamedInPrevious} of ${previousRun}'s outcomes name no request at all: that document was` +
+        ` written before replay read recordings, and there is nothing in it to match against.`;
   return [
     {
-      what: "the case list drifted",
+      what: "the recording drifted",
       detail:
-        `${diff.comparedWith ?? "the previous run"} covered ${diff.onlyInPrevious.length} case(s) this run did not ` +
-        `(${diff.onlyInPrevious.join(", ") || "none"}), and this run covered ${diff.onlyInCurrent.length} it did not ` +
-        `(${diff.onlyInCurrent.join(", ") || "none"}). The totals of the two runs are not comparable.`,
+        `${previousRun} replayed ${diff.onlyInPrevious.length} request(s) this run did ` +
+        `not (${few(diff.onlyInPrevious)}), and this run replayed ${diff.onlyInCurrent.length} it did not ` +
+        `(${few(diff.onlyInCurrent)}). The totals of the two runs are not comparable.${unnamed}`,
     },
   ];
 }
@@ -272,10 +306,9 @@ function recordCases(list: CaseList, selected: readonly PlanningCase[]): CaseRec
   return list.cases.map((planningCase) => ({
     id: planningCase.id,
     turnIndex: planningCase.turnIndex,
-    typedIndex: planningCase.typedIndex,
+    promptIndex: planningCase.promptIndex,
     stretchIndex: planningCase.stretchIndex,
     prefixTokens: planningCase.prefixTokens,
-    messageTokens: planningCase.messageTokens,
     answer: planningCase.answer,
     opensWithCompactionSummary: planningCase.opensWithCompactionSummary,
     selected: ran.has(planningCase.id),
@@ -296,6 +329,7 @@ function renderCaseList(
   const ran = new Set(selected.map((planningCase) => planningCase.id));
   const lines = [
     `[onepass-eval] ${describeEligibility(counts)}; ${mode} mode covers ${selected.length} of them`,
+    `[onepass-eval] ${describeNonCases(counts)}`,
     `[onepass-eval] ${describeAnswerGroups(counts)}`,
   ];
   for (const planningCase of list.cases) {
@@ -309,19 +343,26 @@ function renderCaseList(
 }
 
 /** Anything a reader has to know to read the numbers honestly. */
-function notesFor(mode: RunCommand["mode"], list: CaseList, counts: CaseSelection): string[] {
+function notesFor(mode: RunCommand["mode"], list: CaseList, replay: ReplayReport | null): string[] {
   const notes = [
-    "Nothing is scored yet: this build of the eval lists the cases and replays them, and the arms are not written.",
-    `${describeSizing(counts)} That overhead is one number for the whole branch.`,
+    "Nothing is scored yet: this build of the eval lists the cases and replays a recording, and the arms are " +
+      "not written.",
   ];
   const opened = list.cases.filter((one) => one.opensWithCompactionSummary).length;
   if (opened > 0) {
     notes.push(`${opened} of ${list.cases.length} cases sit on history that opens with a compaction summary.`);
   }
-  if (mode === "replay") {
+  if (mode === "replay" && replay !== null) {
     notes.push(
-      "Replay's fake upstream reports no cache creation, so the proxy classifies no rebuild against it; the " +
-        "rebuild count moves only if the build starts classifying them differently.",
+      `The case list above and the replay below are about two different sessions. The cases are turns of the ` +
+        `recorded planning session, which a scored run forks. Replay sends the requests of \`${replay.recording.name}\`, ` +
+        `a session driven by that session's prompts and recorded through the proxy — the proxy's own view of a ` +
+        `real deep session, which is the only thing that carries what Claude Code injects.`,
+    );
+    notes.push(
+      "Replay's fake upstream reports usage at four characters per token, so the proxy calibrates to that " +
+        "rather than to the ~3.2 a real session teaches it. Every build sees the same fake, so a comparison " +
+        "between builds is unaffected; the estimated sizes in the table are not the sizes the API would report.",
     );
   }
   return notes;

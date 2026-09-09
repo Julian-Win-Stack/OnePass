@@ -1,6 +1,6 @@
 import * as http from "node:http";
 import * as https from "node:https";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   evictContextSegments,
@@ -37,6 +37,8 @@ export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
 // calibration sample trips eviction early rather than letting a session overshoot the cap.
 export const FALLBACK_CHARS_PER_TOKEN = 3.2;
 const CALIBRATION_MIN_TOKENS = 1000;
+/** How many bodies this process has dumped, so that each name carries the order it was written in. */
+let dumpSequence = 0;
 const USAGE_SCAN_LIMIT_CHARS = 262_144;
 
 const DROPPED_REQUEST_HEADERS = new Set([
@@ -92,6 +94,9 @@ function formatLiveLine(entry: RequestLogEntry): string {
       `est ${formatTokensShort(entry.estimatedTokensBefore)} -> ${formatTokensShort(entry.estimatedTokensSent)} tok, ` +
         `${entry.stubbedResultCount ?? 0} stubbed (${entry.newlyEvictedCount ?? 0} new)`,
     );
+    // Over the line with nothing to take is the state worth reading off a live log: the proxy is
+    // doing its arithmetic and finding nothing it is allowed to evict.
+    if (entry.overThreshold === true && (entry.newlyEvictedCount ?? 0) === 0) parts.push("over T, nothing eligible");
   }
   const rebuildNote =
     entry.rebuild === undefined
@@ -132,6 +137,8 @@ export function createProxyServer(config: ProxyConfig): http.Server {
   interface EvictionRequestMeta {
     estimatedTokensBefore: number;
     estimatedTokensSent: number;
+    /** The threshold decision itself, kept apart from what the decision led to. */
+    overThreshold: boolean;
     stubbedResultCount: number;
     newlyEvictedCount: number;
     charsPerToken: number;
@@ -370,7 +377,19 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       try {
         mkdirSync(config.dumpDir, { recursive: true });
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        writeFileSync(join(config.dumpDir, `${stamp}${pathname.replace(/[^a-zA-Z0-9]/g, "_")}.json`), rawBody);
+        const suffix = pathname.replace(/[^a-zA-Z0-9]/g, "_");
+        // The name is the clock and then the count, and the eval replays these in name order. The
+        // clock alone is not enough: a millisecond holds more than one request, and two requests
+        // sharing a name would leave the second erasing the first — a request missing from the
+        // middle of an ordered replay with nothing saying so. So every name carries the sequence
+        // this process wrote it in, zero-padded so it sorts as a number, which makes name order
+        // arrival order exactly rather than nearly. `existsSync` then covers the one case the
+        // counter cannot: a second proxy writing into the same directory, which nothing should do.
+        let name = `${stamp}_${String((dumpSequence += 1)).padStart(6, "0")}${suffix}.json`;
+        while (existsSync(join(config.dumpDir, name))) {
+          name = `${stamp}_${String((dumpSequence += 1)).padStart(6, "0")}${suffix}.json`;
+        }
+        writeFileSync(join(config.dumpDir, name), rawBody);
       } catch {
         // Dumping is best-effort; never fail the request over it.
       }
@@ -415,6 +434,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
+        overThreshold: outcome.tripped,
         stubbedResultCount: outcome.stubbedIds.length,
         newlyEvictedCount: outcome.newlyEvictedIds.length,
         charsPerToken: requestCharsPerToken,

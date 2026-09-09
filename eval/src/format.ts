@@ -19,33 +19,40 @@ export function formatTokens(value: number | null): string {
  */
 export interface CaseCounts {
   typedTurns: number;
+  notPrompts: number;
   eligible: number;
   belowThreshold: number;
+  unanswered: number;
   thresholdTokens: number;
-  overheadTokens: number;
-  answers: { tools: number; text: number; none: number };
+  answers: { tools: number; text: number };
 }
 
-/** `28 of 50 typed turns are past the 110k trip threshold`. */
+/** `28 of 50 prompts are past the 110k trip threshold`. */
 export function describeEligibility(counts: CaseCounts): string {
   return (
-    `${counts.eligible} of ${counts.typedTurns} typed turns are past the ` +
+    `${counts.eligible} of ${counts.typedTurns - counts.notPrompts} prompts are past the ` +
     `${formatTokens(counts.thresholdTokens)} trip threshold`
   );
 }
 
-/** `By recorded answer: 12 used tools, 14 answered in text, 2 have no recorded answer.` */
+/** `By recorded answer: 12 used tools, 14 answered in text.` */
 export function describeAnswerGroups(counts: CaseCounts): string {
-  return (
-    `By recorded answer: ${counts.answers.tools} used tools, ${counts.answers.text} answered in text, ` +
-    `${counts.answers.none} have no recorded answer.`
-  );
+  return `By recorded answer: ${counts.answers.tools} used tools, ${counts.answers.text} answered in text.`;
 }
 
 /** How a case's size was arrived at, which a number on its own does not say. */
 export function describeSizing(counts: CaseCounts): string {
   return (
-    `Sizes are the message list measured with count-tokens, plus ${formatTokens(counts.overheadTokens)} of ` +
-    `system prompt and tool definitions read from the first model turn's usage.`
+    `A case's size is what the model turn that answered it reported being shown — the whole request, ` +
+    `system prompt and tools included, as the API counted it. Nothing is rebuilt or estimated.`
+  );
+}
+
+/** What the branch held that is not a case, which a bare eligible count leaves unexplained. */
+export function describeNonCases(counts: CaseCounts): string {
+  return (
+    `${counts.belowThreshold} prompt(s) sat under the threshold, ${counts.unanswered} were never answered, ` +
+    `and ${counts.notPrompts} of the ${counts.typedTurns} typed turns are entries Claude Code wrote in the ` +
+    `user slot itself.`
   );
 }

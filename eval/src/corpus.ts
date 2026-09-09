@@ -1,10 +1,10 @@
 // Where session content lives.
 //
-// Transcript copies, replay bodies, fork and grader outputs, hand labels, the control baseline
-// and every case and tail worktree are written under one directory named by an environment
-// variable. It has to resolve outside this repository: the material is other people's code and
-// my own sessions, and the one rule that keeps it uncommittable is that the eval cannot write
-// it anywhere git is watching. A directory inside the repository is refused rather than
+// Transcript copies, recorded request bodies, replay output, fork and grader outputs, hand labels,
+// the control baseline and every case and tail worktree are written under one directory named by an
+// environment variable. It has to resolve outside this repository: the material is other people's
+// code and my own sessions, and the one rule that keeps it uncommittable is that the eval cannot
+// write it anywhere git is watching. A directory inside the repository is refused rather than
 // gitignored, because a gitignore is a rule someone can edit and this is not.
 
 import { mkdirSync, realpathSync } from "node:fs";
@@ -25,6 +25,8 @@ export interface Corpus {
   worktrees: string;
   /** Hand labels for grader calibration. */
   handLabels: string;
+  /** Raw request bodies a proxy wrote while a real session ran, one directory per recording. */
+  recordings: string;
   /** Everything one run produced: replay bodies, fork outputs, grader outputs. */
   runs: string;
   /** The run directory for a label, created on first use. */
@@ -64,6 +66,7 @@ export function resolveCorpus(env: NodeJS.ProcessEnv, repoRoot: string): Corpus 
     baselines: join(dir, "baselines"),
     worktrees: join(dir, "worktrees"),
     handLabels: join(dir, "hand-labels"),
+    recordings: join(dir, "recordings"),
     runs: join(dir, "runs"),
     runDir(label: string): string {
       const path = join(dir, "runs", label);
@@ -71,7 +74,14 @@ export function resolveCorpus(env: NodeJS.ProcessEnv, repoRoot: string): Corpus 
       return path;
     },
   };
-  for (const path of [corpus.transcripts, corpus.baselines, corpus.worktrees, corpus.handLabels, corpus.runs]) {
+  for (const path of [
+    corpus.transcripts,
+    corpus.baselines,
+    corpus.worktrees,
+    corpus.handLabels,
+    corpus.recordings,
+    corpus.runs,
+  ]) {
     mkdirSync(path, { recursive: true });
   }
   return corpus;

@@ -5,7 +5,7 @@
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import * as http from "node:http";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -282,10 +282,21 @@ test("stubs old large tool results and keeps them stubbed on later requests", as
 
   // A trip is logged while the request is being handled and the request entry at its response,
   // and the writer keeps that order, so both trips are on disk once both requests are.
-  await loggedRequestsSince("/v1/messages", mark, 2);
+  const requests = await loggedRequestsSince("/v1/messages", mark, 2);
   const trips = loggedEntries().filter((entry) => entry.kind === "trip");
   assert.equal(trips.length, 1, "the second identical request must not log a second trip");
   assert.deepEqual(trips[0]?.addedToolUseIds, ["toolu_big"]);
+
+  // The second request went over the threshold and found nothing new to take. A reader counting
+  // `trip` entries reads that as a quiet request under the line, which is the opposite of what
+  // happened, so the threshold decision is written on every request entry in its own right.
+  assert.deepEqual(
+    requests.map((entry) => [entry.overThreshold, entry.newlyEvictedCount]),
+    [
+      [true, 1],
+      [true, 0],
+    ],
+  );
 });
 
 test("count_tokens is evicted identically so counts describe the real request", async () => {
@@ -703,4 +714,47 @@ test("with no API key configured the proxy never calls a judge", async () => {
   } finally {
     await proxy.close();
   }
+});
+
+test("dumped bodies are named so that name order is the order they arrived in", async () => {
+  // The eval replays a recording by sorting the dump directory and feeding the files through one
+  // proxy child in that order. Eviction is monotonic, so a pair read the wrong way round hands the
+  // proxy a state history the session never had — and every request after it inherits that. The
+  // name therefore has to sort by arrival and not merely be unique, which is what this pins: a
+  // millisecond holds several requests, and the clock alone cannot separate them.
+  const dumpDir = mkdtempSync(join(tmpdir(), "onepass-dump-test-"));
+  const server = createProxyServer({
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    evictAfterAssistantTurns: 2,
+    protectLastAssistantTurns: 1,
+    minSavedChars: 50,
+    tripThresholdTokens: 0,
+    logFilePath: join(mkdtempSync(join(tmpdir(), "onepass-dump-log-")), "proxy.log.jsonl"),
+    quiet: true,
+    dumpDir,
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${listeningPort(server)}`;
+
+  // Sent back to back so that several land inside one millisecond, which is the case that used to
+  // come back inverted. Both endpoints, because they are dumped under different names.
+  const sent = 30;
+  try {
+    for (let index = 0; index < sent; index += 1) {
+      await sendRequest(origin, index % 2 === 0 ? "/v1/messages" : "/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "m", messages: [{ role: "user", content: `body ${index}` }] }),
+      });
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  const names = readdirSync(dumpDir).sort();
+  assert.equal(names.length, sent, "every body is kept: a name that repeats would erase one");
+  assert.deepEqual(
+    names.map((name) => JSON.parse(readFileSync(join(dumpDir, name), "utf8")).messages[0].content),
+    Array.from({ length: sent }, (_unused, index) => `body ${index}`),
+  );
 });

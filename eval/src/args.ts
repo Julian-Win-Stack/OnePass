@@ -1,10 +1,11 @@
 // The entry command's argument surface: one place that knows the whole of it, so it can be checked
 // without a proxy, a corpus or a model.
 //
-// Two commands, because they are two different jobs. A run measures a build and writes a result
-// document; an import copies one session into the corpus and prints what it holds. A run is named
+// Three commands, because they are three different jobs. A run measures a build and writes a result
+// document; an import copies one session into the corpus and prints what it holds; a recording
+// import files the request bodies a real session sent and prints how deep they got. A run is named
 // by its mode alone — `onepass-eval quick` — because that is the command anyone types twenty times
-// a day, and import is named because it is not.
+// a day, and the imports are named because they are not.
 
 import { UsageError } from "./errors.js";
 
@@ -32,22 +33,40 @@ export interface ImportCommand {
   name: string | null;
 }
 
-export type Command = RunCommand | ImportCommand;
+export interface ImportRecordingsCommand {
+  kind: "import-recordings";
+  /** The directory the proxy dumped raw request bodies into. */
+  dumpDir: string;
+  /** What the recording is filed under in the corpus, or null for `planning`. */
+  name: string | null;
+}
+
+export interface PromptsCommand {
+  kind: "prompts";
+  /** Where one file per prompt is written, for a driver to feed in name order. */
+  outDir: string;
+  /** The imported session to read them from, or null for `planning`. */
+  session: string | null;
+}
+
+export type Command = RunCommand | ImportCommand | ImportRecordingsCommand | PromptsCommand;
 
 export const USAGE = `onepass-eval <replay|quick|full> [options]
 onepass-eval import <transcript.jsonl> [options]
+onepass-eval import-recordings <dump-dir> [options]
+onepass-eval prompts <out-dir> [options]
 
 Modes
-  replay   Push every eligible case through a fresh proxy child against a fake upstream, and
-           diff what it evicted against the previous build. No model calls, no score, costs
-           nothing. It lists the cases as it goes, so it also shows what a scored run covers.
+  replay   Push every recorded request through one proxy child against a fake upstream, in the
+           order the session sent them, and diff what it evicted against the previous build. No
+           model calls, no score, no key, costs nothing.
   quick    Three proxied tails and every second eligible planning case.
   full     Five proxied tails and every eligible planning case.
 
-Every mode lists the eligible cases by rule: the turns of the planning session whose full prefix
-is past the proxy's trip threshold. There is no case manifest — the list is recomputed each run
-and recorded in the result document. Sizing a case is a count-tokens call, so every mode needs
-ANTHROPIC_API_KEY: free, but not offline.
+Every mode lists the eligible cases by rule: the prompts of the planning session whose request was
+past the proxy's trip threshold, read from what the model turn that answered each one reported
+being shown. There is no case manifest — the list is recomputed each run and recorded in the
+result document.
 
 Run options
   --compare <label>      Report this run against a previous run's label.
@@ -65,36 +84,57 @@ Import
                          written is the one imported.
   --name <name>          File the copy under this name instead of the source file's.
 
+Import-recordings
+  Files the raw request bodies a proxy wrote while a real session ran — everything it was handed,
+  untouched, before it evicted anything — and prints how many there are, how deep they got, and
+  which are /v1/messages against /v1/messages/count_tokens. Replay sends exactly these, in the
+  order the proxy received them. eval/record.sh produces one.
+
+  --name <name>          File the recording under this name instead of \`planning\`.
+
+Prompts
+  Writes the prompts of an imported session to a directory, one file per prompt, numbered in the
+  order they were typed. This is a plain read of one text field per turn — it rebuilds nothing —
+  and it is what eval/record.sh feeds to a fresh session. The entries Claude Code writes in the
+  user slot itself are left out and named.
+
+  --session <name>       Read the session filed under this name instead of \`planning\`.
+
 Anywhere
   --help                 Show this text.
 
 Environment
   ONEPASS_EVAL_CORPUS                 Required. Every byte of session content is written here:
-                                      transcript copies, fork and grader outputs, hand labels,
-                                      the control baseline and the case worktrees. It has to
-                                      resolve outside this repository, so none of it can be
-                                      committed.
+                                      transcript copies, recorded request bodies, fork and grader
+                                      outputs, hand labels, the control baseline and the case
+                                      worktrees. It has to resolve outside this repository, so
+                                      none of it can be committed.
   ONEPASS_EVAL_CLAUDE_CODE_VERSION    The Claude Code version the control baseline is keyed by.
                                       Read from \`claude --version\` when unset.
-  ONEPASS_EVAL_UPSTREAM               Where requests go. The proxy children use it in a scored
-                                      run; replay serves its own fake upstream to them instead.
-                                      The eval's own count-tokens calls go here in every mode,
-                                      replay included, so a replay lists the same cases a scored
-                                      run would. Defaults to the Anthropic API.
-  ANTHROPIC_API_KEY                   Used for count-tokens and, later, the graders. Never for
-                                      the proxy's judge, which stays off in every arm.`;
+  ONEPASS_EVAL_UPSTREAM               Where a scored run's proxy children send what they forward.
+                                      Replay serves its own fake upstream instead and never
+                                      reaches the network. Defaults to the Anthropic API.
+  ANTHROPIC_API_KEY                   Used by the graders, when they land. Never by replay, and
+                                      never for the proxy's judge, which stays off in every arm.`;
 
 /**
  * `argv` is the arguments after the program name. Throws `UsageError` on anything it cannot read,
  * so callers report one kind of failure rather than inspecting a result.
  */
 export function parseArgs(argv: readonly string[]): Command {
-  return argv[0] === "import" ? parseImport(argv.slice(1)) : parseRun(argv);
+  if (argv[0] === "import") return parseImport(argv.slice(1));
+  if (argv[0] === "import-recordings") return parseImportRecordings(argv.slice(1));
+  if (argv[0] === "prompts") return parsePrompts(argv.slice(1));
+  return parseRun(argv);
 }
 
 function parseRun(argv: readonly string[]): RunCommand {
   const { positionals, values } = splitArgs(argv, ["--compare", "--results-dir"]);
-  if (positionals.length === 0) throw new UsageError(`no mode given (expected ${MODES.join(", ")}, or import)`);
+  if (positionals.length === 0) {
+    throw new UsageError(
+      `no mode given (expected ${MODES.join(", ")}, import, import-recordings, or prompts)`,
+    );
+  }
   if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
 
   const mode = positionals[0] as string;
@@ -118,6 +158,24 @@ function parseImport(argv: readonly string[]): ImportCommand {
     tip: values.get("--tip") ?? null,
     name: values.get("--name") ?? null,
   };
+}
+
+function parseImportRecordings(argv: readonly string[]): ImportRecordingsCommand {
+  const { positionals, values } = splitArgs(argv, ["--name"]);
+  if (positionals.length === 0) {
+    throw new UsageError("import-recordings needs the path of the directory the proxy dumped bodies into");
+  }
+  if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
+
+  return { kind: "import-recordings", dumpDir: positionals[0] as string, name: values.get("--name") ?? null };
+}
+
+function parsePrompts(argv: readonly string[]): PromptsCommand {
+  const { positionals, values } = splitArgs(argv, ["--session"]);
+  if (positionals.length === 0) throw new UsageError("prompts needs a directory to write the prompts into");
+  if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
+
+  return { kind: "prompts", outDir: positionals[0] as string, session: values.get("--session") ?? null };
 }
 
 /**

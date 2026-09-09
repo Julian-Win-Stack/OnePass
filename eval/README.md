@@ -23,7 +23,11 @@ npm run build
 # one session has to be in the corpus before a run has anything to read
 node dist/main.js import <transcript.jsonl> --tip <uuid> --name planning
 
-node dist/main.js replay                      # every case, no model calls, no score, free
+# and one recording, before replay has anything to send. ./record.sh drives a real session
+# through the proxy and imports what it captured.
+./record.sh
+
+node dist/main.js replay                      # the whole recording, no model calls, no key, free
 node dist/main.js quick                       # three proxied tails, every second planning case
 node dist/main.js full --compare a001c2b-20260906T101112Z
 ```
@@ -36,35 +40,36 @@ the grader runtime the arms will call once they have pairs to grade. A run today
 lists its cases, replays them if asked, and writes a result document with no scores in it.
 
 - **The corpus.** `ONEPASS_EVAL_CORPUS` names one directory holding every byte of session
-  content: transcript copies, fork and grader outputs, hand labels, the control baseline and the
-  case worktrees. It has to resolve outside this repository, and the command refuses to start
+  content: transcript copies, recorded request bodies, fork and grader outputs, hand labels, the
+  control baseline and the case worktrees. It has to resolve outside this repository, and the command refuses to start
   otherwise — none of that material may ever be committed. (The old shell rig's
   `ONEPASS_EVAL_DIR`, which defaulted to `/tmp/onepass-eval`, is a different variable and still
   belongs to `run.sh`.)
-- **The proxy under test.** The command compiles `proxy/` itself and starts a child per case on
-  a port the operating system picks, with the judge held off, and tears it down after. The
-  globally running `onepass-proxy` is never used, and a build you forgot to make cannot be what
-  gets measured.
+- **The proxy under test.** The command compiles `proxy/` itself and starts a child on a port the
+  operating system picks, with the judge held off, and tears it down after. The globally running
+  `onepass-proxy` is never used, and a build you forgot to make cannot be what gets measured.
 - **The control baseline.** Control answers are recorded once under a model, effort and Claude
   Code version key, and reused by every later run, so an iteration pays for the proxied arm
   alone. Change any of the three and the next run records afresh rather than comparing against
   answers from another world. `claude --version` supplies the version;
   `ONEPASS_EVAL_CLAUDE_CODE_VERSION` pins it.
-- **The result.** Each run is labelled by the proxy's git short SHA and the time it started — a
-  build with uncommitted changes under `proxy/` says `-dirty` in its own label — and writes
-  `results/<label>.json` with `results/<label>.md` beside it. Those are committed; the corpus
-  never is.
+- **The result.** Each run is labelled by the repository's git short SHA and the time it started —
+  a working tree with uncommitted changes *anywhere*, eval included, says `-dirty` in its own
+  label — and writes `results/<label>.json` with `results/<label>.md` beside it. The eval decides
+  what is replayed as surely as the proxy decides what is evicted, so a label that watched only
+  `proxy/` was a claim about what ran that was not true.
 - **The seam.** Every model call the eval makes crosses one HTTP boundary, so the whole command
   can be driven with no model calls and no money. Replay mode serves its own fake upstream to the
-  proxy children; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`. It is not a
-  cold start, though: sizing a case is a count-tokens call, which is free but still needs
-  `ANTHROPIC_API_KEY` and a route to answer it.
+  proxy child; the tests point a scored run at one through `ONEPASS_EVAL_UPSTREAM`. Replay is a
+  cold start: it makes no call of its own at all and needs no key.
 
 ## Cases
 
-A case is a turn I typed whose full prefix is past the proxy's trip threshold of 110k tokens.
+A case is a prompt I typed whose request was past the proxy's trip threshold of 110k tokens.
 Below that the proxy evicts nothing, both arms send byte-identical requests, and the model call
 buys no information — so those turns are listed and left alone.
+
+Cases are for the scored arms. Replay does not use them: it sends a recording (below).
 
 Every mode lists them by rule at run time, in session order, and records the list in the result
 document with each turn's index, prefix size and answer label. **There is no case manifest.**
@@ -76,25 +81,82 @@ second case; full and replay take all of them.
   summary, and carries no `tool_result` block. The rule is spelled out because getting it wrong
   is silently destructive: a compaction summary selected as a case would be typed at the fork as
   though I had written it, and the run would look normal while measuring nothing.
-- **Size is measured, not estimated.** The message list goes through the count-tokens endpoint,
-  and the fixed system-and-tools overhead — read from what the first model turn reported it was
-  shown, less the messages it was shown — is added to it. Estimating would not do: the corpus
-  branch carries 1.8M characters of pasted screenshots, which price out at a few thousand tokens,
-  so a chars-per-token estimate reads the deepest stretch as three times its real size. The
-  endpoint is free, which is why replay measures its cases the same way a scored run does; it
-  needs `ANTHROPIC_API_KEY`.
-- **For sizing and replay, the request is rebuilt as the session sent it.** A scored case is
-  answered by Claude Code itself, which builds its own request; this rebuild is what sizes a case
-  and what replay pushes through the proxy. Claude Code writes one entry per content
-  block, so consecutive entries of one role are merged back into the one message the API saw — a
-  rebuild that did not merge them would count several assistant messages where there was one, and
-  the proxy's age gate counts assistant messages. History starts at the last compaction the case
-  sits past and opens with that compaction's summary, which hangs off the boundary's own root and
-  is never on the branch.
+- **Three shapes sit in the user slot that nobody typed.** `[Request interrupted by user]`, a
+  slash command's `<command-name>` echo, and its `<local-command-stdout>`. The typed-turn rule
+  admits all three; seven of the corpus branch's 57 are one of them. They are never cases and are
+  never fed to a recording session — forking a session to type `[Request interrupted by user]`
+  buys a paid call and no information — and the run reports how many it held back.
+- **Size is read, not rebuilt and not estimated.** A case's size is what the model turn that
+  *answered* it reported being shown: the whole request the API counted, messages, system prompt,
+  tool definitions and every injected attachment. It is already in the transcript, so listing the
+  cases costs nothing and needs no key. A prompt nothing answered has no size to read and is not a
+  case, which is also the right answer for a second reason — there is nothing to compare a fork's
+  answer against.
+
+  This replaced rebuilding the request from the transcript and measuring it with count-tokens. The
+  transcript does not hold what was sent, so the rebuild came out 17k short on the shallowest
+  corpus case and 54k on the deepest, and the threshold had been cut to 80k to stop that silently
+  dropping turns. Reading the answer's own usage has no shortfall to work around, so the eval cuts
+  at the proxy's own 110k again.
 - **Whether the recorded answer used tools does not decide eligibility.** It is a label, and the
-  result document reports the groups apart. A third group carries the turns with no recorded
-  answer at all — interrupted turns, and Claude Code's own local-command entries, which the
-  typed-turn rule admits.
+  result document reports the groups apart.
+
+## Recording a session
+
+```
+./record.sh
+```
+
+Replay needs real request bodies, and the only place they exist is a proxy that saw them. So
+`record.sh` drives a **real Claude Code session** through the proxy with `ONEPASS_DUMP_DIR`
+pointed at the corpus: it takes the prompts of the imported planning session, feeds them one at a
+time to a fresh session in the repo that session was about, and lets it run naturally — if it
+compacts, it compacts, and the proxy sees the real requests on the far side of that. The proxy
+writes every body it is handed to disk, untouched, before it evicts anything.
+
+**Why not rebuild the bodies from the transcript?** Because the transcript does not hold what was
+sent. Claude Code writes attached files, task notifications and its other injections as records of
+its own, not as the text it renders them into: 66 such entries on the corpus branch, about 200k
+characters, none of which is a turn. Three of the proxy's rules are keyed on exactly that text —
+`<system-reminder>\nResult of calling the Read tool:`, `<task-notification>`, and the
+`<system-reminder>\nCalled the Read tool with the following input:` marker that is *protected* from
+eviction — and not one of them appeared in a single one of the 37 rebuilt bodies. All three could
+have been deleted with replay still reporting every case identical.
+
+**What one recording is worth.** The first real recording — 419 requests reaching 333k tokens —
+carries `<task-notification>` in 277 of its bodies, so that rule is exercised where it never was
+before. The two Read-tool markers are in none of them, and in none of the corpus transcript either:
+they were measured from a different captured session, and this one's attachments are task reminders,
+files and queued commands, which render as something else. Covering those two needs a recording of a
+session that attaches files. A green replay is evidence about the rules the recording contains.
+
+**It bills the Claude subscription, never `ANTHROPIC_API_KEY`.** The script unsets
+`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` and then refuses to start if either survived. The
+trap is silent: the key lives in this repository's `.env`, the documented way to run the eval
+sources it, and any shell that has — or any process inheriting from one — makes Claude Code bill
+the key with no warning and no visible difference until the invoice. Unsetting reaches only the
+script's own shell, so it also reads the Claude Code settings files that would put a key back
+*inside* the session — an `env` block or an `apiKeyHelper` — and refuses on those too, along with
+`CLAUDE_CODE_USE_BEDROCK` and `CLAUDE_CODE_USE_VERTEX`, which bill somewhere else again.
+
+It also refuses if the target repository has uncommitted changes, because the recorded session runs
+with permissions bypassed and can edit files there; it prints the commit it started at, which
+`git reset --hard` puts back.
+
+Set `ONEPASS_RECORDING_REPO`, `_MODEL`, `_EFFORT`, `_NAME` or `_SESSION` to change what it drives.
+The defaults are the chp99 takehome, Opus at xhigh, filed under `planning`.
+
+```
+node dist/main.js prompts <out-dir>            # what it would feed, one file per prompt
+node dist/main.js import-recordings <dump-dir> # file bodies captured some other way
+```
+
+`import-recordings` files a dump directory into `$ONEPASS_EVAL_CORPUS/recordings/<name>/` and
+prints what it found: how many bodies, how deep they got, and which are `/v1/messages` against
+`/v1/messages/count_tokens`. The proxy names each dump for the moment it arrived and the count it
+wrote it in, so **name order is arrival order**, and that is the order replay sends them in. The
+count is there because a millisecond holds more than one request, and a pair read the wrong way
+round would hand the proxy a state history the session never had.
 
 ## Replay
 
@@ -102,27 +164,41 @@ second case; full and replay take all of them.
 node dist/main.js replay
 ```
 
-The check to run after every proxy fix. It makes no model calls and costs nothing — sizing its
-cases is a count-tokens call, which is free but not offline: each case's
-message list goes into a request body with a placeholder system prompt — eviction acts on
-messages, not on the system prompt — and through a proxy child of its own against the fake
-upstream. One child per case, torn down after, because a child that has already evicted something
-is carrying state the next case did not put there.
+The check to run after every proxy fix. It makes no model calls, needs no key and costs nothing:
+it reads the recorded bodies off disk and sends them, byte for byte, through a proxy child that
+forwards to a fake upstream. **Nothing is reconstructed.**
 
-It prints each case and its size as it goes, so it doubles as the look at what a scored run would
-cover before one is started. What it writes is a diff against the last run that replayed: trips,
-segments evicted, stub text, body sizes and rebuild count, per case. **It is not scored and the
-bar rule ignores it** — a diff is read, not passed. A case list that has drifted between the two
-runs **refuses the comparison outright** and says which cases moved: eligibility is recomputed every
-run, so drift is a real possibility, and a total over one set of turns against a total over another
-is not a comparison but two numbers side by side.
+**One child for the whole sequence, in the order it was recorded.** Eviction is monotonic — what
+the proxy does at request 400 depends on everything it took at requests 1 to 399 — so a fresh child
+per request, or a run over only the deep ones, would hand the proxy a state history the session
+never had, and the answer would be about that history rather than about the build.
+
+**Every request is replayed; the ~30 deepest are reported.** Correctness comes from the full
+sequence, a readable table from the subset. Eviction only does anything near the threshold, so the
+shallow requests all say the same thing, and a table of several hundred rows is one nobody reads.
+
+What it writes is a diff against the last run that replayed, per request: the threshold decision,
+blocks newly evicted, stubs sent, stub text and bytes forwarded. **It is not scored and the bar
+rule ignores it** — a diff is read, not passed. A recording that has drifted between the two runs
+**refuses the comparison outright** and says which requests moved.
+
+Two things it deliberately does not count. The recorded body is a file on disk, identical for every
+build, so it can never disagree — it stays on each outcome to say how deep the request was, and is
+never counted as agreement. And the fake upstream reports no cache creation, so no rebuild is ever
+classified against it; the field is gone rather than reported as a permanent zero.
+
+**Over the threshold with nothing evicted is counted in its own right.** The proxy writes a `trip`
+log entry only when it actually evicted something, so a request that went over the line and found
+nothing it was allowed to take used to read as a small quiet request — case `turn-724` of
+`3d1bb98-20260908T232351Z.json` reported 121,463 estimated tokens, past the proxy's own 110k, with
+`tripped: false`. The proxy now records the threshold decision on every request entry, and replay
+reports it as its own total. It is the failure most worth catching.
 
 The forwarded bodies are session content, so they are written under
-`$ONEPASS_EVAL_CORPUS/runs/<label>/replay/`, never into the repository. The result document keeps
-a digest of each case's stub text and the first few stubs: enough to detect a wording change and
-to read it, without hundreds of kilobytes of near-identical text in git. For the same reason the
-case table names a case by its turn index and never carries what I typed — the words of a session
-are corpus content, and a result document is committed.
+`$ONEPASS_EVAL_CORPUS/runs/<label>/replay/`, and only for the requests the report covers — a whole
+session's worth would be gigabytes. The result document keeps a digest of each request's stub text
+and the first few stubs: enough to detect a wording change and to read it, without hundreds of
+kilobytes of near-identical text in git.
 
 ## The grader
 
