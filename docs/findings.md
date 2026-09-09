@@ -650,6 +650,116 @@ model writes in the voice it has been shown. The design rule that follows: put e
 recoverable in the harness's blocks, and leave the agent's own blocks empty rather than
 decorated.
 
+## 19. The convex failure was noise: 3 controls and 2 of 3 proxied runs pass `by_owner_key`
+
+**Verdict: not a regression.** All three controls pass the `by_owner_key` ground-truth assertion
+and so do two of the three proxied runs, so §16–§17's "every proxied run fails it" does not
+survive n=3 — and the one proxied run that fails it never opened the file the assertion is about,
+with nothing about that file ever evicted from its context.
+
+§16 and §17 reported runs 3, 4 and 5 all scoring 63/65, all failing the same composite index
+assertion, against a single unproxied control at 64/65. One control is not a baseline. This step
+adds two more controls and two more proxied runs on the same HEAD, all five launched in parallel,
+with `run.sh` and `score.sh` untouched: same base commit `a14c2436bc`, same plan, same `opus[1m]`
+/ `--effort xhigh` / `--permission-mode acceptEdits`, same `--allowedTools`, same byte-identical
+prompt. Proxy build under test: `0d06b60`, clean.
+
+| | control2 | control3 | head1 | head2 | head3 |
+|---|---|---|---|---|---|
+| proxy | none | none | :3781 | :3782 | :3783 |
+| **Ground-truth tests** | **64 / 65** | **64 / 65** | **64 / 65** | **62 / 65** | **64 / 65** |
+| core / 36 | 35 | 35 | 35 | 35 | 35 |
+| convex / 29 | 29 | 29 | 29 | **27** | 29 |
+| `by_owner_key` | pass | pass | pass | **fail** | pass |
+| Peak context (API `usage`) | 284,494 | 284,938 | **112,947** | **112,633** | **114,353** |
+| Median context | 195,687 | 192,184 | 89,981 | 88,628 | 95,024 |
+| p90 context | 273,132 | 270,597 | 105,796 | 107,281 | 110,414 |
+| Assistant turns above 150k | 142 | 118 | **0** | **0** | **0** |
+| Early-quarter -> late-quarter median | 122,504 -> 271,437 (2.22x) | 65,147 -> 268,836 (4.13x) | 59,146 -> 99,970 (1.69x) | 69,711 -> 94,308 (1.35x) | 68,507 -> 105,126 (1.53x) |
+| Compactions | 0 | 0 | 0 | 0 | 0 |
+| Assistant turns | 317 | 381 | 460 | 481 | 527 |
+| Wall clock | 26.3 min | 30.5 min | 33.5 min | 30.1 min | 34.3 min |
+| Requests | — | — | 308 | 298 | 347 |
+| Trips / segments / chars removed | — | — | 6 / 516 / 580,595 | 7 / 505 / 740,034 | 18 / 596 / 788,104 |
+| Unexpected rebuilds | — | — | 1 | 1 | 1 |
+| Proxy time per request | — | — | 5ms median, 68ms max | 6ms median, 18ms max | 6ms median, 65ms max |
+| `recall_search` / `recall_get` calls | 0 | 0 | 0 | 0 | 0 |
+| `InputValidationError`s | 1 | 0 | 2 | 0 | 0 |
+| Redundant reads | 15 | 4 | 46 | 67 | 67 |
+
+**The failing arm never looked at the file.** head2's convex score is not the 28/29 §16–§17
+describe — a `mastra_channel_state` entry present with the wrong index shape. It is 27/29: head2
+never added the table to `TABLE_INDEX_MAP` at all, so both `should have entries for all typed
+tables` and `composite indexes should list fields in correct order` fail. `git status` in the five
+mastra worktrees settles it: the other four all modified
+`stores/convex/src/server/index-map.ts`; head2 did not touch it. It did the rest of the convex
+work — `schema.ts`, `storage.ts`, the channels domain — and skipped that one registration.
+
+Eviction cannot be the cause, because nothing about that file was ever in head2's context to
+evict. Its transcript names `index-map` three times: once in an `ls` of the convex server
+directory at 19:23:19, and twice inside the `import { findBestIndex } from './index-map'` line of
+`storage.ts` that it read for other reasons. It never opened the file. head2's first eviction trip
+was at 19:23:52, *after* the only sighting, and a join of the proxy log's trip entries against the
+transcript finds zero evicted segments matching `index-map` — against 53 evicted segments matching
+`convex/src/server` generally, so the join is not simply blind. What head2 lost was thoroughness,
+not context.
+
+**The score does move, and only just.** The second question this step asked was whether the tests
+can see any difference at all between runs. They can: 62 and 64 both occur. But four of the five
+land on the same 64/65, all five fail the *same* core assertion — the `supportsChannelState`
+capability fallback, which §16–§18 report for every arm including the unproxied control — and the
+only separation comes from one arm omitting a piece of work. Across all eight runs now on record
+(§17's control at 64, runs 3–5 at 63, run 6 at 64, and these five) the suite resolves whole
+missing features, not degradation. It is a completeness check, not a quality gradient, and a
+future step wanting to detect quality loss needs a different instrument.
+
+**What the parallel controls did buy is the size result, at n=3 per arm.** The controls peak at
+284,494 and 284,938 tokens with 142 and 118 turns above 150k; the proxied runs peak at 112,947,
+112,633 and 114,353 with none. That is a 2.5x reduction with the score unchanged in two arms of
+three, and it is the first time either side of this comparison has more than one sample. Neither
+side compacted: `opus[1m]` has a 1M window, so on this task the proxy is not preventing
+compaction — it is holding context to 40% of what the task would otherwise cost, per request, for
+the whole session.
+
+**Eviction with no recovery path available still matched the controls.** The recall tools were not
+registered in any of these five runs — `recall_search` does not appear anywhere in their
+transcripts, where run 6's transcript carries `mcp__onepass__recall_get` and
+`mcp__onepass__recall_search` in its tool list. `.mcp.json` is scoped to the Onepass repository and
+the runs' working directory is a mastra worktree, so the `--allowedTools` entries named nothing.
+This is a deviation from §16–§18's setup and is reported as such, but it cuts *for* the result
+rather than against it: head1 and head3 had 580,595 and 788,104 chars removed from their context
+with no way at all to get any of it back, and still scored what the controls scored. It also means
+the recovery path remains as unexercised as §17 said it was, and §12 is still the only evidence it
+works.
+
+**One stub-shape imitation in 1,468 proxied assistant turns.** §18 measured the `{}` stub at 3
+imitations in 557 turns (0.54 per 100). Here there is one: head1 sent a literal `Bash {}` and was
+rejected with `InputValidationError`, then issued the real command — 0.07 per 100 proxied turns.
+control2's single `InputValidationError` is a genuine long Bash command, not an imitation, which
+is a reminder that the error tally is an upper bound on imitations rather than a synonym for them.
+The direction agrees with §18; the counts are far too small to compare.
+
+**Caveats.**
+- n=3 per arm. Three passes and one failure do not measure a failure *rate*; they rule out the
+  3-of-3 pattern §16–§17 rested on.
+- All five ran in parallel on one machine against one subscription. **No 429s and no rate-limit
+  retries:** every arm's `.err` is empty, no arm's result JSON mentions `429`, `rate_limit` or
+  `overloaded`, and all five exited `subtype: success`. The proxied arms did record 12 upstream
+  TLS failures (`ssl3_read_bytes: bad record mac`), surfaced to Claude Code as 502 and retried
+  transparently: 2 on :3781, 5 on :3782, 5 on :3783. The control arms have no equivalent
+  instrumentation, so this is "the proxy saw 12" rather than "the proxy caused 12" — but three
+  proxies sharing a machine is the obvious suspect and a single-arm run should be checked against
+  it before the number is read as a property of the proxy.
+- The recall tools were absent (above). The tool list is part of the cached prefix, so these five
+  runs differ from §16–§18 by more than the proxy alone.
+- Wall clock is not comparable across arms here: five sessions shared one machine, and they
+  started 60s apart.
+- head3's list-price cost ($36.92) is well above the other four ($22.57–$23.75) on similar work.
+  Unexplained; noted rather than used.
+- The controls' peaks are not reporter-validated, because the reporter needs a proxy log. They
+  come from the same script whose max matched the reporter's peak exactly on all three proxied
+  arms (112,947 / 112,633 / 114,353).
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -668,6 +778,9 @@ decorated.
   identical work (425 vs 424 assistant turns, 263 vs 279 requests). Peak context is
   arithmetic and survives that; the wall-clock difference (26 vs 28.5 min) does not, and
   is not quoted above.
+- §19 is n=3 per arm and the first section with more than one control. It rules out §16–§17's
+  3-of-3 pattern; it does not measure a failure rate. Its five runs also lacked the recall tools,
+  which §16–§18's runs had — the section says so and says which way that cuts.
 - §17 is n=1 per arm, with the same nondeterminism: run 5 did more work than run 4 (588 vs
   556 turns) and went further into the task (clickhouse, cloudflare, docs, changesets). Peak,
   p90 and the eviction counts are arithmetic over what was actually sent and survive that;
@@ -704,6 +817,19 @@ ellipsis — and check the total against `InputValidationError` tool results in 
 transcript, which is the harness's own ground truth and matched exactly (11 and 3) on both runs.
 Dose is the count of distinct `call:` ids across the proxy log's `trip` entries, over `tool_use`
 blocks in the transcript. Ground-truth score: [eval/score.sh](../eval/score.sh).
+
+§19 is reproducible from `eval/run.sh` and `eval/score.sh` unchanged — five arms, `./run.sh
+control2 --no-proxy` and `ONEPASS_BASE_URL=http://localhost:378N ./run.sh headN` — plus the
+reporter for each proxied arm. Three things it needs that the earlier sections did not. Each proxy
+must start at least a second apart: the log filename is a millisecond timestamp with no env
+override, so simultaneous starts share one file and the arms become unattributable. A child
+`claude -p` launched from inside another Claude Code session inherits that session's `CLAUDE_*`
+and `ANTHROPIC_BASE_URL`, which silently routes a `--no-proxy` control through whatever the parent
+was pointed at; strip them. And the `by_owner_key` claim is settled by `git status` in each mastra
+worktree — whether the arm modified `stores/convex/src/server/index-map.ts` at all — before any
+transcript is read, because an arm that never opened the file cannot have had it evicted. Scoring
+the failing assertion by name needs the staged ground-truth tests run without `score.sh`'s own
+`tail -25`, which truncates the failure list.
 
 §16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
 ad-hoc script:
