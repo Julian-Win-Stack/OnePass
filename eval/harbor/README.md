@@ -11,6 +11,10 @@ and report **success unchanged, tokens down**. [Harbor](https://harborframework.
 the container-per-trial, install-the-real-CLI, run-it-N-times and score-it work, so none of that is
 hand-built here.
 
+**Picking this up to run it?** Start with [`HANDOFF-LOCAL.md`](HANDOFF-LOCAL.md) — the run plan,
+the credentials, the smoke gate, and what is still unverified. This file is the reference for what
+each knob is and why.
+
 Nothing in `proxy/src` changes for this. Everything under `eval/harbor/` is packaging: how the
 proxy gets into a trial container, how it is started, and how the two arms are read back.
 
