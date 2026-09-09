@@ -325,8 +325,9 @@ export function readTranscript(path: string, options: ReadOptions = {}): Branch 
   }
 
   // 2. The walk. Every entry type links, whatever it is, because the spine runs through entries
-  //    that are not conversation and dropping them here would snap the chain.
-  const walked = walk(byUuid, tipUuid);
+  //    that are not conversation and dropping them here would snap the chain. Parallel tool calls
+  //    fork the file, so the walk alone reaches only one of their results.
+  const walked = adoptParallelToolResults(byUuid, walk(byUuid, tipUuid));
 
   // 3. The filter, and only now.
   const turns = buildTurns(walked);
@@ -389,6 +390,78 @@ function walk(byUuid: Map<string, Entry>, tip: string): Entry[] {
     current = byUuid.get(parent);
   }
   return path.reverse();
+}
+
+/**
+ * The path, with the results of parallel tool calls put back on it.
+ *
+ * Claude Code writes one entry per content block, so an answer making two tool calls is two
+ * `assistant` entries — and it hangs the first call's result off the first entry as a childless
+ * leaf while the chain carries on through the second. The walk follows the chain, so it reaches
+ * the last call's result and no other. The request carried all of them: the API requires every
+ * `tool_use` to be answered in the message that follows it, and the model was shown every result.
+ *
+ * Ownership is what decides, not position. A result belongs on the path when the call it answers
+ * is on the path, wherever the parent links happen to have put the result itself.
+ *
+ * Adopted results are placed with the results already on the path rather than after the call that
+ * made them. Both satisfy the API, but only this one keeps the shape the session sent: one
+ * `assistant` message holding every call, one `user` message holding every result. Splitting them
+ * would double the assistant-message count of a parallel call, and the proxy's age gate is counted
+ * in assistant messages.
+ */
+function adoptParallelToolResults(byUuid: Map<string, Entry>, path: Entry[]): Entry[] {
+  const onPath = new Set<string>();
+  for (const entry of path) {
+    const uuid = stringOr(entry.uuid, null);
+    if (uuid !== null) onPath.add(uuid);
+  }
+
+  // Only the results the walk missed. One entry can answer several calls, so it is kept once.
+  const missedResults = new Map<string, Entry>();
+  for (const entry of byUuid.values()) {
+    const uuid = stringOr(entry.uuid, null);
+    if (uuid === null || onPath.has(uuid)) continue;
+    for (const id of blockIds(entry, "tool_result", "tool_use_id")) {
+      if (!missedResults.has(id)) missedResults.set(id, entry);
+    }
+  }
+  if (missedResults.size === 0) return path;
+
+  const adopted: Entry[] = [];
+  const taken = new Set<string>();
+  const rebuilt: Entry[] = [];
+  for (const entry of path) {
+    // The call run has ended, so its adopted results go in ahead of whatever answered on the path.
+    if (adopted.length > 0 && blockIds(entry, "tool_use", "id").length === 0) {
+      rebuilt.push(...adopted.splice(0));
+    }
+    rebuilt.push(entry);
+    for (const id of blockIds(entry, "tool_use", "id")) {
+      const result = missedResults.get(id);
+      const uuid = result === undefined ? null : stringOr(result.uuid, null);
+      if (result === undefined || uuid === null || taken.has(uuid)) continue;
+      taken.add(uuid);
+      adopted.push(result);
+    }
+  }
+  // A run whose every result was off the path leaves nothing on the path to sit in front of.
+  rebuilt.push(...adopted);
+  return rebuilt;
+}
+
+/** The `idKey` of every `type` block of an entry, in the order the entry stored them. */
+function blockIds(entry: Entry, type: string, idKey: string): string[] {
+  const content = messageContent(entry);
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content) {
+    const record = asRecord(block);
+    if (record?.type !== type) continue;
+    const id = stringOr(record[idKey], null);
+    if (id !== null) ids.push(id);
+  }
+  return ids;
 }
 
 /** Entries nothing else claims as a parent. One per abandoned rewind, plus the live tip. */

@@ -7,102 +7,90 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { extractCases, selectCases, TRIP_THRESHOLD_TOKENS } from "./cases.js";
-import type { CaseMessage } from "./messages.js";
-import { readTranscript, type Branch } from "./transcript.js";
+import { extractCases, selectCases, type PlanningCase } from "./cases.js";
+import type { Branch } from "./transcript.js";
 import {
+  branchOf,
   compactBoundary,
   compactSummary,
   model,
   synthetic,
   toolResult,
   typed,
-  writeTranscript,
-  type Line,
 } from "./transcriptFixture.js";
 
-function branchOf(lines: readonly Line[], tip: string): Branch {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "onepass-cases-")));
-  return readTranscript(writeTranscript(dir, "session.jsonl", lines), { tip });
-}
-
-/** Four chars a token, which is what the fake upstream's count-tokens answers too. */
-const byLength = async (messages: readonly CaseMessage[]): Promise<number> =>
-  Math.ceil(JSON.stringify(messages).length / 4);
-
-/** A message list of a size chosen by the caller, so a turn can be pushed over the threshold. */
-function counterOf(sizes: ReadonlyMap<string, number>, fallback = 10): (m: readonly CaseMessage[]) => Promise<number> {
-  return async (messages) => {
-    for (const [needle, tokens] of sizes) if (JSON.stringify(messages).includes(needle)) return tokens;
-    return fallback;
-  };
-}
-
-/** A branch whose turns can be pushed over the threshold one at a time by naming their text. */
+/** One turn under the threshold and two over it, each sized by what its answer reported. */
 function deepBranch(): Branch {
   return branchOf(
     [
       typed("u1", null, "shallow one"),
-      model("a1", "u1", { textOnly: true }),
+      model("a1", "u1", { textOnly: true, contextTokens: 40_000 }),
       typed("u2", "a1", "deep one"),
-      model("a2", "u2", { textOnly: false }),
+      model("a2", "u2", { textOnly: false, contextTokens: 150_000 }),
       toolResult("t2", "a2"),
-      model("a3", "t2", { textOnly: true }),
+      model("a3", "t2", { textOnly: true, contextTokens: 160_000 }),
       typed("u3", "a3", "deep two"),
-      model("a4", "u3", { textOnly: true }),
+      model("a4", "u3", { textOnly: true, contextTokens: 200_000 }),
     ],
     "a4",
   );
 }
 
-test("only turns past the trip threshold are cases; below it both arms would send the same bytes", async () => {
-  const branch = deepBranch();
-  const list = await extractCases(branch, counterOf(new Map([["deep two", 400_000]])), { overheadTokens: 0 });
+test("only turns past the trip threshold are cases; below it both arms would send the same bytes", () => {
+  const list = extractCases(deepBranch());
 
   assert.deepEqual(
     list.cases.map((planningCase) => planningCase.text),
-    ["deep two"],
+    ["deep one", "deep two"],
   );
   assert.equal(list.typedTurns, 3);
-  assert.equal(list.belowThreshold, 2);
-  assert.equal(list.thresholdTokens, TRIP_THRESHOLD_TOKENS);
+  assert.equal(list.belowThreshold, 1);
+  // Written out rather than imported: comparing the constant with itself would hold for any value
+  // it was ever changed to. It is the proxy's own trip threshold, which the eval can use directly
+  // now that a case's size is what the API reported rather than a rebuild that came out short.
+  assert.equal(list.thresholdTokens, 110_000);
 });
 
-test("the fixed system-and-tools overhead counts towards the threshold", async () => {
-  const branch = deepBranch();
-  const under = await extractCases(branch, counterOf(new Map([["deep two", 60_000]])), { overheadTokens: 0 });
-  const over = await extractCases(branch, counterOf(new Map([["deep two", 60_000]])), { overheadTokens: 54_000 });
+test("a case's size is what the turn that answered it reported being shown", () => {
+  const list = extractCases(deepBranch());
 
-  assert.equal(under.cases.length, 0, "60k of messages alone is under the threshold");
+  // 150,000 for `deep one` — the first model turn after it — not the 160,000 of the turn after
+  // that, which was shown the tool result the answer itself produced.
   assert.deepEqual(
-    over.cases.map((planningCase) => planningCase.prefixTokens),
-    [114_000],
-    "the same turn is over it once the system and tools are counted",
+    list.cases.map((planningCase) => planningCase.prefixTokens),
+    [150_000, 200_000],
   );
 });
 
-test("a compaction summary, a meta entry, a sidechain entry and a tool result are never cases", async () => {
+test("a compaction summary, a meta entry, a sidechain entry and a tool result are never cases", () => {
   const branch = branchOf(
     [
       typed("u1", null, "typed by me"),
       model("a1", "u1", { textOnly: false, contextTokens: 170_000 }),
       toolResult("t1", "a1"),
       model("a2", "t1", { textOnly: true, contextTokens: 172_000 }),
-      typed("m1", "a2", "injected by the harness", { isMeta: true }),
+      // The boundary itself is off the branch — it carries no parentUuid, only a logical one — but
+      // the summary it introduces is a plain user entry sitting *on* the chain, which is the whole
+      // reason it is dangerous. A fixture that hung it off the boundary would leave it unreachable
+      // from the tip, and this test would pass while the exclusion did nothing.
+      compactBoundary("c1", "a2"),
+      compactSummary("cs1", "a2"),
+      typed("m1", "cs1", "injected by the harness", { isMeta: true }),
       typed("s1", "m1", "a subagent's prompt", { isSidechain: true }),
       typed("u2", "s1", "typed by me again"),
-      model("a3", "u2", { contextTokens: 9_000 }),
-      compactBoundary("c1", "a2"),
-      compactSummary("cs1", "c1"),
+      model("a3", "u2", { contextTokens: 190_000 }),
     ],
     "a3",
   );
 
-  // Everything is over the threshold, so nothing is left out for being small.
-  const list = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
+  // Each excluded kind has to be reachable from the tip, or the exclusion is never exercised.
+  const { typed: typedTurns, meta, compactSummary: summaries, sidechain, toolResult: results } = branch.counts;
+  assert.deepEqual(
+    { typedTurns, meta, summaries, sidechain, results },
+    { typedTurns: 2, meta: 1, summaries: 1, sidechain: 1, results: 1 },
+  );
+
+  const list = extractCases(branch);
 
   assert.deepEqual(
     list.cases.map((planningCase) => planningCase.text),
@@ -117,18 +105,65 @@ test("a compaction summary, a meta entry, a sidechain entry and a tool result ar
   );
 });
 
-test("each case says whether its recorded answer used tools, and the groups are counted", async () => {
+test("a case past a compaction says its history opened with the summary, not the session start", () => {
+  const branch = branchOf(
+    [
+      typed("u1", null, "before"),
+      model("a1", "u1", { textOnly: true, contextTokens: 170_000 }),
+      compactBoundary("c1", "a1"),
+      // The summary hangs off the boundary's own root, which is where Claude Code writes it: it is
+      // never on the branch, and is found through the boundary rather than by walking the chain.
+      compactSummary("cs1", "c1"),
+      typed("u2", "a1", "after"),
+      model("a2", "u2", { textOnly: true, contextTokens: 190_000 }),
+    ],
+    "a2",
+  );
+
+  assert.deepEqual(
+    extractCases(branch).cases.map((one) => [one.text, one.opensWithCompactionSummary]),
+    [
+      ["before", false],
+      ["after", true],
+    ],
+  );
+});
+
+test("an entry Claude Code wrote in the user slot is never a case, however deep it sits", () => {
+  const branch = branchOf(
+    [
+      typed("u1", null, "typed by me"),
+      model("a1", "u1", { textOnly: true, contextTokens: 200_000 }),
+      typed("u2", "a1", "[Request interrupted by user]"),
+      model("a2", "u2", { textOnly: true, contextTokens: 210_000 }),
+      typed("u3", "a2", "<local-command-stdout>Compacted </local-command-stdout>"),
+      model("a3", "u3", { textOnly: true, contextTokens: 220_000 }),
+    ],
+    "a3",
+  );
+
+  const list = extractCases(branch);
+
+  assert.deepEqual(
+    list.cases.map((planningCase) => planningCase.text),
+    ["typed by me"],
+  );
+  assert.equal(list.typedTurns, 3);
+  assert.equal(list.notPrompts, 2, "the two are counted, not quietly dropped");
+});
+
+test("each case says whether its recorded answer used tools, and the groups are counted", () => {
   // The text-answered turn comes first on purpose. A label is what *this* turn's answer did, and
   // the answer ends at the next turn I typed; with the tool turn first, a rule that read on past
   // that boundary would still label every turn correctly and the fixture would prove nothing.
   const branch = branchOf(
     [
       typed("u1", null, "answered in text"),
-      model("a1", "u1", { textOnly: true }),
+      model("a1", "u1", { textOnly: true, contextTokens: 200_000 }),
       typed("u2", "a1", "answered with a tool"),
-      model("a2", "u2", { textOnly: false }),
+      model("a2", "u2", { textOnly: false, contextTokens: 210_000 }),
       toolResult("t1", "a2"),
-      model("a3", "t1", { textOnly: true }),
+      model("a3", "t1", { textOnly: true, contextTokens: 220_000 }),
       typed("u3", "a3", "interrupted before an answer"),
       synthetic("x1", "u3"),
       typed("u4", "x1", "the last thing typed"),
@@ -136,23 +171,36 @@ test("each case says whether its recorded answer used tools, and the groups are 
     "u4",
   );
 
-  const list = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
+  const list = extractCases(branch);
 
   assert.deepEqual(
     list.cases.map((planningCase) => [planningCase.text, planningCase.answer]),
     [
       ["answered in text", "text"],
       ["answered with a tool", "tools"],
-      ["interrupted before an answer", "none"],
-      ["the last thing typed", "none"],
     ],
   );
-  assert.deepEqual(list.answers, { tools: 1, text: 1, none: 2 });
+  assert.deepEqual(list.answers, { tools: 1, text: 1 });
+  // Nothing answered the last two, so there is no depth to read and nothing to compare a fork's
+  // answer against. A synthetic entry is an interrupt Claude Code wrote for itself, not an answer.
+  assert.equal(list.unanswered, 2);
 });
 
-test("cases are listed in session order, with the turn index they were cut at", async () => {
-  const branch = deepBranch();
-  const list = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
+test("cases are listed in session order, with the turn index they were cut at", () => {
+  const branch = branchOf(
+    [
+      typed("u1", null, "one"),
+      model("a1", "u1", { textOnly: true, contextTokens: 200_000 }),
+      typed("u2", "a1", "two"),
+      model("a2", "u2", { textOnly: false, contextTokens: 210_000 }),
+      toolResult("t2", "a2"),
+      model("a3", "t2", { textOnly: true, contextTokens: 215_000 }),
+      typed("u3", "a3", "three"),
+      model("a4", "u3", { textOnly: true, contextTokens: 220_000 }),
+    ],
+    "a4",
+  );
+  const list = extractCases(branch);
 
   // A turn index is an index into the branch's turns, not a count of the ones I typed: the model
   // turns and the tool result between them are turns of the branch too. The three typed turns of
@@ -166,48 +214,50 @@ test("cases are listed in session order, with the turn index they were cut at", 
     list.cases.map((planningCase) => planningCase.id),
     ["turn-0", "turn-2", "turn-6"],
   );
+  // The prompt index counts the prompts, so it is what a driver feeding them would count by.
   assert.deepEqual(
-    list.cases.map((planningCase) => planningCase.typedIndex),
-    [0, 1, 2],
+    list.cases.map((planningCase) => planningCase.promptIndex),
+    [1, 2, 3],
   );
 });
 
-test("quick mode takes every second eligible case; full mode takes all of them", async () => {
-  const branch = deepBranch();
-  const { cases } = await extractCases(branch, async () => 200_000, { overheadTokens: 0 });
-  assert.equal(cases.length, 3, "every typed turn of the fixture is over the threshold");
+/** Three eligible cases, so a mode that takes half of them takes a different set from all of them. */
+function eligibleCases(): readonly PlanningCase[] {
+  const { cases } = extractCases(
+    branchOf(
+      [
+        typed("u1", null, "one"),
+        model("a1", "u1", { textOnly: true, contextTokens: 200_000 }),
+        typed("u2", "a1", "two"),
+        model("a2", "u2", { textOnly: true, contextTokens: 210_000 }),
+        typed("u3", "a2", "three"),
+        model("a3", "u3", { textOnly: true, contextTokens: 220_000 }),
+      ],
+      "a3",
+    ),
+  );
+  assert.equal(cases.length, 3, "every prompt of the fixture is over the threshold");
+  return cases;
+}
 
+test("quick mode takes every second eligible case", () => {
   assert.deepEqual(
-    selectCases(cases, "quick").map((planningCase) => planningCase.typedIndex),
-    [0, 2],
+    selectCases(eligibleCases(), "quick").map((planningCase) => planningCase.promptIndex),
+    [1, 3],
   );
-  assert.equal(selectCases(cases, "full").length, 3);
-  assert.equal(selectCases(cases, "replay").length, 3, "replay is free, so it covers every case");
 });
 
-test("the overhead is read from the first model turn's usage when it is not given", async () => {
-  // Two model turns at different depths, because reading the wrong one is the mistake worth
-  // catching: the overhead is a property of the system prompt and the tools, which do not grow,
-  // and a later turn's usage is mostly the conversation by then.
-  const branch = branchOf(
-    [
-      typed("u1", null, "start"),
-      model("a1", "u1", { contextTokens: 54_000 }),
-      typed("u2", "a1", "next"),
-      model("a2", "u2", { contextTokens: 120_000 }),
-    ],
-    "a2",
+test("full mode takes every eligible case", () => {
+  assert.deepEqual(
+    selectCases(eligibleCases(), "full").map((planningCase) => planningCase.promptIndex),
+    [1, 2, 3],
   );
-
-  const list = await extractCases(branch, byLength);
-
-  // What the first model turn was shown, less the messages it was shown: 54,000 tokens reported,
-  // against a message list of one 60-character user message, which `byLength` prices at 15.
-  assert.equal(list.overheadTokens, 53_985);
 });
 
-test("a branch whose model turns report no usage cannot be sized, and says so", async () => {
+test("a branch whose model turns report no usage yields no case rather than a guessed one", () => {
   const branch = branchOf([typed("u1", null, "start"), synthetic("x1", "u1")], "x1");
 
-  await assert.rejects(extractCases(branch, byLength), /overhead/);
+  const list = extractCases(branch);
+  assert.deepEqual(list.cases, []);
+  assert.equal(list.unanswered, 1);
 });

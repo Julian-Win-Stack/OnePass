@@ -3,7 +3,8 @@
 // internal state would pass while the result document a stranger has to read said nothing.
 //
 // The one seam is the HTTP boundary to the model API: a fake upstream stands in for it, so a
-// whole run costs no key and no money.
+// whole run costs no key and no money. Replay does not even need that — it sends files off disk
+// through a proxy child that forwards to a fake of its own.
 
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { writeFileSync } from "node:fs";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
 import type { RunResult } from "./result.js";
 import { model, toolResult, typed, writeTranscript, type Line } from "./transcriptFixture.js";
@@ -53,10 +55,9 @@ function scratch(prefix: string): string {
 const TOOL_ANSWER_TURN = 5;
 
 /**
- * A planning session small enough to write here and deep enough to be worth replaying: one large
- * tool result, then enough turns after it that the proxy's age gate has let go of it. The fake
- * upstream counts four characters to the token, so 400,000 characters is a prefix past the
- * 110,000-token trip threshold.
+ * A planning session small enough to write here and deep enough to hold cases: one large tool
+ * result, then a run of turns whose answers report being shown well past the 110,000-token trip
+ * threshold. A case's size is what its answer reported, so the fixture sets those numbers directly.
  */
 function planningTranscript(): Line[] {
   const lines: Line[] = [
@@ -82,12 +83,51 @@ function planningTranscript(): Line[] {
   return lines;
 }
 
-/** A corpus with that session imported under the name a run reads its cases from. */
+/**
+ * One recorded request: the same conversation `turnsAfter` assistant turns on. The big tool result
+ * is resent in full every time, which is what Claude Code really does, so this is where the proxy
+ * has to re-stub what it has already taken rather than take it again.
+ */
+function recordedBody(turnsAfter: number): string {
+  const messages: unknown[] = [
+    { role: "user", content: [{ type: "text", text: "read the file" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "x".repeat(600_000) }] },
+  ];
+  for (let turn = 0; turn < turnsAfter; turn += 1) {
+    messages.push({ role: "assistant", content: [{ type: "text", text: `thinking about it, ${turn}` }] });
+    messages.push({ role: "user", content: [{ type: "text", text: `carry on, ${turn}` }] });
+  }
+  return JSON.stringify({ model: "claude-opus-5", max_tokens: 1_024, messages });
+}
+
+/** How many requests the fixture recording holds. */
+const RECORDED_REQUESTS = 12;
+
+/**
+ * A dump directory shaped the way the proxy leaves one: a file per request, named for the moment
+ * it arrived. The conversation deepens by one assistant turn each time, so the big tool result
+ * starts inside the proxy's age gate and comes out the far side of it partway through.
+ */
+function recordedSession(): string {
+  const dir = scratch("onepass-eval-dump-");
+  for (let index = 0; index < RECORDED_REQUESTS; index += 1) {
+    const stamp = `2026-09-08T23-23-${String(index).padStart(2, "0")}-000Z`;
+    const sequence = String(index + 1).padStart(6, "0");
+    writeFileSync(join(dir, `${stamp}_${sequence}_v1_messages.json`), recordedBody(index + 1), "utf8");
+  }
+  return dir;
+}
+
+/** A corpus with that session imported, and a recording for replay to send. */
 async function preparedCorpus(): Promise<string> {
   const dir = scratch("onepass-eval-corpus-");
   const source = writeTranscript(scratch("onepass-projects-"), "62d8de7e.jsonl", planningTranscript());
-  const run = await runCli(["import", source, "--name", "planning"], { env: { ONEPASS_EVAL_CORPUS: dir } });
-  assert.equal(run.code, 0, run.stderr);
+  const imported = await runCli(["import", source, "--name", "planning"], { env: { ONEPASS_EVAL_CORPUS: dir } });
+  assert.equal(imported.code, 0, imported.stderr);
+
+  const recorded = await runCli(["import-recordings", recordedSession()], { env: { ONEPASS_EVAL_CORPUS: dir } });
+  assert.equal(recorded.code, 0, recorded.stderr);
   return dir;
 }
 
@@ -101,14 +141,14 @@ interface RunOptions {
 async function runCli(args: string[], options: RunOptions = {}): Promise<Run & { results: string }> {
   const { env = {}, results = scratch("onepass-eval-results-") } = options;
   // Only a run writes a result document, so only a run is given somewhere to put one.
-  const isRun = !args.includes("--help") && args[0] !== "import";
+  const isRun = !["--help", "import", "import-recordings", "prompts"].some((one) => args.includes(one));
   const full = isRun ? [...args, "--results-dir", results] : [...args];
   try {
     const { stdout, stderr } = await execFileAsync(process.execPath, [cli, ...full], {
       env: {
         PATH: process.env.PATH,
         HOME: process.env.HOME,
-        ONEPASS_EVAL_CORPUS: corpus ?? scratch("onepass-eval-corpus-"),
+        ONEPASS_EVAL_CORPUS: corpus,
         ONEPASS_EVAL_CLAUDE_CODE_VERSION: "2.1.261",
         ONEPASS_EVAL_UPSTREAM: upstream.url,
         ...env,
@@ -154,13 +194,15 @@ test("a judge key in the environment around the run does not reach the proxy chi
   assert.equal(resultOf(run).proxy.judge, "off");
 });
 
-test("listing the cases costs nothing: the eval's own calls are count-tokens and no more", async () => {
+test("listing the cases costs nothing at all: the eval makes no call of its own", async () => {
   const before = upstream.requests.length;
   const run = await runCli(["quick"]);
   assert.equal(run.code, 0, run.stderr);
 
-  const paths = new Set(upstream.requests.slice(before).map((request) => request.url.split("?")[0]));
-  assert.deepEqual([...paths], ["/v1/messages/count_tokens"], "sizing a case must not sample a model");
+  // Not even a count-tokens call. A case is sized by what the model turn that answered it reported
+  // being shown, which is already in the transcript, so listing the cases needs no key and no
+  // network — and a run that started sizing again would show up here as a request nobody asked for.
+  assert.deepEqual(upstream.requests.slice(before), []);
 });
 
 test("quick mode takes every second eligible case, and says which ones it took", async () => {
@@ -168,12 +210,24 @@ test("quick mode takes every second eligible case, and says which ones it took",
   const selection = result.caseSelection;
   assert.ok(selection !== null);
 
-  assert.equal(selection.selected, Math.ceil(selection.eligible / 2));
+  // Counted off the fixture rather than recomputed from the answer: 13 turns typed, of which the
+  // first was answered at 54k and so is the only one under the threshold, leaving 12 eligible and
+  // every second one of those taken.
+  assert.deepEqual(
+    {
+      typedTurns: selection.typedTurns,
+      eligible: selection.eligible,
+      belowThreshold: selection.belowThreshold,
+      unanswered: selection.unanswered,
+      notPrompts: selection.notPrompts,
+    },
+    { typedTurns: 13, eligible: 12, belowThreshold: 1, unanswered: 0, notPrompts: 0 },
+  );
+  assert.equal(selection.selected, 6);
   assert.deepEqual(
     result.cases.filter((one) => one.selected).map((one) => one.id),
-    result.cases.filter((_, index) => index % 2 === 0).map((one) => one.id),
+    ["turn-4", "turn-8", "turn-12", "turn-18", "turn-22", "turn-26"],
   );
-  assert.equal(selection.eligible + selection.belowThreshold, selection.typedTurns);
 });
 
 test("the case list records the turn index, the prefix size and the tool label", async () => {
@@ -183,7 +237,7 @@ test("the case list records the turn index, the prefix size and the tool label",
   // The fixture answers one turn with a tool and every other in text, so the list has to hold both
   // groups and put the `tools` label on the right turn. A run that labelled them all the same, or
   // labelled the wrong one, would still be a list of twelve plausible cases.
-  assert.deepEqual(result.caseSelection?.answers, { tools: 1, text: 11, none: 0 });
+  assert.deepEqual(result.caseSelection?.answers, { tools: 1, text: 11 });
   assert.deepEqual(
     result.cases.map((one) => one.answer),
     ["text", "text", "text", "text", "tools", "text", "text", "text", "text", "text", "text", "text"],
@@ -201,8 +255,22 @@ test("the case list records the turn index, the prefix size and the tool label",
 
   // Every mode prints the list, not only replay: a scored run is about to spend money on these
   // turns and the person starting it should see which ones without waiting for the document.
-  assert.match(run.stdout, /turn-4\s+154k\s+text/);
-  assert.match(run.stdout, /turn-12\s+154k\s+tools/, "the tool label is printed, not only recorded");
+  assert.match(run.stdout, /turn-4\s+131k\s+text/);
+  assert.match(run.stdout, /turn-12\s+135k\s+tools/, "the tool label is printed, not only recorded");
+});
+
+test("the progress lines and the result document count the cases the same way", async () => {
+  const run = await runCli(["full"]);
+
+  // Counted by hand from the fixture session: 13 prompts, and the first was answered at 54k so it
+  // sits under the threshold. The threshold is the proxy's own 110k, which the eval can use
+  // directly now that a case is sized by what the API reported rather than by a rebuild. A run
+  // states these counts twice — once to whoever started it, once to whoever reads the committed
+  // document later — and the two being written in different places is how they come to disagree.
+  const counted = "12 of 13 prompts are past the 110k trip threshold";
+  assert.ok(run.stdout.includes(counted), `progress lines do not say "${counted}":\n${run.stdout}`);
+  const table = readFileSync(join(run.results, `${resultOf(run).label}.md`), "utf8");
+  assert.ok(table.includes(counted), `the document does not say "${counted}":\n${table}`);
 });
 
 test("what I typed is printed but never recorded: a result document is committed", async () => {
@@ -245,51 +313,120 @@ test("the result names the control baseline for both kinds of arm", async () => 
   assert.equal(result.baselines[0]?.directory, "claude-opus-5--xhigh--cc2.1.261");
 });
 
-test("replay serves its own upstream to the children, is not scored, and needs no baseline", async () => {
-  // No Claude Code version: the check run after every proxy fix has to work with nothing set up
-  // but a corpus.
-  const before = upstream.requests.length;
-  const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
-  assert.equal(run.code, 0, run.stderr);
+/**
+ * One replay run, shared by the three tests below that each ask a different question of it. Run
+ * with no Claude Code version set, because the check run after every proxy fix has to work with
+ * nothing set up but a corpus.
+ *
+ * Shared because a replay run costs about a second, and these three read the run rather than
+ * changing it — but they stay three tests, because "the children get their own upstream" failing
+ * and "the run is not scored" failing are different bugs and should be different red lines.
+ */
+let versionlessReplay: { result: RunResult; upstreamPathsDuring: string[] } | null = null;
 
-  const result = resultOf(run);
-  assert.equal(result.scored, false);
+async function replayWithoutAVersion(): Promise<{ result: RunResult; upstreamPathsDuring: string[] }> {
+  if (versionlessReplay === null) {
+    const before = upstream.requests.length;
+    const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CLAUDE_CODE_VERSION: "" } });
+    assert.equal(run.code, 0, run.stderr);
+    versionlessReplay = {
+      result: resultOf(run),
+      upstreamPathsDuring: upstream.requests.slice(before).map((request) => request.url.split("?")[0]),
+    };
+  }
+  return versionlessReplay;
+}
+
+test("replay serves the child an upstream of its own and never reaches the network", async () => {
+  const { result, upstreamPathsDuring } = await replayWithoutAVersion();
+
   assert.match(result.upstream, /^http:\/\/127\.0\.0\.1:\d+$/, "replay must not reach the real API");
-  assert.notEqual(result.upstream, upstream.url, "the children forward to replay's own fake, not the run's");
+  assert.notEqual(result.upstream, upstream.url, "the child forwards to replay's own fake, not the run's");
+  assert.deepEqual(upstreamPathsDuring, [], "a replay makes no call outside its own fake");
+});
 
-  // Two upstreams, and only the children's is replay's own. The eval's own sizing calls still go
-  // to the run's upstream — which is the real API outside a test — because a replay that measured
-  // its cases against a fake would not be listing the cases a scored run covers.
-  const paths = upstream.requests.slice(before).map((request) => request.url.split("?")[0]);
-  assert.deepEqual([...new Set(paths)], ["/v1/messages/count_tokens"], "the run's upstream sized the cases");
+test("a replay run is not scored", async () => {
+  const { result } = await replayWithoutAVersion();
+  assert.equal(result.scored, false);
+});
 
+test("a replay run needs no baseline to compare against", async () => {
+  const { result } = await replayWithoutAVersion();
   assert.deepEqual(result.baselines, [], "replay has no control to compare against");
 });
 
-test("replay pushes every case through a proxy child and reports what came out", async () => {
+test("replay sends every recorded request through one proxy child and reports what came out", async () => {
   const run = await runCli(["replay"]);
   assert.equal(run.code, 0, run.stderr);
   const result = resultOf(run);
 
   const replay = result.replay;
   assert.ok(replay !== null, "a replay run reports a replay");
-  assert.equal(replay.outcomes.length, result.cases.length, "replay is free, so it covers every case");
-  assert.ok(replay.totals.trips > 0, "every case is past the threshold, so every case trips");
-  assert.ok(replay.totals.segmentsEvicted > 0, `nothing was evicted: ${JSON.stringify(replay.totals)}`);
+  assert.equal(replay.outcomes.length, RECORDED_REQUESTS, "replay is free, so it sends the whole recording");
+  assert.deepEqual(replay.recording, {
+    name: "planning",
+    dir: join(result.corpusDir, "recordings", "planning"),
+    requests: RECORDED_REQUESTS,
+    messages: RECORDED_REQUESTS,
+    countTokens: 0,
+  });
+
+  // The state carried across the sequence, which is the whole reason there is one child. The tool
+  // result is inside the proxy's age gate at first — too few assistant turns have followed it — and
+  // once it is old enough it is taken **once**. Every request after that re-stubs it rather than
+  // taking it again, which a fresh child per request could not show.
+  const took = replay.outcomes.filter((one) => one.newlyEvicted > 0).map((one) => one.id);
+  assert.equal(took.length, 1, `taken on ${took.join(", ")}: a block is evicted once and stays evicted`);
+  assert.equal(replay.totals.newlyEvicted, 1);
   assert.ok(
-    replay.totals.forwardedBytes < replay.totals.sentBytes,
-    "the proxy forwarded no less than it was given",
+    replay.totals.stubbed > 1,
+    `stubbed ${replay.totals.stubbed}: every request after the first re-sends the stub`,
   );
 
-  // The forwarded bodies are session content, so they live in the corpus and not in the repository.
-  const body = replay.outcomes.find((one) => one.segmentsEvicted > 0)?.bodyPath;
-  assert.ok(body !== undefined && body.startsWith(result.corpusDir), `${body} is not under the corpus`);
-  assert.ok(readFileSync(body, "utf8").includes("[onepass: evicted"));
+  // Over the line with nothing eligible: the requests before the tool result aged out. Counting
+  // the proxy's trip entries reads these as small quiet requests, which is the opposite of what
+  // happened, so replay counts them in their own right.
+  assert.ok(
+    replay.totals.overThresholdNothingEvicted > 0,
+    "the fixture's early requests are over the threshold with nothing old enough to take",
+  );
+  assert.equal(
+    replay.totals.overThresholdNothingEvicted,
+    replay.outcomes.filter((one) => one.overThreshold && one.newlyEvicted === 0).length,
+  );
+
+  // The forwarded bodies are session content, so they live in the corpus and not in the repository
+  // — and only for the requests the report covers, since a whole session's worth would be gigabytes.
+  const stubbed = replay.outcomes.find((one) => one.stubbed > 0 && one.bodyPath !== null);
+  assert.ok(stubbed?.bodyPath != null && stubbed.bodyPath.startsWith(result.corpusDir), `${stubbed?.bodyPath} is not under the corpus`);
+  assert.ok(readFileSync(stubbed.bodyPath, "utf8").includes("[onepass: evicted"));
 
   const table = readFileSync(join(run.results, `${result.label}.md`), "utf8");
   assert.match(table, /## Cases/);
   assert.match(table, /## Replay/);
-  assert.match(run.stdout, /replay 1\/\d+ {2}turn-\d+/, "replay lists each case as it goes");
+  assert.match(table, /### The \d+ deepest requests/);
+  assert.match(table, /over it with nothing evicted/);
+  assert.match(run.stdout, /replay \d+\/12 {2}req-\d+/, "replay says where it has got to");
+});
+
+test("the report covers the deepest requests, and the JSON holds every one of them", async () => {
+  const result = resultOf(await runCli(["replay"]));
+  const replay = result.replay;
+  assert.ok(replay !== null);
+
+  // Twelve recorded, thirty reported on: fewer than the cap, so every one is in the table. What is
+  // pinned here is that the two are separate — the sequence is what the diff is over, the subset is
+  // what a person reads — and that only the reported ones keep a body.
+  assert.equal(replay.reported.length, RECORDED_REQUESTS);
+  assert.equal(
+    replay.outcomes.filter((one) => one.bodyPath !== null).length,
+    replay.reported.length,
+  );
+  assert.deepEqual(
+    replay.outcomes.map((one) => one.position),
+    Array.from({ length: RECORDED_REQUESTS }, (_, index) => index + 1),
+    "the sequence is reported in the order the session sent it",
+  );
 });
 
 test("a second replay of the same build diffs against the first and finds nothing moved", async () => {
@@ -299,9 +436,57 @@ test("a second replay of the same build diffs against the first and finds nothin
 
   const diff = second.replay?.diff;
   assert.equal(diff?.comparedWith, first.label);
-  assert.deepEqual(diff?.changes, [], "the same build on the same cases has to come out the same");
+  assert.deepEqual(diff?.changes, [], "the same build on the same recording has to come out the same");
   assert.equal(diff?.unchanged, second.replay?.outcomes.length);
-  assert.deepEqual(second.problems, [], "an unchanged case list is not a problem");
+});
+
+test("a replay refuses when nothing has been recorded, and says how to record one", async () => {
+  const bare = scratch("onepass-eval-corpus-");
+  const source = writeTranscript(scratch("onepass-projects-"), "62d8de7e.jsonl", planningTranscript());
+  const imported = await runCli(["import", source, "--name", "planning"], { env: { ONEPASS_EVAL_CORPUS: bare } });
+  assert.equal(imported.code, 0, imported.stderr);
+
+  const run = await runCli(["replay"], { env: { ONEPASS_EVAL_CORPUS: bare } });
+  assert.equal(run.code, 1);
+  assert.match(run.stderr, /no recording filed under planning/);
+  assert.match(run.stderr, /record\.sh/);
+});
+
+test("import-recordings files the bodies and says how many, how deep, and of what kind", async () => {
+  const dir = scratch("onepass-eval-corpus-");
+  const run = await runCli(["import-recordings", recordedSession()], { env: { ONEPASS_EVAL_CORPUS: dir } });
+
+  assert.equal(run.code, 0, run.stderr);
+  assert.match(run.stdout, /Recorded requests: 12/);
+  assert.match(run.stdout, /a model answered\s+12/);
+  assert.match(run.stdout, /counted only\s+0/);
+  assert.match(run.stdout, /biggest body\s+[\d,]+ bytes/);
+  assert.equal(existsSync(join(realpathSync(dir), "recordings", "planning.import.json")), true);
+});
+
+test("prompts writes the session's prompts to a directory, and leaves out what nobody typed", async () => {
+  const dir = scratch("onepass-eval-corpus-");
+  const source = writeTranscript(scratch("onepass-projects-"), "62d8de7e.jsonl", [
+    typed("u1", null, "plan the work"),
+    model("a1", "u1", { contextTokens: 120_000 }),
+    typed("u2", "a1", "[Request interrupted by user]"),
+    typed("u3", "u2", "carry on"),
+  ]);
+  const imported = await runCli(["import", source, "--name", "planning"], { env: { ONEPASS_EVAL_CORPUS: dir } });
+  assert.equal(imported.code, 0, imported.stderr);
+
+  const out = join(scratch("onepass-eval-prompts-"), "prompts");
+  const run = await runCli(["prompts", out], { env: { ONEPASS_EVAL_CORPUS: dir } });
+  assert.equal(run.code, 0, run.stderr);
+
+  // A file per prompt, named so that name order is session order, and each holding the text field
+  // exactly. A driver feeds these with `claude -p < file`, so anything that reworded one would be
+  // recording a session nobody had.
+  assert.equal(readFileSync(join(out, "0001.txt"), "utf8"), "plan the work");
+  assert.equal(readFileSync(join(out, "0002.txt"), "utf8"), "carry on");
+  assert.equal(existsSync(join(out, "0003.txt")), false, "the interrupt notice is not a prompt");
+  assert.match(run.stdout, /prompts to feed\s+2/);
+  assert.match(run.stdout, /interrupted\s+1/);
 });
 
 test("session content has a home under the corpus, and the result document is not in the repository", async () => {
@@ -310,7 +495,7 @@ test("session content has a home under the corpus, and the result document is no
   const result = resultOf(run);
 
   assert.equal(result.corpusDir, realpathSync(own));
-  for (const name of ["transcripts", "baselines", "worktrees", "hand-labels", "runs"]) {
+  for (const name of ["transcripts", "baselines", "worktrees", "hand-labels", "recordings", "runs"]) {
     assert.ok(existsSync(join(result.corpusDir, name)), `the corpus has no ${name}`);
   }
   assert.ok(existsSync(join(result.corpusDir, "runs", result.label)), "the run has nowhere to put session content");

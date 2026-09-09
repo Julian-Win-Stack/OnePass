@@ -6,8 +6,10 @@
 // the same uuid, a spine running through entries that are not conversation, a compaction written
 // as a root of its own, and entry types from a Claude Code version that did not exist yet.
 
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readTranscript, type Branch } from "./transcript.js";
 
 export type Line = Record<string, unknown>;
 
@@ -46,11 +48,13 @@ export function typed(uuid: string, parentUuid: string | null, text: string, ext
 export interface ToolResultOptions extends Common {
   /** How big the result is. A case only trips the proxy when its prefix is large. */
   chars?: number;
+  /** The call this answers. Set it to pair a result with a `model` entry's `toolUseId`. */
+  toolUseId?: string;
 }
 
 /** A `user` entry carrying tool results back to the model. */
 export function toolResult(uuid: string, parentUuid: string | null, extra: Line & ToolResultOptions = {}): Line {
-  const { chars, ...rest } = extra;
+  const { chars, toolUseId, ...rest } = extra;
   return {
     ...common(extra),
     type: "user",
@@ -58,7 +62,13 @@ export function toolResult(uuid: string, parentUuid: string | null, extra: Line 
     parentUuid,
     message: {
       role: "user",
-      content: [{ type: "tool_result", tool_use_id: `tool-${uuid}`, content: chars === undefined ? "ok" : "x".repeat(chars) }],
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId ?? `tool-${uuid}`,
+          content: chars === undefined ? "ok" : "x".repeat(chars),
+        },
+      ],
     },
     ...rest,
   };
@@ -73,12 +83,14 @@ export interface ModelOptions extends Common {
   textOnly?: boolean;
   /** True when the turn belongs to a subagent's conversation rather than the user's. */
   isSidechain?: boolean;
+  /** The id of the `tool_use` block, for pairing it with the `toolResult` that answers it. */
+  toolUseId?: string;
 }
 
 export function model(uuid: string, parentUuid: string | null, options: ModelOptions = {}): Line {
   const context = options.contextTokens ?? 1_000;
   const content = options.textOnly === false
-    ? [{ type: "tool_use", id: `tool-${uuid}`, name: "Read", input: { file_path: "/tmp/a" } }]
+    ? [{ type: "tool_use", id: options.toolUseId ?? `tool-${uuid}`, name: "Read", input: { file_path: "/tmp/a" } }]
     : [{ type: "text", text: "answer" }];
   return {
     ...common(options),
@@ -179,4 +191,14 @@ export function writeTranscript(dir: string, name: string, lines: readonly Line[
   const path = join(dir, name);
   writeFileSync(path, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
   return path;
+}
+
+/**
+ * The branch these lines hold, read the way a run reads one: written to a real file and walked
+ * back from `tip`. The reader takes a path and nothing else, so a fixture that skipped the file
+ * would be testing a function that does not exist.
+ */
+export function branchOf(lines: readonly Line[], tip: string): Branch {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "onepass-fixture-")));
+  return readTranscript(writeTranscript(dir, "session.jsonl", lines), { tip });
 }

@@ -39,10 +39,11 @@ export interface CannedToolCall {
 }
 
 /**
- * A canned assistant turn: the text it ends on, or the tools it calls. A turn may call more than
- * one at a time, which is what a model does when it asks for two files at once.
+ * A canned assistant turn: the text it ends on, or the tools it calls. Always a list, even for the
+ * one call that is the common case — a second spelling for a single call buys nothing and leaves
+ * every reader of a script checking which one it used.
  */
-export type CannedTurn = ({ say: string } | { call: string; input?: unknown } | { calls: CannedToolCall[] }) & {
+export type CannedTurn = ({ say: string } | { calls: CannedToolCall[] }) & {
   /**
    * What the turn reports as usage. The real API decides these and a caller cannot make it hit or
    * miss on demand, so a fake that always says zero can only ever test the miss. `input` defaults
@@ -136,34 +137,34 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
 }
 
 function message(turn: CannedTurn, nextToolUseId: () => string, inputTokens: number): unknown {
-  const calls = toolCallsOf(turn);
-  const said = "say" in turn ? turn.say : "";
+  const talking = "say" in turn;
   const content =
-    calls === null ?
-      [{ type: "text", text: said }]
-    : calls.map((call) => ({ type: "tool_use", id: nextToolUseId(), name: call.name, input: call.input ?? {} }));
-  const spoken = calls === null ? said : JSON.stringify(content);
+    talking ?
+      [{ type: "text", text: turn.say }]
+    : turn.calls.map((call) => ({ type: "tool_use", id: nextToolUseId(), name: call.name, input: call.input ?? {} }));
   return {
     id: "msg_fake",
     type: "message",
     role: "assistant",
     model: "fake-upstream",
     content,
-    stop_reason: calls === null ? "end_turn" : "tool_use",
-    usage: {
-      input_tokens: turn.usage?.input ?? inputTokens,
-      cache_creation_input_tokens: turn.usage?.cacheCreation ?? 0,
-      cache_read_input_tokens: turn.usage?.cacheRead ?? 0,
-      output_tokens: Math.max(1, Math.ceil(spoken.length / 4)),
-    },
+    stop_reason: talking ? "end_turn" : "tool_use",
+    usage: usageOf(turn, inputTokens, talking ? turn.say : JSON.stringify(content)),
   };
 }
 
-/** The tools `turn` calls, or null when it is text. */
-function toolCallsOf(turn: CannedTurn): CannedToolCall[] | null {
-  if ("calls" in turn) return turn.calls;
-  if ("call" in turn) return [{ name: turn.call, input: turn.input }];
-  return null;
+/**
+ * The usage an answer reports. Split out from the body because a streamed answer carries a usage
+ * and no content blocks, and building a whole message to reach into it for one field meant handing
+ * `message` a tool-use id generator it could never call.
+ */
+function usageOf(turn: CannedTurn, inputTokens: number, spoken: string): Record<string, number> {
+  return {
+    input_tokens: turn.usage?.input ?? inputTokens,
+    cache_creation_input_tokens: turn.usage?.cacheCreation ?? 0,
+    cache_read_input_tokens: turn.usage?.cacheRead ?? 0,
+    output_tokens: Math.max(1, Math.ceil(spoken.length / 4)),
+  };
 }
 
 function json(response: http.ServerResponse, status: number, value: unknown): void {
@@ -174,8 +175,8 @@ function json(response: http.ServerResponse, status: number, value: unknown): vo
 /** The proxy reads usage out of `message_start`, so a streamed answer has to carry one. */
 function streamedMessage(response: http.ServerResponse, text: string, inputTokens: number): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
-  const started = message({ say: text }, () => "", inputTokens) as { usage: unknown };
-  response.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: started.usage } })}\n\n`);
+  const usage = usageOf({ say: text }, inputTokens, text);
+  response.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage } })}\n\n`);
   response.write(
     `event: content_block_delta\ndata: ${JSON.stringify({
       type: "content_block_delta",

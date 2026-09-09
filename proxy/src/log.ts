@@ -28,6 +28,13 @@ export interface RequestLogEntry {
   rebuild?: RebuildKind;
   estimatedTokensBefore?: number;
   estimatedTokensSent?: number;
+  /**
+   * The projected size crossed the trip threshold. Written whatever came of it, including when
+   * nothing was eligible and nothing was evicted — which is the failure worth seeing, and the one
+   * a reader cannot infer from the absence of a `trip` entry, since those are only written when
+   * something was actually evicted.
+   */
+  overThreshold?: boolean;
   stubbedResultCount?: number;
   newlyEvictedCount?: number;
   /** Chars-per-token ratio used for this request's token estimates (calibrated from API usage). */

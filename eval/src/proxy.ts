@@ -26,7 +26,15 @@ export interface ProxyBuild {
   entry: string;
   /** The repository's short SHA at the time of the build. */
   shortSha: string;
-  /** Uncommitted changes under `proxy/`, which make the short SHA a lie about what ran. */
+  /**
+   * Uncommitted changes anywhere in the repository, which make the short SHA a lie about what ran.
+   *
+   * The whole repository, not just `proxy/`. The eval decides what is replayed as surely as the
+   * proxy decides what is evicted, and three result documents in `eval/results` say build `3d1bb98`
+   * and `dirty: false` while having been produced by three different versions of the eval — one of
+   * which changed the case threshold. A label that only watches `proxy/` is a claim about what ran
+   * that is not true.
+   */
   dirty: boolean;
   /** The version the built proxy reports for itself. */
   version: string;
@@ -69,7 +77,7 @@ export async function buildProxyUnderTest(repoRoot: string): Promise<ProxyBuild>
   }
   const entry = join(dir, "dist", "main.js");
   const version = (await execFileAsync(process.execPath, [entry, "--version"], { encoding: "utf8" })).stdout.trim();
-  return { dir, entry, shortSha: shortSha(repoRoot), dirty: hasUncommittedProxyChanges(repoRoot), version };
+  return { dir, entry, shortSha: shortSha(repoRoot), dirty: hasUncommittedChanges(repoRoot), version };
 }
 
 /**
@@ -210,9 +218,9 @@ function shortSha(repoRoot: string): string {
   return git(repoRoot, ["rev-parse", "--short", "HEAD"]).trim();
 }
 
-/** Tracked or untracked changes under `proxy/`: what makes the built dist differ from the SHA. */
-function hasUncommittedProxyChanges(repoRoot: string): boolean {
-  return git(repoRoot, ["status", "--porcelain", "--", "proxy"]).trim() !== "";
+/** Tracked or untracked changes anywhere: what makes the run differ from the SHA in its label. */
+function hasUncommittedChanges(repoRoot: string): boolean {
+  return git(repoRoot, ["status", "--porcelain"]).trim() !== "";
 }
 
 function git(repoRoot: string, args: string[]): string {
