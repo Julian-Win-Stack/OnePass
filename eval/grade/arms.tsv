@@ -1,0 +1,15 @@
+# Step 1's five finished repos, and the opaque name each is copied to before a grader sees it.
+# `mastra-head1` beside `mastra-control2` tells a grader which side is which from the path alone,
+# so the token is what gets attached. The mapping is not secret — it is just never in the call.
+#
+# arm	token	repo (under $GRADE_MATERIAL)
+control2	q2md	mastra-control2
+control3	kx7f	mastra-control3
+head1	w1jy	mastra-head1
+head2	m6hs	mastra-head2
+head3	r5ct	mastra-head3
+#
+# control2b is a second, byte-identical copy of control2 under a different token. It exists so
+# a pair can show the grader the same change on both sides: if that does not come out Yes/Yes,
+# the grader cannot say "these are equivalent" and every preference it reports is manufactured.
+control2b	z8vn	mastra-control2

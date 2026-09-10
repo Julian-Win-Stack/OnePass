@@ -1,0 +1,26 @@
+# Step 1's eight pairs, and the draw of which arm is shown as A in the first call. Both
+# orderings are always run, so the draw decides presentation order only, never what is compared.
+# Drawn once with python random.seed(20260909); reproduce it before changing a row.
+#
+# pair	kind	call1_A	call1_B
+p1	proxied vs control	head1	control2
+p2	proxied vs control	head1	control3
+p3	proxied vs control	control2	head2
+p4	proxied vs control	head2	control3
+p5	proxied vs control	control2	head3
+p6	proxied vs control	control3	head3
+p7	noise floor	control3	control2
+p8	same-condition, proxied	head1	head3
+#
+# p9 and p10 are the positive control. The ground-truth tests already rank head2 last of the
+# five: 62/65, and it never opened stores/convex/src/server/index-map.ts. That ranking comes
+# from running tests, not from the grader, so asking the grader to place head2 against the two
+# other proxied arms asks it a question whose answer is already known from outside it.
+# Drawn with python random.seed(20260910); reproduce it before changing a row.
+p9	positive control (head2)	head2	head1
+p10	positive control (head2)	head2	head3
+#
+# p11 shows the grader the same change on both sides (control2b is a byte-identical copy of
+# control2 under another token). It must come out Yes/Yes. No pair in p1–p8 did, so this is
+# the test that the grader can say "same" at all.
+p11	self-pair	control2	control2b
