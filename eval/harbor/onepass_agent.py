@@ -11,6 +11,14 @@ added:
 * ``run()`` — start ``onepass-proxy`` on 127.0.0.1 inside the container, then let the stock
   ``run()`` launch ``claude -p`` exactly as it would otherwise. The base URL is injected through
   ``_resolve_auth_env()``, which is the one place the stock agent decides where the CLI points.
+* ``run()`` also tars ``/app`` into ``/logs/agent`` twice, once before the agent starts and once
+  after it exits. Harbor collects nothing of the working directory itself, so without this the
+  code the agent wrote dies with the container and only the transcript survives.
+
+``onepass_proxy=false`` turns the first two off and leaves the third, which is what
+``OnepassClaudeCodeControl`` at the bottom of this file is: stock Claude Code, talking straight to
+the API, capturing its work the same way. The control arm has to run through this class to get
+that capture, because Harbor's own ``claude-code`` agent cannot be changed.
 
 The proxy is per container by construction, which is what the design needs: ``proxy/src/server.ts``
 keeps one evicted-id set and one chars-per-token calibration per process, so two sessions must
@@ -57,7 +65,24 @@ PROXY_STDOUT = f"{AGENT_LOGS}/onepass-proxy.stdout.log"
 PROXY_BODY_DIR = f"{PROXY_LOG_DIR}/bodies"
 BUILD_RECORD = f"{AGENT_LOGS}/onepass-build.txt"
 
+# The task's working directory. Harbor puts every Terminal-Bench task here and Claude Code runs
+# with it as its cwd; the session logs of the first pass carry `"cwd":"/app"` on all 20 trials.
+WORKDIR = "/app"
+SNAPSHOT_BEFORE = f"{AGENT_LOGS}/onepass-workdir-before.tar.gz"
+SNAPSHOT_AFTER = f"{AGENT_LOGS}/onepass-workdir-after.tar.gz"
+# One line per snapshot: what was taken, how big, or why nothing was. Read this before concluding
+# a tarball is missing because the agent wrote nothing.
+SNAPSHOT_NOTE = f"{AGENT_LOGS}/onepass-workdir-snapshots.txt"
+# A ceiling on one tarball, because everything under /logs/agent is downloaded to the host: a task
+# that leaves a few GB in /app would otherwise pull that down once per trial, twice per trial with
+# both snapshots. Over the cap the archive is dropped and the reason recorded, which loses the
+# code — so the cap is set high enough that hitting it is a decision worth a human, and
+# `onepass_snapshot_max_mb=0` removes it.
+DEFAULT_SNAPSHOT_MAX_MB = 2048
+
 PROXY_READY_TIMEOUT_SEC = 60
+# Compressing a large working directory is slow, and this runs twice per trial.
+SNAPSHOT_TIMEOUT_SEC = 900
 
 
 def _int_kwarg(value: Any, name: str, default: int) -> int:
@@ -117,6 +142,9 @@ class OnepassClaudeCode(ClaudeCode):
         onepass_protect_last_turns: Any = None,
         onepass_min_saved_chars: Any = None,
         onepass_capture_bodies: Any = None,
+        onepass_proxy: Any = None,
+        onepass_snapshot_workdir: Any = None,
+        onepass_snapshot_max_mb: Any = None,
         **kwargs,
     ):
         # Popped before super(), which forwards unknown kwargs to BaseAgent and would reject them.
@@ -130,6 +158,19 @@ class OnepassClaudeCode(ClaudeCode):
         # Capture every body the proxy is handed, for replay. Off unless asked for: it is not
         # part of the measurement, and the bodies are the session in the clear.
         self._capture_bodies = _bool_kwarg(onepass_capture_bodies, "onepass_capture_bodies", False)
+        # False makes this the control arm: no clone, no build, no proxy, and the CLI left pointed
+        # at whatever the stock agent resolves. Everything else — install order, model routing,
+        # the workdir snapshots — stays identical, which is the point of running the control
+        # through this class rather than through Harbor's own agent.
+        self._proxy_enabled = _bool_kwarg(onepass_proxy, "onepass_proxy", True)
+        # On by default, and in both arms. A trial's container is deleted when it finishes, so a
+        # snapshot not taken is a snapshot that cannot be taken later.
+        self._snapshot_workdir = _bool_kwarg(
+            onepass_snapshot_workdir, "onepass_snapshot_workdir", True
+        )
+        self._snapshot_max_mb = _int_kwarg(
+            onepass_snapshot_max_mb, "onepass_snapshot_max_mb", DEFAULT_SNAPSHOT_MAX_MB
+        )
         # None means "leave the proxy's own default alone", so the eval only ever states the
         # knobs it actually moved.
         self._evict_after_turns = (
@@ -148,6 +189,15 @@ class OnepassClaudeCode(ClaudeCode):
             else _int_kwarg(onepass_min_saved_chars, "onepass_min_saved_chars", 50)
         )
         super().__init__(logs_dir, *args, **kwargs)
+        if self._capture_bodies and not self._proxy_enabled:
+            # Downgraded rather than rejected. Body capture is a proxy feature, and the runner
+            # exports one capture setting for the whole experiment: an arm that cannot honour it
+            # must say so and carry on, not fail every trial in the run.
+            self._capture_bodies = False
+            self.logger.warning(
+                "onepass: onepass_capture_bodies is ignored with onepass_proxy=false — the bodies "
+                "are what the proxy is handed, and there is no proxy in this arm"
+            )
 
     @property
     def proxy_base_url(self) -> str:
@@ -168,6 +218,9 @@ class OnepassClaudeCode(ClaudeCode):
         control (docs/findings.md §11).
         """
         env = super()._resolve_auth_env()
+        if not self._proxy_enabled:
+            # The control arm's whole definition: the stock resolution, untouched.
+            return env
         env["ANTHROPIC_BASE_URL"] = self.proxy_base_url
         env["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"] = "1"
         return env
@@ -199,12 +252,27 @@ class OnepassClaudeCode(ClaudeCode):
                 f"chmod -R a+rX {ONEPASS_ROOT}",
                 # One file that says exactly what got built, collected with the run.
                 f"mkdir -p {AGENT_LOGS}",
-                f"{{ echo \"repo_url={self._repo_url}\";"
+                f'{{ echo "proxy=on";'
+                f' echo "repo_url={self._repo_url}";'
                 f' echo "ref={self._ref}";'
                 f' echo "commit=$(git -C {REPO_DIR} rev-parse HEAD)";'
                 f' echo "node=$({NODE_BIN} --version)";'
                 f' echo "proxy_version=$({NODE_BIN} {PROXY_ENTRY} --version)";'
                 f" }} > {BUILD_RECORD}",
+            ]
+        )
+
+    def _control_record_command(self) -> str:
+        """The build record, for the arm that builds nothing.
+
+        Written so every trial in either arm has one file naming its arm, and a results directory
+        can be read without already knowing which arm produced it.
+        """
+        return "; ".join(
+            [
+                "set -euo pipefail",
+                f"mkdir -p {AGENT_LOGS}",
+                f'{{ echo "proxy=off"; echo "repo_url="; echo "ref="; }} > {BUILD_RECORD}',
             ]
         )
 
@@ -217,10 +285,74 @@ class OnepassClaudeCode(ClaudeCode):
             # runs no package manager at all — the proxied arm must not upgrade packages
             # the control arm keeps. (ca_certificates is deliberately absent: it carries
             # always_install=True and would apt-get on every trial.)
+            #
+            # Asked for in both arms, not just the proxied one. Only `tar` is needed with the
+            # proxy off, but requesting a different set per arm would let the two arms diverge on
+            # installed packages, which is the one thing this eval cannot afford.
             environment,
             ("curl", "bash", "git", "tar"),
         )
-        await self.exec_as_root(environment, command=self._install_command())
+        if self._proxy_enabled:
+            await self.exec_as_root(environment, command=self._install_command())
+        else:
+            await self.exec_as_root(environment, command=self._control_record_command())
+
+    def _snapshot_command(self, dest: str, label: str) -> str:
+        """Tar the task's working directory into a file Harbor collects.
+
+        Archived as ``app/...`` rather than ``./...`` so the two snapshots of a trial extract into
+        the same shape and diff directly against each other.
+        """
+        cap_bytes = self._snapshot_max_mb * 1024 * 1024
+        over_cap = (
+            [
+                f'if [ "$bytes" -gt {cap_bytes} ]; then'
+                f' echo "{label}: dropped, $bytes bytes is over the'
+                f' {self._snapshot_max_mb} MB cap (raise onepass_snapshot_max_mb, or set it to 0)"'
+                f" >> {SNAPSHOT_NOTE}; rm -f {dest}; exit 0; fi"
+            ]
+            if cap_bytes > 0
+            else []
+        )
+        return "; ".join(
+            [
+                # No `-e`: every failure below is handled where it happens, and a snapshot must
+                # never be the thing that ends a trial.
+                "set -uo pipefail",
+                f"mkdir -p {AGENT_LOGS}",
+                f"if [ ! -d {WORKDIR} ]; then"
+                f' echo "{label}: {WORKDIR} does not exist, nothing captured" >> {SNAPSHOT_NOTE};'
+                f" exit 0; fi",
+                f"rm -f {dest}",
+                # tar exits 1 for warnings such as "file changed as we read it" while still
+                # producing a usable archive, so the test is whether an archive came out — not
+                # what tar returned.
+                f"tar -czf {dest} -C / {WORKDIR.lstrip('/')} 2>> {SNAPSHOT_NOTE} || true",
+                f"if [ ! -s {dest} ]; then"
+                f' echo "{label}: tar produced no archive" >> {SNAPSHOT_NOTE};'
+                f" rm -f {dest}; exit 0; fi",
+                f"bytes=$(wc -c < {dest} | tr -d ' ')",
+                *over_cap,
+                # Taken as root so root-owned files in the working directory are readable; made
+                # world-readable again so collecting it does not depend on who Harbor runs as.
+                f"chmod a+r {dest}",
+                f'echo "{label}: $bytes bytes -> {dest}" >> {SNAPSHOT_NOTE}',
+            ]
+        )
+
+    async def _take_snapshot(
+        self, environment: BaseEnvironment, dest: str, label: str
+    ) -> None:
+        if not self._snapshot_workdir:
+            return
+        try:
+            await self.exec_as_root(
+                environment,
+                command=self._snapshot_command(dest, label),
+                timeout_sec=SNAPSHOT_TIMEOUT_SEC,
+            )
+        except Exception as exc:  # noqa: BLE001 - the trial's own result outranks this
+            self.logger.warning(f"onepass: {label} workdir snapshot failed: {exc}")
 
     def _proxy_env(self) -> dict[str, str]:
         env = {
@@ -280,11 +412,23 @@ class OnepassClaudeCode(ClaudeCode):
     ) -> None:
         # Not decorated with @with_prompt_template: the stock run() carries the decorator, so
         # the instruction is rendered exactly once, on the way through super().
-        await self.exec_as_agent(environment, command=self._start_proxy_command())
-        await self.exec_as_agent(environment, command=self._wait_for_proxy_command())
+        #
+        # Taken before the proxy starts so it is the working directory the task handed over and
+        # nothing of ours. Paired with the "after" snapshot it is what makes the agent's work
+        # readable as a diff — Harbor collects no part of the working directory itself.
+        await self._take_snapshot(environment, SNAPSHOT_BEFORE, "before")
+        if self._proxy_enabled:
+            await self.exec_as_agent(environment, command=self._start_proxy_command())
+            await self.exec_as_agent(environment, command=self._wait_for_proxy_command())
         try:
             await super().run(instruction, environment, context)
         finally:
+            # In `finally` so a trial that raised or ran out of time still leaves its working
+            # directory behind. That is the case where seeing what the agent actually wrote
+            # matters most, and it is exactly the case an `else` would skip.
+            await self._take_snapshot(environment, SNAPSHOT_AFTER, "after")
+            if not self._proxy_enabled:
+                return
             # Give the proxy's buffered log writer a moment to drain, then stop it, before the
             # container goes away. A failure here must not mask the agent's own result.
             try:
@@ -301,3 +445,30 @@ class OnepassClaudeCode(ClaudeCode):
                 )
             except Exception as exc:  # noqa: BLE001 - diagnostics only
                 self.logger.debug(f"onepass: could not stop the proxy cleanly: {exc}")
+
+
+class OnepassClaudeCodeControl(OnepassClaudeCode):
+    """The control arm: stock Claude Code, no proxy, the same working-directory capture.
+
+    Harbor's own ``claude-code`` agent is what the control arm used to be, and it cannot be taught
+    to snapshot ``/app``. Running the control through this subclass instead buys that capture
+    while changing nothing the measurement depends on: with ``_proxy_enabled`` false there is no
+    clone, no build, no proxy process, and ``_resolve_auth_env()`` returns the stock resolution
+    untouched, so the CLI talks to the same host it would have talked to on its own.
+    """
+
+    @staticmethod
+    @override
+    def name() -> str:
+        # Distinct from the proxied arm's name so `agent_info.name` in result.json still says
+        # which arm a trial belongs to.
+        return "onepass-claude-code-control"
+
+    def __init__(self, logs_dir: Path, *args, **kwargs):
+        requested = kwargs.pop("onepass_proxy", None)
+        if requested is not None and _bool_kwarg(requested, "onepass_proxy", False):
+            raise ValueError(
+                "OnepassClaudeCodeControl is the proxy-off arm; use OnepassClaudeCode for the "
+                "proxied one"
+            )
+        super().__init__(logs_dir, *args, onepass_proxy=False, **kwargs)

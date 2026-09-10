@@ -68,7 +68,16 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="print every reading, not just the newest")
     args = ap.parse_args()
 
-    job_dirs = args.job or sorted(d for d in args.jobs_dir.iterdir() if d.is_dir())
+    # A bare job name is the natural thing to pass, since that is what run.sh prints, so resolve
+    # anything that is not already a directory against --jobs-dir before giving up on it.
+    resolved = []
+    for job in args.job:
+        resolved.append(job if job.is_dir() else args.jobs_dir / job)
+    job_dirs = resolved or sorted(d for d in args.jobs_dir.iterdir() if d.is_dir())
+    missing = [d for d in job_dirs if not d.is_dir()]
+    if missing:
+        print("no such job directory: " + ", ".join(str(d) for d in missing), file=sys.stderr)
+        return 2
     readings = list(_events(job_dirs))
     if not readings:
         print("no rate_limit_event lines found — no trial has run yet, or the logs were not "
