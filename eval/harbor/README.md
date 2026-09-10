@@ -22,12 +22,21 @@ proxy gets into a trial container, how it is started, and how the two arms are r
 
 | | proxied arm | control arm |
 |---|---|---|
-| Harbor agent | `onepass_agent:OnepassClaudeCode` (subclass of Harbor's own `ClaudeCode`) | stock `claude-code` |
+| Harbor agent | `onepass_agent:OnepassClaudeCode` (subclass of Harbor's own `ClaudeCode`) | `onepass_agent:OnepassClaudeCodeControl` — the same subclass with the proxy off |
 | CLI | the real Claude Code, installed by Harbor's own installer | the same |
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:3777` — a proxy inside that one container | unset; the CLI's default |
 | `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | `1` | unset (not needed) |
 | `ANTHROPIC_MODEL` | `claude-opus-5` | `claude-opus-5` |
+| working-directory snapshots | `/app` tarred before and after the run | the same |
 | everything else | identical | identical |
+
+The control arm runs a class of ours rather than Harbor's stock `claude-code` for one reason: the
+snapshots. Harbor collects no part of the working directory and its own agent has no hook to add
+that, so a stock control arm would come back with the proxied arm's code and none of its own — a
+comparison with only one side readable. `OnepassClaudeCodeControl` adds the snapshots and nothing
+else: with the proxy off there is no clone, no build, and nothing injected into the CLI's
+environment, so the CLI still runs exactly as Harbor would have run it. `ONEPASS_CONTROL_STOCK=1`
+falls back to the stock agent, for when the subclass itself is what you suspect.
 
 **Model:** `claude-opus-5`, for both arms, via `--model claude-opus-5`. Deliberately without the
 `anthropic/` prefix: Harbor's `_resolved_model_name()` returns the *prefixed* name whenever a base
@@ -146,7 +155,7 @@ python3 report.py --proxied <job-dir> --control <job-dir> --out RESULT.md
 Every knob is an environment variable with a default, listed at the top of `run.sh`:
 `ONEPASS_MODEL`, `ONEPASS_HARBOR_ENV` (default `daytona`; `docker` runs on the local daemon),
 `ONEPASS_N_CONCURRENT`, `ONEPASS_TRIP_TOKENS`, `ONEPASS_CLAUDE_VERSION`, `ONEPASS_REF`,
-`ONEPASS_JOBS_DIR`, `ONEPASS_TASKS_FILE`.
+`ONEPASS_JOBS_DIR`, `ONEPASS_TASKS_FILE`, `ONEPASS_CAPTURE_BODIES`, `ONEPASS_CONTROL_STOCK`.
 
 ### Running it in batches, and why you have to
 

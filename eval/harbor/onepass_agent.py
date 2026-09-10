@@ -427,24 +427,28 @@ class OnepassClaudeCode(ClaudeCode):
             # directory behind. That is the case where seeing what the agent actually wrote
             # matters most, and it is exactly the case an `else` would skip.
             await self._take_snapshot(environment, SNAPSHOT_AFTER, "after")
-            if not self._proxy_enabled:
-                return
-            # Give the proxy's buffered log writer a moment to drain, then stop it, before the
-            # container goes away. A failure here must not mask the agent's own result.
-            try:
-                await self.exec_as_agent(
-                    environment,
-                    # The bracket in `mai[n]` is not decoration: this command's own shell
-                    # carries the pattern in its argv, so a literal pattern makes pkill match
-                    # the shell running it and kill that instead of the proxy.
-                    command=(
-                        "sleep 2; "
-                        "pkill -TERM -f 'onepass/repo/proxy/dist/mai[n][.]js' || true; "
-                        "true"
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001 - diagnostics only
-                self.logger.debug(f"onepass: could not stop the proxy cleanly: {exc}")
+            # An `if not ...: return` here would read the same and be a silent data-corruption bug:
+            # a `return` inside `finally` discards the exception on its way out, and this branch is
+            # taken only when the proxy is off — the control arm. A container that died would have
+            # come back as a plain low score instead of an exception, which is indistinguishable
+            # after the fact from stock Claude Code failing the task on merit.
+            if self._proxy_enabled:
+                # Give the proxy's buffered log writer a moment to drain, then stop it, before the
+                # container goes away. A failure here must not mask the agent's own result.
+                try:
+                    await self.exec_as_agent(
+                        environment,
+                        # The bracket in `mai[n]` is not decoration: this command's own shell
+                        # carries the pattern in its argv, so a literal pattern makes pkill match
+                        # the shell running it and kill that instead of the proxy.
+                        command=(
+                            "sleep 2; "
+                            "pkill -TERM -f 'onepass/repo/proxy/dist/mai[n][.]js' || true; "
+                            "true"
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - diagnostics only
+                    self.logger.debug(f"onepass: could not stop the proxy cleanly: {exc}")
 
 
 class OnepassClaudeCodeControl(OnepassClaudeCode):

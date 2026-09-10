@@ -112,9 +112,16 @@ fi
 JOB_NAME="${ONEPASS_JOB_NAME:-onepass-$MODE$BATCH_TAG-$ARM-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 # ---------------------------------------------------------------------------- the two arms
+# Both arms run a class from onepass_agent.py, so both take the working-directory snapshots. The
+# control arm used to run Harbor's stock `claude-code`, which cannot be taught to tar /app and
+# cannot be modified — an arm that brought back no code would leave the comparison one-sided, with
+# the proxied arm's work readable and the baseline's gone. OnepassClaudeCodeControl adds the
+# snapshots and nothing else: proxy off means no clone, no build, and nothing injected into the
+# CLI's environment. Set ONEPASS_CONTROL_STOCK=1 to fall back to the stock agent if the subclass
+# is ever the thing under suspicion.
 declare -a AGENT_FLAGS=()
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 if [[ "$ARM" == "proxied" ]]; then
-  export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
   AGENT_FLAGS+=(--agent "onepass_agent:OnepassClaudeCode")
   AGENT_FLAGS+=(--ak "onepass_repo_url=$ONEPASS_REPO_URL")
   AGENT_FLAGS+=(--ak "onepass_ref=$ONEPASS_REF")
@@ -125,7 +132,16 @@ if [[ "$ARM" == "proxied" ]]; then
     *) echo "run.sh: ONEPASS_CAPTURE_BODIES must be a boolean, got: $CAPTURE_BODIES" >&2; exit 2 ;;
   esac
 else
-  AGENT_FLAGS+=(--agent claude-code)
+  case "${ONEPASS_CONTROL_STOCK:-0}" in
+    1|true|yes|on)
+      # No snapshots from this arm: the stock agent has no hook to take them.
+      AGENT_FLAGS+=(--agent claude-code) ;;
+    0|false|no|off|"")
+      AGENT_FLAGS+=(--agent "onepass_agent:OnepassClaudeCodeControl") ;;
+    *)
+      echo "run.sh: ONEPASS_CONTROL_STOCK must be a boolean, got: ${ONEPASS_CONTROL_STOCK}" >&2
+      exit 2 ;;
+  esac
 fi
 if [[ -n "$CLAUDE_VERSION" ]]; then
   AGENT_FLAGS+=(--ak "version=$CLAUDE_VERSION")
