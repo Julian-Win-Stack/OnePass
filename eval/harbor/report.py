@@ -67,6 +67,11 @@ class Arm:
     # rate-limit window, so each batch is its own job directory.
     job_dirs: list[Path] = field(default_factory=list)
     trials: list[TrialRecord] = field(default_factory=list)
+    # Trials dropped as operator cancellations. Counted rather than discarded: a reader has to be
+    # able to tell "we stopped the run" apart from "these tasks were never attempted".
+    cancelled: int = 0
+    # Rewardless trials superseded by a successful re-run of the same task. See _drop_superseded.
+    superseded: int = 0
 
     def by_task(self) -> dict[str, list[TrialRecord]]:
         grouped: dict[str, list[TrialRecord]] = {}
@@ -163,6 +168,15 @@ def _trial_results_paths(job_dir: Path) -> list[Path]:
     return [p for p in paths if p.parent != job_dir]
 
 
+# Harbor writes a result.json for a trial killed with the run, marked CancelledError and carrying
+# no reward. That is not an outcome — it is an operator stopping the job — and a resumed run leaves
+# the cancelled dir sitting beside the real one for the same task. Counted, they inflate the trial
+# total, show up as errors the arm did not commit, and put a task in the table twice. A genuine
+# infrastructure failure (RuntimeError from a failed install, say) is deliberately NOT covered by
+# this: that one is a real thing that happened to a real trial and has to stay visible.
+CANCELLED_EXCEPTION = "CancelledError"
+
+
 def load_arm(label: str, job_dirs: Sequence[Path]) -> Arm:
     for job_dir in job_dirs:
         if not job_dir.is_dir():
@@ -174,6 +188,9 @@ def load_arm(label: str, job_dirs: Sequence[Path]) -> Arm:
             results = json.loads(results_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             print(f"warning: unreadable {results_path}: {exc}", file=sys.stderr)
+            continue
+        if (results.get("exception_info") or {}).get("exception_type") == CANCELLED_EXCEPTION:
+            arm.cancelled += 1
             continue
         agent_info = results.get("agent_info") or {}
         model_info = agent_info.get("model_info") or {}
@@ -204,10 +221,27 @@ def load_arm(label: str, job_dirs: Sequence[Path]) -> Arm:
             record.chars_removed = stats["chars"]
             record.pressure_trips = stats["pressure_trips"]
         arm.trials.append(record)
+    arm.trials, arm.superseded = _drop_superseded(arm.trials)
     if not arm.trials:
         joined = ", ".join(str(d) for d in job_dirs)
         raise SystemExit(f"{label}: no trials with a result.json under {joined}")
     return arm
+
+
+def _drop_superseded(trials: list[TrialRecord]) -> tuple[list[TrialRecord], int]:
+    """Drop a task's rewardless trials when a later run of the same task produced a reward.
+
+    A trial that died before the verifier ran — a failed install, say — leaves a result.json with no
+    reward. Re-running that task afterwards puts a second directory beside the first, and both are
+    real files on disk, so the arm reads as one trial too many with an error the task did not
+    actually end on. Unlike a cancellation this is not the operator's doing, which is why it is
+    reported separately: the crash happened and is worth knowing about, it is just no longer this
+    task's outcome. A task whose every attempt failed keeps them all — there is no result to prefer,
+    and dropping them would hide the failure entirely.
+    """
+    scored = {t.task for t in trials if t.reward is not None}
+    kept = [t for t in trials if t.reward is not None or t.task not in scored]
+    return kept, len(trials) - len(kept)
 
 
 def _mean(values: Iterable[float | None]) -> float | None:
@@ -311,6 +345,14 @@ def render(proxied: Arm, control: Arm) -> str:
             w(f"- {arm.label} jobs ({len(dirs)} batches):")
             for d in dirs:
                 w(f"  - `{d}`")
+    for arm in (proxied, control):
+        if arm.cancelled:
+            w(f"- {arm.label}: {arm.cancelled} trial(s) excluded as operator cancellations — the "
+              f"run was stopped and resumed, and each of those tasks was re-run below")
+        if arm.superseded:
+            w(f"- {arm.label}: {arm.superseded} trial(s) excluded as superseded — they ended before "
+              f"the verifier ran (an infrastructure failure, not a task outcome) and the task was "
+              f"re-run successfully")
     w(f"- agent: {', '.join(p['agent'])} (proxied) vs {', '.join(c['agent'])} (control)")
     w(f"- Claude Code: {', '.join(p['cli_version'])} (proxied), {', '.join(c['cli_version'])} (control)")
     w(f"- model: {', '.join(p['model'] or ['—'])}")
