@@ -760,6 +760,186 @@ The direction agrees with §18; the counts are far too small to compare.
   come from the same script whose max matched the reporter's peak exactly on all three proxied
   arms (112,947 / 112,633 / 114,353).
 
+## 20. A blind code-review grader on the same five repos: it reads, and it ranks both controls above every proxied arm
+
+**No verdict on the proxy.** The rule agreed before the run gives one only when the four clean
+real pairs show no preferred arm; they show *control preferred* on all four, so what follows is
+reported as it came out. The grader itself passed every check that could be put to it without a
+human reading mastra source — a positive control, a self-pair, and a sampled citation check —
+after the check the handoff asked for turned out to test the wrong thing. That is the finding
+about the instrument. The finding about the arms is a ranking, not a verdict: **control3 >
+control2 > {head1, head3} > head2**, consistent across ten graded pairs with no cycle, and both
+controls above all three proxied arms is what one would see one time in ten if the proxy made no
+difference at all. One task cannot separate "the proxy hurts" from "runs vary and these five
+sorted this way"; two controls of the same task already differ by as much as the arms differ from
+them. That is Step 2's job, and why the plan puts breadth there.
+
+§19 settled completeness: the ground-truth suite resolves whole missing features, not degradation,
+and it says a future step wanting to detect quality loss needs a different instrument. This is that
+instrument's first run, on the same five finished repos, so nothing new was paid for on the arms'
+side. The grader is Claude Code itself — `claude -p` on Opus at effort max, Read/Grep/Glob and no
+other tool, started in a scratch directory holding only the plan, the two diffs and the question,
+with both finished repositories attached read-only and no test score anywhere in the prompt.
+Proxy build the arms ran: `0d06b60`. Grader: Claude Code 2.1.265. Driver: [eval/grade/](../eval/grade/).
+
+**The pairs.** Each is graded in both orderings, and one outcome is derived from the two verdicts:
+Yes/Yes is *same*, Yes/No and No/Yes name a preferred side, No/No and any Unknown are *no clear
+answer*. The eight pairs the handoff asked for are p1–p8; p9–p11 were added when the trust check
+was replaced (below) and are checks on the grader, not on the arms.
+
+| pair | kind | call 1 (A / B) | verdict | call 2 (A / B) | verdict | outcome |
+|---|---|---|---|---|---|---|
+| p1 | proxied vs control | head1 / control2 | No | control2 / head1 | Yes | **control preferred** |
+| p2 | proxied vs control | head1 / control3 | No | control3 / head1 | Yes | **control preferred** |
+| p3 | proxied vs control | control2 / head2 | Yes | head2 / control2 | No | **control preferred** |
+| p4 | proxied vs control | head2 / control3 | No | control3 / head2 | Yes | **control preferred** |
+| p5 | proxied vs control | control2 / head3 | Yes | head3 / control2 | No | **control preferred** |
+| p6 | proxied vs control | control3 / head3 | Yes | head3 / control3 | No | **control preferred** |
+| p7 | noise floor (two controls) | control3 / control2 | Yes | control2 / control3 | No | **control3 preferred** |
+| p8 | same-condition, proxied | head1 / head3 | No | head3 / head1 | No | **no clear answer (contradiction)** |
+| p9 | positive control (head2) | head2 / head1 | No | head1 / head2 | Yes | **head1 preferred** |
+| p10 | positive control (head2) | head2 / head3 | No | head3 / head2 | Yes | **head3 preferred** |
+| p11 | self-pair | control2 / control2b | Yes | control2b / control2 | Yes | **same** |
+
+head2's two real pairs (p3, p4) are on their own line: it skipped
+`stores/convex/src/server/index-map.ts` entirely and §19's tests already say so, so a control
+preferred there is the completeness finding §19 has, not a quality one. Twenty-two calls, no
+Unknowns, no `is_error`, and every transcript shows `Read`, `Grep` and `Glob` and no other tool.
+
+**The trust check as agreed, and why it was replaced.** The rule was: pairs 7 and 8 come out
+*same*, and five reasons picked by the user hold when the files are opened; otherwise the grader is
+picking winners out of luck and nothing it says can be read. Neither pair came out *same*. Pair 8's
+No/No is two calls citing the same facts in the same files — one arm adds the ClickHouse and
+Cloudflare table-name entries and claims in MySQL with one statement, the other guards the
+Postgres `jsonb` read and wires the shutdown hook — and each concluding the side shown as A is not
+at least as good; two changes each worse in a way the other is not is a real state the Yes/No
+shape cannot express. Pair 7 is the one that matters: two controls, same task, no proxy in either,
+and both calls say control3 is the better change, citing the Cloudflare `mastra_channel_state` key
+control2 omits from a `Record<TABLE_NAMES, …>` and the three changesets control2 does not ship.
+Those citations were opened (R147, R148, R155, R156, R158 in the corpus) and hold. So two runs of one
+condition are two different changes, of visibly different quality, and *same* was never the right
+requirement: it counted real between-run variance as grader noise, and no honest grader could
+have passed it. The user could not do the five-reason check — "I have no context about the repo"
+— which is a fair statement about a 25-file diff against an unfamiliar monorepo, and is the second
+reason the check was replaced rather than the rule bent.
+
+**What replaced it: three checks that need no one to read mastra.** All three pass.
+
+- *Positive control.* The tests already rank head2 last of the five — 62/65, one required file
+  never opened — and that ranking owes nothing to the grader. head2 against each other proxied
+  arm is therefore a question with a known answer. p9 and p10: head2 loses both, in both orderings,
+  and the grader's stated reason is the same omission the tests found — `stores/convex/README.md`
+  and the Convex schema work untouched.
+- *Self-pair.* control2 against a byte-identical copy of itself under another token. p11: Yes/Yes,
+  both calls listing the same locations on both sides and one noting the two diffs touch the same
+  24 files with no adds, deletes or renames. This is the only test that the grader can say *same*
+  at all — none of the eight real pairs did — and it can.
+- *Citations.* Every reason names a file and a line. A machine pass over all 183 reasons from the
+  first sixteen calls resolved 409 citations: none names a file that does not exist; five give a
+  line number that is a line in that side's diff rather than in the file, and the diff at that
+  line is the code the sentence describes. Twenty-three reasons drawn at random (seed 20260910,
+  every pair covered) were then opened and read — by Claude in the grading session, not by the
+  user, and that is the weaker of the two — and all twenty-three hold; one (R169) is a diff-line
+  citation. The record is `VERIFY.md` in the corpus; `eval/grade/cite.mjs` is what resolves a
+  citation to its lines so the check is reading two short things rather than navigating a repo.
+
+Position is also ruled out directly: in nine of the eleven pairs the verdict reverses when the
+sides swap, and the two that do not reverse are the contradiction and the self-pair, which should
+not. A grader answering by slot would read No/No or Yes/Yes throughout; one answering by coin
+would reverse about half the time.
+
+**What the six real pairs say, and what they cannot.** All six come out *control preferred*, and
+with p7, p9 and p10 the ten graded pairs form one order — control3 > control2 > head1, head3 >
+head2, with head1 against head3 unresolved — and no cycle. Both controls above all three proxied
+arms is the ranking "the proxy costs quality" predicts, and it is also what a lottery over five
+runs produces one time in ten: under "condition makes no difference", the two control labels land
+on the top two of five ranks with probability 1/C(5,2). One in ten is suggestive and is not a
+finding, and there is no reading of the reasons that makes it one, because pair 7 shows the
+between-run spread inside one condition is of the same size as the spread between conditions. What
+the reasons do show is the *kind* of shortfall the grader saw on the proxied side: entries missing
+from total records that the plan named as expected fallout (ClickHouse `TABLE_ENGINES`, Cloudflare
+`RecordTypes`), the named doc line and the "in-memory fallback" comment left unedited, the Convex
+"fail loudly" behaviour absent, changesets folded or mis-bumped — omissions of plan-mandated items
+rather than wrong code. That is the shape a shortened context would produce. It is also the shape
+control2 produced on changesets, so it is not a signature. Whether it recurs across tasks is
+exactly what Step 2 measures.
+
+**Grading cost.** $108.68 for twenty-two calls, 35 to 87 turns each, 2.7 to 12.8 minutes each;
+the self-pair's two calls were the cheapest at $2.38 and $2.60.
+
+**Cost, per arm.** From each arm's own `claude -p` result JSON and its start/end stamps — the
+arms' cost, not the grader's. `turns` here is the result JSON's `num_turns`, which is not §19's
+count of assistant entries in the transcript.
+
+| | control2 | control3 | head1 | head2 | head3 |
+|---|---|---|---|---|---|
+| List price | $23.75 | $22.99 | $22.57 | $22.60 | **$36.92** |
+| Total tokens | 37,075,406 | 35,374,597 | 25,755,125 | 24,760,926 | 30,527,675 |
+| Fresh input | 386 | 412 | 610 | 584 | 682 |
+| Cache write | 284,492 | 275,787 | 708,182 | 789,912 | 1,962,422 |
+| Cache read | 36,688,363 | 34,989,120 | 24,925,424 | 23,859,615 | 28,441,732 |
+| Output | 102,165 | 109,278 | 120,909 | 110,815 | 122,839 |
+| Turns (`num_turns`) | 221 | 267 | 329 | 324 | 375 |
+| Wall clock | 26.3 min | 30.5 min | 33.5 min | 30.1 min | 34.3 min |
+
+Cache reads are 97–99% of every arm's tokens, which is why the dollar figures move so little
+against a 25% swing in total tokens.
+
+**Paired differences, proxied minus control, over the six real pairs.**
+
+| pair | dollars | total tokens | turns | wall clock |
+|---|---|---|---|---|
+| head1 − control2 | −$1.17 | −11,320,281 | +108 | +7.3 min |
+| head1 − control3 | −$0.42 | −9,619,472 | +62 | +3.0 min |
+| head2 − control2 | −$1.14 | −12,314,480 | +103 | +3.8 min |
+| head2 − control3 | −$0.38 | −10,613,671 | +57 | −0.4 min |
+| head3 − control2 | +$13.17 | −6,547,731 | +154 | +8.1 min |
+| head3 − control3 | +$13.93 | −4,846,922 | +108 | +3.9 min |
+| **mean of 6** | **+$4.00** | **−9,210,426** | **+98.7** | **+4.3 min** |
+
+§19 said to expect about the same dollars from 40% more turns at 40% of the context, with head3
+an outlier. Measured: 45% more turns, 25% fewer total tokens, and dollars within $1.17 either way
+on four of the six pairs. The mean of +$4.00 is head3 alone — drop it and the mean is −$0.78. The
+40%-of-context figure was per request at peak (§19: 112k against 284k); the 25% here is the whole
+session's token total, which the proxy's rebuilds move between classes rather than remove, and
+the two are not the same measurement.
+
+**What the diffs shown to the grader are.** Not plain `git diff a14c2436bc`, and the corrections
+are worth stating because a reader will otherwise reproduce something else. `score.sh` staged the
+human's ground-truth test files over each arm's own to score it, so both those paths come out of
+every diff; the arm's own `state-adapter.test.ts` is spliced back from `score.sh`'s saved copies,
+which were checked by hash and are genuine for all five, while `index-map.test.ts` is dropped for
+all five because one control's saved copy is byte-identical to the ground truth and is therefore
+unrecoverable there. The changesets the plan's Step 8 asks for are untracked files `git diff` does
+not show, and are appended as new-file hunks. Each prepared copy is then asserted to equal the
+base commit plus its own diff before any call runs.
+
+**Blinding.** The grader is never told which side is proxied and never told a test score. The
+source paths name the arms, so each finished repo is copied to an opaque name and the copy is
+what gets attached; the driver refuses to start a call whose diffs mention the harness. On 2.1.265
+`--safe-mode` alone was not enough to keep the operator's own configuration out: a first call
+under it still carried the user's `outputStyle` in as an attachment telling the grader to keep
+answers short. `--setting-sources ""` removes it.
+
+**Caveats.**
+- n=1 task. One plan, one repository, one base commit; every pair here is a different pair of
+  answers to the same question, and the one-in-ten above is the whole of what five runs of one
+  task can say.
+- Eight real-or-floor pairs, six of them real, and two of those six are head2, whose omission §19
+  already measured. Four independent proxied-versus-control pairs is the width of the real
+  comparison.
+- The grader is the same model family as the arms, prompted the same way, reading the same repo.
+  It is not an independent judge of that repository's conventions; it is another instance of the
+  thing being measured.
+- The citation check was done by Claude, not by the user, on a random sample. It is evidence the
+  reasons are not invented; it is not the human check the handoff asked for, and the positive
+  control and self-pair are the checks that carry the weight.
+- The positive control is coarse: head2's shortfall is a completeness gap the grader could see for
+  the same reason the tests did. That it can also tell two complete changes apart rests on pair 7,
+  whose reasons were opened and hold.
+- The five repos differ in more than the proxy: §19 records that these runs had no recall tools
+  registered, so an evicted arm had no recovery path at all.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -781,6 +961,10 @@ The direction agrees with §18; the counts are far too small to compare.
 - §19 is n=3 per arm and the first section with more than one control. It rules out §16–§17's
   3-of-3 pattern; it does not measure a failure rate. Its five runs also lacked the recall tools,
   which §16–§18's runs had — the section says so and says which way that cuts.
+- §20 carries no verdict on the proxy. Its grader passed a positive control, a self-pair and a
+  sampled citation check, so what it says can be read; what it says is a ranking of five runs of
+  one task with both controls on top, which is one-in-ten under no effect at all. It is a
+  suggestive number and a checked instrument, not a finding about the proxy.
 - §17 is n=1 per arm, with the same nondeterminism: run 5 did more work than run 4 (588 vs
   556 turns) and went further into the task (clickhouse, cloudflare, docs, changesets). Peak,
   p90 and the eviction counts are arithmetic over what was actually sent and survive that;
