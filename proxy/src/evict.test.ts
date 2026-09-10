@@ -729,3 +729,141 @@ test("leaves a user block alone when the judge never selected it", () => {
   const outcome = evictContextSegments(body, new Set([PASTED_USER_TEXT_ID]), ALWAYS_TRIP);
   assert.equal(outcome.bodyChanged, false, "only judge-selected user text is evictable");
 });
+
+// --- more than one evictable block in the same message ---
+
+// Parallel tool calls are the ordinary shape of a Claude Code turn: one assistant message
+// carrying several calls, one user message carrying all their results. Every test above has at
+// most one evictable block per message, so nothing yet holds the per-message grouping to
+// keeping each pair together.
+test("parallel calls in one message each name their own file in their own result's stub", () => {
+  const body = requestBody([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "toolu_a", name: "Edit", input: { file_path: "/repo/a.ts", old_string: "a", new_string: "A".repeat(900) } },
+        { type: "tool_use", id: "toolu_b", name: "Edit", input: { file_path: "/repo/b.ts", old_string: "b", new_string: "B".repeat(900) } },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "toolu_a", content: "R".repeat(4000) },
+        { type: "tool_result", tool_use_id: "toolu_b", content: "S".repeat(4000) },
+      ],
+    },
+    ...filler(3),
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+
+  assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_a", "call:toolu_b", "toolu_a", "toolu_b"]);
+  assert.deepEqual(inputAt(outcome.body, 0, 0), {});
+  assert.deepEqual(inputAt(outcome.body, 0, 1), {});
+  assert.equal(blockAt(outcome.body, 1, 0).content, "[onepass: evicted 4,000 chars; call evicted, /repo/a.ts]");
+  assert.equal(blockAt(outcome.body, 1, 1).content, "[onepass: evicted 4,000 chars; call evicted, /repo/b.ts]");
+});
+
+// The pass that moves a stubbed call's path into its result's stub walks every block of the
+// message it lands in. A block it was not given a suffix for is not its business.
+test("a live text block beside a stubbed result keeps its text", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_c", "Edit", editInput()),
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "toolu_c", content: "Q".repeat(4000) },
+        { type: "text", text: "and now do the next thing" },
+      ],
+    },
+    ...filler(3),
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+
+  assert.deepEqual((outcome.body as { messages: { content: unknown }[] }).messages[1]?.content, [
+    {
+      type: "tool_result",
+      tool_use_id: "toolu_c",
+      content: "[onepass: evicted 4,000 chars; call evicted, /repo/src/x.ts]",
+    },
+    { type: "text", text: "and now do the next thing" },
+  ]);
+});
+
+// Both passes run on one request: the normal pass takes what is aged past N, the pressure pass
+// takes what is only aged past K. An id the first pass took must not be offered to the second —
+// it would enter the evicted set twice and be charged to charsRemoved twice with it.
+test("the pressure pass adds to the normal pass's ids without repeating any", () => {
+  const config: EvictionConfig = { ...ALWAYS_TRIP, tripThresholdTokens: 5_000 };
+  const body = requestBody([
+    assistantToolUse("toolu_old", "Bash", { command: "c".repeat(900) }),
+    userToolResult("toolu_old", "O".repeat(60_000)),
+    ...filler(3), // toolu_old is now aged past N=3
+    assistantToolUse("toolu_mid", "Bash", { command: "d".repeat(900) }),
+    userToolResult("toolu_mid", "M".repeat(60_000)),
+    ...filler(2), // toolu_mid is age 2: younger than N=3, no younger than K=2
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, config);
+
+  assert.equal(outcome.pressure, true);
+  assert.deepEqual(outcome.newlyEvictedIds, ["call:toolu_old", "toolu_old", "call:toolu_mid", "toolu_mid"]);
+});
+
+// --- the exact boundaries of the two gates ---
+
+/** 5,600 chars of JSON: at the 4 chars per token these configs use, exactly 1,400 tokens. */
+function bodyOfExactlyFourteenHundredTokens(): Record<string, unknown> {
+  return requestBody([
+    assistantToolUse("toolu_1", "Read", { file_path: "/a.ts" }),
+    userToolResult("toolu_1", "a".repeat(4886)),
+    ...filler(4),
+  ]);
+}
+
+test("a request estimated at exactly T does not trip", () => {
+  const body = bodyOfExactlyFourteenHundredTokens();
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, { ...ALWAYS_TRIP, tripThresholdTokens: 1_400 });
+
+  assert.equal(outcome.estimatedTokensBefore, 1_400, "this test's body is no longer 1,400 tokens");
+  assert.equal(outcome.tripped, false);
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+});
+
+test("a request estimated one token above T trips", () => {
+  const body = bodyOfExactlyFourteenHundredTokens();
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, { ...ALWAYS_TRIP, tripThresholdTokens: 1_399 });
+
+  assert.equal(outcome.estimatedTokensBefore, 1_400, "this test's body is no longer 1,400 tokens");
+  assert.equal(outcome.tripped, true);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+});
+
+// `[onepass: evicted ` is 18 chars, the count 2, ` chars]` 7 — so a two-digit result stubs to
+// 27 whatever it holds, and the saving is the content length less 27.
+test("a result whose stub saves one char less than the minimum is left alone", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_1", "Read", { file_path: "/a.ts" }),
+    userToolResult("toolu_1", "x".repeat(76)), // 76 - 27 = 49, one short of minSavedChars
+    ...filler(4),
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+  assert.equal(blockAt(outcome.body, 1).content, "x".repeat(76));
+});
+
+test("a result whose stub saves exactly the minimum is stubbed", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_1", "Read", { file_path: "/a.ts" }),
+    userToolResult("toolu_1", "x".repeat(77)), // 77 - 27 = 50, exactly minSavedChars
+    ...filler(4),
+  ]);
+
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+  assert.equal(blockAt(outcome.body, 1).content, "[onepass: evicted 77 chars]");
+});

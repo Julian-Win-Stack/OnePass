@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   buildJudgeRequest,
+  callJudge,
   JUDGE_BRIEF,
   parseJudgeResponse,
   validateJudgePicks,
@@ -295,4 +298,60 @@ test("each remaining guard drops its entry and counts it", () => {
     assistantText: 1,
     keepOnNonUserBlock: 2,
   });
+});
+
+// --- what the judge does when the call itself goes wrong ---
+//
+// The judge fails open: nothing extra is evicted and the rule pass is untouched. A judge that
+// answers with a non-2xx is covered by the integration test; these are the other two ways the
+// call can end — an answer with no verdict in it, and a call that never connects at all.
+
+const TEST_JUDGE = { apiKey: "sk-judge-test", model: "claude-test-judge" };
+
+async function listenOnLoopback(server: http.Server): Promise<string> {
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+}
+
+test("a judge answering 200 with no verdict in it evicts nothing", async () => {
+  let calls = 0;
+  const server = http.createServer((_request, response) => {
+    calls++;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ type: "message", content: [{ type: "text", text: "I could not decide." }] }));
+  });
+  const upstreamUrl = await listenOnLoopback(server);
+
+  try {
+    const result = await callJudge(judgedConversation(), {
+      upstreamUrl,
+      judge: TEST_JUDGE,
+      protectLastAssistantTurns: 2,
+      minSavedChars: 0,
+      timeoutMs: 5_000,
+    });
+
+    assert.deepEqual(result, { picks: null, error: "judge response was not a verdict" });
+    assert.equal(calls, 2, "one call plus one retry");
+  } finally {
+    server.close();
+  }
+});
+
+test("a judge whose call never connects evicts nothing", async () => {
+  // Listen only long enough to hold a port nothing else will take, then hand back a dead one.
+  const server = http.createServer();
+  const upstreamUrl = await listenOnLoopback(server);
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+
+  const result = await callJudge(judgedConversation(), {
+    upstreamUrl,
+    judge: TEST_JUDGE,
+    protectLastAssistantTurns: 2,
+    minSavedChars: 0,
+    timeoutMs: 5_000,
+  });
+
+  assert.equal(result.picks, null);
+  assert.match(String(result.error), /ECONNREFUSED/, "the reason the call failed is what gets logged");
 });
