@@ -1,0 +1,4 @@
+# batch 4 — 3600s caps, hard, highest expert-time estimates.
+regex-chess
+fix-ocaml-gc
+train-fasttext

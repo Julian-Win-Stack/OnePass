@@ -1,0 +1,3 @@
+# batch 5 — the two that dominate the budget: 12000s and 7200s agent caps. Own window.
+build-pov-ray
+sam-cell-seg

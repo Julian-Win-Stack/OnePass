@@ -8,3 +8,5 @@ proxy/proxy.log.jsonl
 eval/dist/
 eval/smoke/dist/
 .claude/worktrees/
+__pycache__/
+*.pyc
