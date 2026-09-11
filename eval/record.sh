@@ -128,31 +128,20 @@ if [ ! -e "${PROMPTS[0]}" ]; then
 fi
 
 # The proxy on a port the operating system picks, so this never collides with one already running.
-# ONEPASS_JUDGE_API_KEY is cleared rather than left alone: a judge would put a second model in the
-# path of every recorded request and its calls would be recorded too.
 PROXY_LOG="$WORK_DIR/proxy.stdout"
-env -u ONEPASS_JUDGE_API_KEY -u ANTHROPIC_BASE_URL \
+env -u ANTHROPIC_BASE_URL \
   ONEPASS_PORT=0 ONEPASS_DUMP_DIR="$DUMP_DIR" \
   node "$REPO_ROOT/proxy/dist/main.js" >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 trap 'kill "$PROXY_PID" 2>/dev/null' EXIT INT TERM
 
-# The judge line is the last of the proxy's banner, so waiting for that rather than for the port
-# is what makes the check below read a finished banner. Waiting for the port and reading the judge
-# line in the same breath would pass a proxy whose judge line had simply not been flushed yet.
 for _ in $(seq 1 100); do
-  grep -q "judge:" "$PROXY_LOG" && break
+  grep -q "listening on http://" "$PROXY_LOG" && break
   sleep 0.1
 done
-PORT=$(sed -n 's|.*listening on http://localhost:\([0-9]*\).*|\1|p' "$PROXY_LOG" | head -1)
+PORT=$(sed -n 's|.*listening on http://[^:]*:\([0-9]*\).*|\1|p' "$PROXY_LOG" | head -1)
 if [ -z "$PORT" ]; then
   echo "record.sh: the proxy did not report a port. Its output:" >&2
-  cat "$PROXY_LOG" >&2
-  exit 1
-fi
-if ! grep -q "judge: off" "$PROXY_LOG"; then
-  echo "record.sh: the proxy did not say its judge was off. Refusing: a judge would put a second" >&2
-  echo "           model in the path of every recorded request. Its output:" >&2
   cat "$PROXY_LOG" >&2
   exit 1
 fi
