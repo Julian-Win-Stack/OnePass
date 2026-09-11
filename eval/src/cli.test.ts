@@ -483,6 +483,21 @@ test("--compare refuses a run whose proxy evicted by a different T, and names bo
   assert.match(second.stderr, /T = 30,000/);
 });
 
+test("--compare takes a run at another batch minimum, because that is the comparison, and says so", async () => {
+  const results = scratch("onepass-eval-results-");
+  const off = resultOf(await runCli(["replay"], { results, env: { ONEPASS_BATCH_MIN_TOKENS: "0" } }));
+
+  const on = await runCli(["replay", "--compare", off.label], { results, env: { ONEPASS_BATCH_MIN_TOKENS: "20000" } });
+
+  assert.equal(on.code, 0, on.stderr);
+  const result = resultOf(on);
+  assert.equal(result.replay?.diff.comparedWith, off.label);
+  assert.ok(
+    result.notes.some((note) => /batch minimum off/.test(note) && /batch minimum 20,000 tokens/.test(note)),
+    `a note names both minimums: ${JSON.stringify(result.notes)}`,
+  );
+});
+
 test("--compare refuses a replay of a different recording", async () => {
   await withOtherRecording();
   const results = scratch("onepass-eval-results-");

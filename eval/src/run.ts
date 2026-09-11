@@ -127,7 +127,8 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       logFilePath: started.logFilePath,
       settings: started.settings,
     }));
-    if (comparedRun !== null) refuseUnlikeComparison(comparedRun, child.settings, recordings?.name ?? null);
+    const comparisonNote =
+      comparedRun === null ? null : refuseUnlikeComparison(comparedRun, child.settings, recordings?.name ?? null);
 
     const caseList = extractCases(planning.branch);
     const selected = selectCases(caseList.cases, options.mode);
@@ -185,7 +186,7 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
       replay,
       arms: [],
       problems,
-      notes: notesFor(options.mode, caseList, replay),
+      notes: [...notesFor(options.mode, caseList, replay), ...(comparisonNote === null ? [] : [comparisonNote])],
     };
     return { result, written: writeRunResult(resultsDir, result) };
   } finally {
@@ -263,17 +264,26 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
 }
 
 /**
- * A comparison is only between two runs that evicted by the same settings and, when both replayed,
- * sent the same recording. Two replays at different T come out different whatever the build, and
- * before settings were recorded nothing in either document said so.
+ * A comparison named on the command line is only between two runs that evicted by the same T, N
+ * and K and, when both replayed, sent the same recording. Two replays at different T come out
+ * different whatever the build, and before settings were recorded nothing in either document said
+ * so. The batch minimum is the one setting that may differ, because a run with it on against the
+ * same build with it off is how the minimum is measured; the returned note says so in the result.
  */
-function refuseUnlikeComparison(previous: RunResult, settings: ProxySettings | null, recording: string | null): void {
-  if (!sameSettings(previous.proxy.settings, settings)) {
+function refuseUnlikeComparison(
+  previous: RunResult,
+  settings: ProxySettings | null,
+  recording: string | null,
+): string | null {
+  const earlier = previous.proxy.settings;
+  const minimumAside = (one: ProxySettings | null | undefined): ProxySettings | null =>
+    one == null ? null : { ...one, batchMinTokens: null };
+  if (!sameSettings(minimumAside(earlier), minimumAside(settings))) {
     throw new EvalError(
-      `${previous.label} ran its proxy at ${describeSettings(previous.proxy.settings)}, and this run's evicts at ` +
-        `${describeSettings(settings)}. A comparison across settings reports what the settings did, not the ` +
-        `build, so it is refused: run both at the same ONEPASS_TRIP_TOKENS, ONEPASS_EVICT_AFTER_TURNS, ` +
-        `ONEPASS_PROTECT_LAST_TURNS and ONEPASS_BATCH_MIN_TOKENS.`,
+      `${previous.label} ran its proxy at ${describeSettings(earlier)}, and this run's evicts at ` +
+        `${describeSettings(settings)}. A comparison across T, N or K reports what the settings did, not the ` +
+        `build, so it is refused: run both at the same ONEPASS_TRIP_TOKENS, ONEPASS_EVICT_AFTER_TURNS and ` +
+        `ONEPASS_PROTECT_LAST_TURNS.`,
     );
   }
   const previousRecording = previous.replay?.recording.name ?? null;
@@ -283,6 +293,11 @@ function refuseUnlikeComparison(previous: RunResult, settings: ProxySettings | n
         `are not a comparison of two builds, so it is refused.`,
     );
   }
+  if (sameSettings(earlier, settings)) return null;
+  return (
+    `Compared with ${previous.label}, which evicted at ${describeSettings(earlier)}; this run evicts at ` +
+    `${describeSettings(settings)}. The diff is what the batch minimum did, not what the build did.`
+  );
 }
 
 /** Anything about the case list a reader has to be told rather than left to notice. */
