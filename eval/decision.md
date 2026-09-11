@@ -10,9 +10,8 @@ One line each. Newest at the bottom.
 - Session content stays outside the repo; scripts, case manifest, and result tables are committed.
 - Manual, one command, no CI.
 - Replay is fresh: a build evicts a stored prefix from an empty state, because the eval compares builds, not history.
-- Names live in CONTEXT.md; "judge" is the proxy's, "grader" is the eval's.
+- Names live in CONTEXT.md; the model that scores a pair is the "grader", never a "judge".
 - This file is one sentence per decision; ADRs are not used.
-- The proxy's judge stays off in every eval arm; the eval measures the rules alone.
 - Planning cases are text turns only; tool behaviour is not graded there, though a proxied tool call where control answered in text is counted as cost.
 - Implementation tails always fork from one recorded control run at the last turn under 110k, never from scratch, because the proxy is inert before its first trip so the prefix is identical either way.
 - Verified 2026-09-04 on Claude Code 2.1.261: `claude -p --resume <id> --fork-session` continues a recorded session under a new id and leaves the parent transcript unmodified.
@@ -48,7 +47,7 @@ One line each. Newest at the bottom.
 - The implementation grader asks the same single comparative question as planning, over a proxied tail's diff and a control tail's diff with both worktrees readable: is diff A at least as good a change as diff B, where as good as means does what the plan asks, breaks nothing, is as simple as the job allows, and reuses existing code. The four fault questions are dropped; ground-truth assertions remain the deciding number and the grader is a second column with its own noise floor.
 - The implementation grader runs on Opus 5 at effort xhigh from the start, not Sonnet-first: one heavy code-review question over a few dozen pairs, so the stronger model is cheap. The planning grader stays Sonnet-first. Supersedes the Sonnet-first bullet for implementation only.
 - Graders call the API directly through the Anthropic SDK, never through `claude -p`, so every model call the eval makes itself can be faked at one HTTP seam in tests.
-- The eval builds and starts its own proxy child per planning case and per proxied tail, on an ephemeral port with the judge unset; the manually started proxy is never used.
+- The eval builds and starts its own proxy child per planning case and per proxied tail, on an ephemeral port; the manually started proxy is never used.
 - Worktree snapshots during the recording are hidden git commits made through a temporary index and commit-tree under a private ref namespace, one per tool-use id, so the agent's git commands see nothing. The SDK's file checkpointing is not used because it misses shell-command changes and rewinds in place.
 - Planning cases and tails both fork through the Agent SDK's resume-at option. Two smoke checks precede any build: a copied transcript under another worktree's project directory resumes by id, and a resume-at fork at a model turn given the recorded user turn as prompt produces one turn.
 - The bar file is enforced by the command: it refuses a second scored run while the file is missing.

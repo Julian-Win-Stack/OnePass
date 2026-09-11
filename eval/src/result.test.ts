@@ -21,7 +21,6 @@ function aResult(overrides: Partial<RunResult> = {}): RunResult {
       shortSha: "a001c2b",
       dirty: false,
       version: "0.2.0",
-      judge: "off",
       settings: { evictAfterTurns: 8, protectLastTurns: 4, tripTokens: 30_000, batchMinTokens: 20_000 },
       logs: ["/tmp/proxy.log.jsonl"],
     },
@@ -97,7 +96,6 @@ test("the rendered table names the build, the baseline and the corpus without re
   assert.match(table, /claude-opus-5/);
   assert.match(table, /2\.1\.261/);
   assert.match(table, /\/tmp\/corpus/);
-  assert.match(table, /judge \| off/);
   assert.match(table, /evicts by \| T = 30,000 tokens, N = 8, K = 4, batch minimum 20,000 tokens/);
 });
 

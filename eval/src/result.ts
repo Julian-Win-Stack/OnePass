@@ -126,8 +126,6 @@ export interface RunResult {
     shortSha: string;
     dirty: boolean;
     version: string;
-    /** What the proxy children reported about their judge. Every arm expects "off". */
-    judge: string;
     /**
      * What the children said they evict by. Two runs of one build at different T are different
      * runs, and nothing else in the document says so. Null when the child printed nothing readable
@@ -412,7 +410,6 @@ export function renderRunResult(result: RunResult): string {
   lines.push("| | |", "| --- | --- |");
   lines.push(`| build | \`${result.proxy.shortSha}\`${result.proxy.dirty ? " **with uncommitted changes**" : ""} |`);
   lines.push(`| proxy version | ${result.proxy.version} |`);
-  lines.push(`| judge | ${result.proxy.judge} |`);
   lines.push(`| evicts by | ${describeSettings(result.proxy.settings)} |`);
   lines.push(`| upstream | ${result.upstream} |`);
   lines.push(`| corpus | ${result.corpusDir} |`);

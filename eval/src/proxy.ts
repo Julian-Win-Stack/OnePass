@@ -7,9 +7,7 @@
 // case is what makes each replay fresh — a child that has already evicted something has state
 // the next case did not put there.
 //
-// The child reports its own port, log file and judge on startup, so nothing here has to guess
-// at any of them. The judge is held off in every arm, so the eval measures the eviction rules
-// alone; a child that reports it on is a bug and stops the run rather than quietly biasing it.
+// The child reports its own port and log file on startup, so nothing here has to guess at either.
 
 import { execFile, execFileSync, spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
@@ -61,8 +59,6 @@ export interface ProxyChild {
   port: number;
   /** The proxy's own log for this child: trips, rebuilds and first-byte latency. */
   logFilePath: string;
-  /** What the child said about its judge. Every arm expects "off". */
-  judge: string;
   /** What it said it evicts by, or null when it printed nothing this reads as settings. */
   settings: ProxySettings | null;
   stop(): Promise<void>;
@@ -99,9 +95,8 @@ export async function buildProxyUnderTest(repoRoot: string): Promise<ProxyBuild>
 }
 
 /**
- * Starts one proxy child and waits until it reports its port, its log and its judge. Rejects,
- * with everything the child printed, when it exits early, reports its judge on, or says nothing
- * in time.
+ * Starts one proxy child and waits until it reports its port and its log. Rejects, with everything
+ * the child printed, when it exits early or says nothing in time.
  */
 export async function startProxyChild(build: ProxyBuild, options: ProxyChildOptions): Promise<ProxyChild> {
   const child: ProxyProcess = spawn(process.execPath, [build.entry], {
@@ -132,22 +127,10 @@ export async function startProxyChild(build: ProxyBuild, options: ProxyChildOpti
     throw err;
   });
 
-  // The second of two: `childEnv` has already dropped the judge key, so this fires only if a
-  // future proxy learns to turn its judge on some other way. Cheap, and what it guards against
-  // is every number in the run quietly measuring a second model as well as the rules.
-  if (banner.judge !== "off") {
-    await stop();
-    throw new EvalError(
-      `the proxy child reported its judge ${banner.judge}. Every arm runs with the judge held off, ` +
-        `so the eval measures the eviction rules alone. Unset ONEPASS_JUDGE_API_KEY.`,
-    );
-  }
-
   return {
     baseUrl: `http://127.0.0.1:${banner.port}`,
     port: banner.port,
     logFilePath: banner.logFilePath,
-    judge: banner.judge,
     settings: banner.settings,
     stop,
   };
@@ -181,7 +164,6 @@ function compilerOutput(err: unknown): string {
 interface Banner {
   port: number;
   logFilePath: string;
-  judge: string;
   settings: ProxySettings | null;
 }
 
@@ -213,18 +195,16 @@ function waitForBanner(child: ProxyProcess, output: string[], timeoutMs: number)
 }
 
 /**
- * The three lines the child prints about itself. Absent any one of them, it is not ready. The
- * settings line comes before the judge's, so by the time a child is ready it has been printed.
+ * The two lines the child prints about itself. Absent either one, it is not ready. The settings
+ * line comes before the log's, so by the time a child is ready it has been printed.
  */
 function parseBanner(text: string): Banner | null {
-  const port = /listening on http:\/\/localhost:(\d+)/.exec(text);
+  const port = /listening on http:\/\/([^\s:]+):(\d+)/.exec(text);
   const log = /^\[onepass\] log: (.+)$/m.exec(text);
-  const judge = /^\[onepass\] judge: (\w+)/m.exec(text);
-  if (port === null || log === null || judge === null) return null;
+  if (port === null || log === null) return null;
   return {
-    port: Number(port[1]),
+    port: Number(port[2]),
     logFilePath: (log[1] as string).trim(),
-    judge: judge[1] as string,
     settings: parseSettings(text),
   };
 }
@@ -243,16 +223,16 @@ function parseSettings(text: string): ProxySettings | null {
 }
 
 /**
- * The child's environment. Two variables are dropped rather than overridden: a judge key would
- * put a second model in the path of every arm, and an inherited `ANTHROPIC_BASE_URL` — set in
- * any shell that runs `claudep` — would chain this child through the proxy the author already
- * has running, which is the one thing the eval never uses.
+ * The child's environment. `ANTHROPIC_BASE_URL` is dropped rather than overridden: it is set in
+ * any shell that runs `claudep`, and an inherited one would chain this child through the proxy the
+ * author already has running, which is the one thing the eval never uses. `ONEPASS_HOST` is
+ * pinned for the same reason it is pinned for `claudep`'s child: this proxy exists to serve the
+ * one case below it, and the eval dials `127.0.0.1` whatever the surrounding shell asked for.
  */
 function childEnv(options: ProxyChildOptions): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...options.env };
-  delete env.ONEPASS_JUDGE_API_KEY;
   delete env.ANTHROPIC_BASE_URL;
-  return { ...env, ONEPASS_PORT: "0", ONEPASS_UPSTREAM: options.upstreamUrl };
+  return { ...env, ONEPASS_PORT: "0", ONEPASS_HOST: "127.0.0.1", ONEPASS_UPSTREAM: options.upstreamUrl };
 }
 
 function shortSha(repoRoot: string): string {

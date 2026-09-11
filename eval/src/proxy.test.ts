@@ -68,16 +68,6 @@ test("what a child is given, it forwards to the upstream it was pointed at", asy
   assert.match(forwarded[0]?.body ?? "", /hello/);
 });
 
-test("the judge is held off even when a key is set in the environment around the run", async () => {
-  await withProxyChild(
-    build,
-    { upstreamUrl: upstream.url, env: { ONEPASS_JUDGE_API_KEY: "sk-should-be-dropped" } },
-    async (child) => {
-      assert.equal(child.judge, "off");
-    },
-  );
-});
-
 test("a child reports the eviction settings it took from the environment around it", async () => {
   await withProxyChild(
     build,
