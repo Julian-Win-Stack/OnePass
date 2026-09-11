@@ -5,7 +5,7 @@
 import { createReadStream, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { measureContentChars } from "./evict.js";
-import type { JudgeLogEntry, ProxyLogEntry, RequestLogEntry, TripLogEntry } from "./log.js";
+import type { ProxyLogEntry, RequestLogEntry, TripLogEntry } from "./log.js";
 
 const RECALL_TOOL_NAME = /(^|__)recall_(search|get)$/;
 
@@ -96,13 +96,11 @@ export async function scanTranscript(path: string): Promise<TranscriptStats> {
 export interface ProxyLogContents {
   requests: RequestLogEntry[];
   trips: TripLogEntry[];
-  judges: JudgeLogEntry[];
 }
 
 export function parseProxyLog(path: string): ProxyLogContents {
   const requests: RequestLogEntry[] = [];
   const trips: TripLogEntry[] = [];
-  const judges: JudgeLogEntry[] = [];
   for (const line of readFileSync(path, "utf8").split("\n")) {
     if (line.trim() === "") continue;
     let entry: ProxyLogEntry;
@@ -113,7 +111,6 @@ export function parseProxyLog(path: string): ProxyLogContents {
     }
     if (entry.kind === "request" && entry.path.split("?")[0] === "/v1/messages") requests.push(entry);
     else if (entry.kind === "trip") trips.push(entry);
-    else if (entry.kind === "judge") judges.push(entry);
   }
-  return { requests, trips, judges };
+  return { requests, trips };
 }

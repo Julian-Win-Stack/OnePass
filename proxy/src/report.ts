@@ -7,65 +7,12 @@
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { formatThousands } from "./evict.js";
-import { latestProxyLogPath, proxyLogDir, type JudgeLogEntry, type RequestLogEntry } from "./log.js";
+import { latestProxyLogPath, proxyLogDir, type RequestLogEntry } from "./log.js";
 import { parseProxyLog, scanTranscript } from "./session.js";
 import { describeRebuild, formatDuration, GAUGE_MIN_ESTIMATED_TOKENS, type RebuildKind } from "./speed.js";
 
 const REBUILD_KINDS: RebuildKind[] = ["first", "after-trip", "after-idle", "unexpected"];
 const BAR_WIDTH = 24;
-
-/**
- * What the judge did. Its picks never show up as trips — they are applied by re-stubbing on the
- * next request — so without this section its work is invisible in the report.
- */
-function printJudgeSummary(judges: JudgeLogEntry[]): void {
-  if (judges.length === 0) return;
-  const ran = judges.filter((judge) => judge.skipped !== true && judge.error === undefined);
-  const failed = judges.filter((judge) => judge.error !== undefined);
-  const skipped = judges.filter((judge) => judge.skipped === true);
-  const sum = (pick: (judge: JudgeLogEntry) => number): number => judges.reduce((total, judge) => total + pick(judge), 0);
-  const reasons: [string, number][] = [
-    ["unknown id", sum((judge) => judge.rejected.unknownId)],
-    ["inside the protected window", sum((judge) => judge.rejected.protectedWindow)],
-    ["too small to be worth stubbing", sum((judge) => judge.rejected.tooSmall)],
-    ["quote not found in the block", sum((judge) => judge.rejected.keepMismatch)],
-    ["user block with no quote and no note", sum((judge) => judge.rejected.noKeepOrNote)],
-    ["assistant text", sum((judge) => judge.rejected.assistantText)],
-    ["quote or note on a non-user block", sum((judge) => judge.rejected.keepOnNonUserBlock)],
-  ];
-  const rejectedTotal = reasons.reduce((total, [, count]) => total + count, 0);
-
-  console.log("Judge:");
-  console.log(
-    `  calls: ${ran.length} answered, ${failed.length} failed after retry, ` +
-      `${skipped.length} skipped (one already running)`,
-  );
-  console.log(
-    `  picks: ${sum((judge) => judge.accepted)} accepted of ${sum((judge) => judge.proposed)} proposed — ` +
-      `${formatThousands(sum((judge) => judge.charsRemovedEstimate))} chars of content selected`,
-  );
-  console.log(`  rejected by guard: ${rejectedTotal} total`);
-  for (const [reason, count] of reasons) {
-    if (count > 0) console.log(`    ${String(count).padStart(4)}  ${reason}`);
-  }
-  console.log(
-    `  judge tokens: ${formatThousands(sum((judge) => judge.inputTokens ?? 0))} in, ` +
-      `${formatThousands(sum((judge) => judge.outputTokens ?? 0))} out`,
-  );
-  console.log(
-    `  ${"time".padEnd(8)}  ${"took".padStart(7)}  ${"proposed".padStart(8)}  ${"accepted".padStart(8)}  ` +
-      `${"chars".padStart(9)}  note`,
-  );
-  for (const judge of judges) {
-    const note = judge.skipped === true ? "skipped — a judge was already running" : (judge.error ?? "");
-    console.log(
-      `  ${timeOfDay(judge.timestamp)}  ${formatDuration(judge.durationMs).padStart(7)}  ` +
-        `${String(judge.proposed).padStart(8)}  ${String(judge.accepted).padStart(8)}  ` +
-        `${formatThousands(judge.charsRemovedEstimate).padStart(9)}  ${note}`,
-    );
-  }
-  console.log("");
-}
 
 function timeOfDay(isoTimestamp: string): string {
   const timePart = isoTimestamp.split("T")[1];
@@ -175,13 +122,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  const { requests, trips, judges } = parseProxyLog(proxyLogPath);
+  const { requests, trips } = parseProxyLog(proxyLogPath);
   const evictedIdCount = trips.reduce((sum, trip) => sum + trip.addedToolUseIds.length, 0);
   const tripCharsRemoved = trips.reduce((sum, trip) => sum + trip.charsRemoved, 0);
-  // Judge picks are applied by re-stubbing on a later request, so they never land in a trip
-  // record. Left out of the total, the headline under-reports everything the judge removed.
-  const judgeCharsRemoved = judges.reduce((sum, judge) => sum + judge.charsRemovedEstimate, 0);
-  const tokensEvictedOnce = Math.round((tripCharsRemoved + judgeCharsRemoved) / 4);
+  const tokensEvictedOnce = Math.round(tripCharsRemoved / 4);
   const cumulativeTokensKeptOut = requests.reduce(
     (sum, request) =>
       request.estimatedTokensBefore !== undefined && request.estimatedTokensSent !== undefined
@@ -193,19 +137,14 @@ async function main(): Promise<void> {
   console.log(`Proxy log: ${proxyLogPath}`);
   console.log(`  /v1/messages requests: ${requests.length}`);
   console.log(
-    `  eviction trips: ${trips.length} — ${evictedIdCount} segments evicted by the rules, ` +
+    `  eviction trips: ${trips.length} — ${evictedIdCount} segments evicted, ` +
       `${formatThousands(tripCharsRemoved)} chars removed`,
   );
-  if (judgeCharsRemoved > 0) {
-    console.log(`  judge picks: ${formatThousands(judgeCharsRemoved)} chars selected on top of the rules`);
-  }
-  console.log(`  tokens evicted (one-time, chars/4, rules + judge): ${formatThousands(tokensEvictedOnce)}`);
+  console.log(`  tokens evicted (one-time, chars/4): ${formatThousands(tokensEvictedOnce)}`);
   console.log(`  tokens kept out of requests (cumulative over turns): ${formatThousands(cumulativeTokensKeptOut)}`);
   console.log("");
   console.log(`Product metric — tokens evicted : tokens recalled = ${ratioLine(tokensEvictedOnce, recalledTokens)}`);
   console.log("");
-
-  printJudgeSummary(judges);
 
   if (requests.length === 0) return;
   printSpeedSummary(requests);
