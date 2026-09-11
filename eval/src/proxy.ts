@@ -40,6 +40,22 @@ export interface ProxyBuild {
   version: string;
 }
 
+/**
+ * What a child evicts by, as it said on startup. A child takes these from the environment around
+ * the run, so two runs of one build can evict differently, and the result document is the only
+ * place that tells them apart.
+ */
+export interface ProxySettings {
+  /** N: a block is eligible once this many assistant turns follow it. */
+  evictAfterTurns: number;
+  /** K: blocks inside the last K assistant turns are never touched. */
+  protectLastTurns: number;
+  /** T: the trip threshold, in tokens. */
+  tripTokens: number;
+  /** The batch minimum, in tokens. Null for a build from before it existed, which printed none. */
+  batchMinTokens: number | null;
+}
+
 export interface ProxyChild {
   baseUrl: string;
   port: number;
@@ -47,6 +63,8 @@ export interface ProxyChild {
   logFilePath: string;
   /** What the child said about its judge. Every arm expects "off". */
   judge: string;
+  /** What it said it evicts by, or null when it printed nothing this reads as settings. */
+  settings: ProxySettings | null;
   stop(): Promise<void>;
 }
 
@@ -130,6 +148,7 @@ export async function startProxyChild(build: ProxyBuild, options: ProxyChildOpti
     port: banner.port,
     logFilePath: banner.logFilePath,
     judge: banner.judge,
+    settings: banner.settings,
     stop,
   };
 }
@@ -163,6 +182,7 @@ interface Banner {
   port: number;
   logFilePath: string;
   judge: string;
+  settings: ProxySettings | null;
 }
 
 function waitForBanner(child: ProxyProcess, output: string[], timeoutMs: number): Promise<Banner> {
@@ -192,13 +212,34 @@ function waitForBanner(child: ProxyProcess, output: string[], timeoutMs: number)
   });
 }
 
-/** The three lines the child prints about itself. Absent any one of them, it is not ready. */
+/**
+ * The three lines the child prints about itself. Absent any one of them, it is not ready. The
+ * settings line comes before the judge's, so by the time a child is ready it has been printed.
+ */
 function parseBanner(text: string): Banner | null {
   const port = /listening on http:\/\/localhost:(\d+)/.exec(text);
   const log = /^\[onepass\] log: (.+)$/m.exec(text);
   const judge = /^\[onepass\] judge: (\w+)/m.exec(text);
   if (port === null || log === null || judge === null) return null;
-  return { port: Number(port[1]), logFilePath: (log[1] as string).trim(), judge: judge[1] as string };
+  return {
+    port: Number(port[1]),
+    logFilePath: (log[1] as string).trim(),
+    judge: judge[1] as string,
+    settings: parseSettings(text),
+  };
+}
+
+/** `evict after N=8 assistant turns, protect last K=4, trip over T=110000 …, batch min 20000 tokens`. */
+function parseSettings(text: string): ProxySettings | null {
+  const line = /^\[onepass\] evict after N=(\d+)\b.*?protect last K=(\d+)\b.*?trip over T=(\d+)\b(.*)$/m.exec(text);
+  if (line === null) return null;
+  const batchMin = /batch min (\d+) tokens/.exec(line[4] as string);
+  return {
+    evictAfterTurns: Number(line[1]),
+    protectLastTurns: Number(line[2]),
+    tripTokens: Number(line[3]),
+    batchMinTokens: batchMin === null ? null : Number(batchMin[1]),
+  };
 }
 
 /**

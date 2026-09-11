@@ -21,6 +21,8 @@ export interface RunCommand {
   compareWith: string | null;
   /** Where result documents are written, or null for the repository's own `eval/results`. */
   resultsDir: string | null;
+  /** The recording replay sends, or null for `planning`. Replay only. */
+  recording: string | null;
 }
 
 export interface ImportCommand {
@@ -71,6 +73,10 @@ result document.
 Run options
   --compare <label>      Report this run against a previous run's label.
   --results-dir <path>   Write the result document here instead of the repo's eval/results.
+  --recording <name>     Replay only: send the recording filed under this name instead of
+                         \`planning\`. The proxy child takes T, N, K and the batch minimum from
+                         the environment around the run, and a comparison refuses when the two
+                         runs differ in any of them or in the recording.
 
 Import
   Copies a session transcript into the corpus and prints the branch it holds: turn counts,
@@ -129,7 +135,7 @@ export function parseArgs(argv: readonly string[]): Command {
 }
 
 function parseRun(argv: readonly string[]): RunCommand {
-  const { positionals, values } = splitArgs(argv, ["--compare", "--results-dir"]);
+  const { positionals, values } = splitArgs(argv, ["--compare", "--results-dir", "--recording"]);
   if (positionals.length === 0) {
     throw new UsageError(
       `no mode given (expected ${MODES.join(", ")}, import, import-recordings, or prompts)`,
@@ -139,11 +145,16 @@ function parseRun(argv: readonly string[]): RunCommand {
 
   const mode = positionals[0] as string;
   if (!isMode(mode)) throw new UsageError(`unknown mode: ${mode} (expected ${MODES.join(", ")})`);
+  const recording = values.get("--recording") ?? null;
+  if (recording !== null && mode !== "replay") {
+    throw new UsageError(`--recording is for replay; ${mode} mode forks the planning session and sends no recording`);
+  }
   return {
     kind: "run",
     mode,
     compareWith: values.get("--compare") ?? null,
     resultsDir: values.get("--results-dir") ?? null,
+    recording,
   };
 }
 

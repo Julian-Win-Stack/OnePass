@@ -109,9 +109,9 @@ const RECORDED_REQUESTS = 12;
  * it arrived. The conversation deepens by one assistant turn each time, so the big tool result
  * starts inside the proxy's age gate and comes out the far side of it partway through.
  */
-function recordedSession(): string {
+function recordedSession(requests = RECORDED_REQUESTS): string {
   const dir = scratch("onepass-eval-dump-");
-  for (let index = 0; index < RECORDED_REQUESTS; index += 1) {
+  for (let index = 0; index < requests; index += 1) {
     const stamp = `2026-09-08T23-23-${String(index).padStart(2, "0")}-000Z`;
     const sequence = String(index + 1).padStart(6, "0");
     writeFileSync(join(dir, `${stamp}_${sequence}_v1_messages.json`), recordedBody(index + 1), "utf8");
@@ -438,6 +438,71 @@ test("a second replay of the same build diffs against the first and finds nothin
   assert.equal(diff?.comparedWith, first.label);
   assert.deepEqual(diff?.changes, [], "the same build on the same recording has to come out the same");
   assert.equal(diff?.unchanged, second.replay?.outcomes.length);
+});
+
+/** The shared corpus with a second, shorter recording filed beside `planning` under `other`. */
+let otherRecording: Promise<void> | null = null;
+
+function withOtherRecording(): Promise<void> {
+  otherRecording ??= runCli(["import-recordings", recordedSession(5), "--name", "other"]).then((run) => {
+    assert.equal(run.code, 0, run.stderr);
+  });
+  return otherRecording;
+}
+
+test("replay --recording sends the recording filed under that name", async () => {
+  await withOtherRecording();
+  const result = resultOf(await runCli(["replay", "--recording", "other"]));
+
+  assert.equal(result.replay?.recording.name, "other");
+  assert.equal(result.replay?.outcomes.length, 5);
+});
+
+test("the result records what the proxy child evicted by, as the environment around the run set it", async () => {
+  const run = await runCli(["replay"], { env: { ONEPASS_TRIP_TOKENS: "30000", ONEPASS_BATCH_MIN_TOKENS: "15000" } });
+  assert.equal(run.code, 0, run.stderr);
+  const result = resultOf(run);
+
+  assert.deepEqual(result.proxy.settings, {
+    evictAfterTurns: 8,
+    protectLastTurns: 4,
+    tripTokens: 30_000,
+    batchMinTokens: 15_000,
+  });
+  assert.match(readFileSync(join(run.results, `${result.label}.md`), "utf8"), /T = 30,000 tokens/);
+});
+
+test("--compare refuses a run whose proxy evicted by a different T, and names both", async () => {
+  const results = scratch("onepass-eval-results-");
+  const first = resultOf(await runCli(["replay"], { results, env: { ONEPASS_TRIP_TOKENS: "110000" } }));
+
+  const second = await runCli(["replay", "--compare", first.label], { results, env: { ONEPASS_TRIP_TOKENS: "30000" } });
+
+  assert.equal(second.code, 1);
+  assert.match(second.stderr, /T = 110,000/);
+  assert.match(second.stderr, /T = 30,000/);
+});
+
+test("--compare refuses a replay of a different recording", async () => {
+  await withOtherRecording();
+  const results = scratch("onepass-eval-results-");
+  const first = resultOf(await runCli(["replay"], { results }));
+
+  const second = await runCli(["replay", "--recording", "other", "--compare", first.label], { results });
+
+  assert.equal(second.code, 1);
+  assert.match(second.stderr, /replayed `planning`/);
+  assert.match(second.stderr, /`other`/);
+});
+
+test("with no --compare, a replay is reported against the last one of the same recording at the same settings", async () => {
+  const results = scratch("onepass-eval-results-");
+  const at110 = resultOf(await runCli(["replay"], { results, env: { ONEPASS_TRIP_TOKENS: "110000" } }));
+  const at30 = resultOf(await runCli(["replay"], { results, env: { ONEPASS_TRIP_TOKENS: "30000" } }));
+  const again = resultOf(await runCli(["replay"], { results, env: { ONEPASS_TRIP_TOKENS: "110000" } }));
+
+  assert.equal(at30.replay?.diff.comparedWith, null, "the only earlier replay ran at another T");
+  assert.equal(again.replay?.diff.comparedWith, at110.label, "the latest replay, at30, ran at another T");
 });
 
 test("a replay refuses when nothing has been recorded, and says how to record one", async () => {

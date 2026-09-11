@@ -78,6 +78,16 @@ test("the judge is held off even when a key is set in the environment around the
   );
 });
 
+test("a child reports the eviction settings it took from the environment around it", async () => {
+  await withProxyChild(
+    build,
+    { upstreamUrl: upstream.url, env: { ONEPASS_TRIP_TOKENS: "30000", ONEPASS_BATCH_MIN_TOKENS: "15000" } },
+    async (child) => {
+      assert.deepEqual(child.settings, { evictAfterTurns: 8, protectLastTurns: 4, tripTokens: 30_000, batchMinTokens: 15_000 });
+    },
+  );
+});
+
 test("a child is torn down after the run, however the run ended", async () => {
   const child = await startProxyChild(build, { upstreamUrl: upstream.url });
   const port = child.port;

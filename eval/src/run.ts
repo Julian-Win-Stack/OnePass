@@ -29,7 +29,7 @@ import { resolveCorpus } from "./corpus.js";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
 import { describeAnswerGroups, describeEligibility, describeNonCases, formatTokens } from "./format.js";
 import { openImported, PLANNING_SESSION } from "./importSession.js";
-import { buildProxyUnderTest, withProxyChild, type ProxyBuild } from "./proxy.js";
+import { buildProxyUnderTest, withProxyChild, type ProxyBuild, type ProxySettings } from "./proxy.js";
 import {
   conversationRequests,
   approximateTokens,
@@ -41,8 +41,10 @@ import {
 } from "./recordings.js";
 import { diffReplays, replayRecordings, totalsOf, type ReplayOutcome } from "./replay.js";
 import {
+  describeSettings,
   freeLabel,
   latestReplayedRun,
+  sameSettings,
   readRunResult,
   RESULT_SCHEMA,
   runLabel,
@@ -84,7 +86,8 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
   const resultsDir = options.resultsDir ?? join(repoRoot, "eval", "results");
 
   const corpus = resolveCorpus(env, repoRoot);
-  if (options.compareWith !== null && readRunResult(resultsDir, options.compareWith) === null) {
+  const comparedRun = options.compareWith === null ? null : readRunResult(resultsDir, options.compareWith);
+  if (options.compareWith !== null && comparedRun === null) {
     throw new EvalError(
       `no run labelled ${options.compareWith} in ${resultsDir}. ` +
         `A run is reported against a label that was written there; \`ls\` it for the ones that exist.`,
@@ -96,7 +99,8 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
   // costs nothing at all to catch, and a refusal after a fake upstream is listening would leave
   // the run holding an open server it never gets to close.
   const planning = openImported(corpus, PLANNING_SESSION);
-  const recordings = options.mode === "replay" ? readRecordings(corpus, PLANNING_RECORDING) : null;
+  const recordings =
+    options.mode === "replay" ? readRecordings(corpus, options.recording ?? PLANNING_RECORDING) : null;
 
   // Replay is the check run after every proxy fix, so it depends on as little as it can: no
   // control to compare against means no baseline, and no baseline means no reason to ask an
@@ -121,7 +125,9 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
     const child = await withProxyChild(build, { upstreamUrl: upstream }, async (started) => ({
       judge: started.judge,
       logFilePath: started.logFilePath,
+      settings: started.settings,
     }));
+    if (comparedRun !== null) refuseUnlikeComparison(comparedRun, child.settings, recordings?.name ?? null);
 
     const caseList = extractCases(planning.branch);
     const selected = selectCases(caseList.cases, options.mode);
@@ -148,6 +154,7 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
             runDir,
             resultsDir,
             compareWith: options.compareWith,
+            settings: child.settings,
             say,
           });
     if (replay !== null) problems.push(...driftProblems(replay));
@@ -167,6 +174,7 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
         dirty: build.dirty,
         version: build.version,
         judge: child.judge,
+        settings: child.settings,
         logs: [child.logFilePath],
       },
       corpusDir: corpus.dir,
@@ -195,6 +203,8 @@ interface ReplayContext {
   resultsDir: string;
   /** A run named on the command line to compare with, or null to take the last one that replayed. */
   compareWith: string | null;
+  /** What this run's child evicts by. With no run named, only one at the same settings is compared. */
+  settings: ProxySettings | null;
   say: (line: string) => void;
 }
 
@@ -224,9 +234,17 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
   // A scored run holds no replay outcomes, so a comparison with one has nothing to read. Naming it
   // anyway is answered by saying so — `comparedWith` is kept — rather than by quietly reporting
   // this build against nothing.
+  // Unnamed, the comparison is with the last replay of this recording at these settings: a replay
+  // at another T, or of another session, would be a diff of the settings or the session, not of
+  // the build. Named, a mismatch has already been refused.
   const against =
     context.compareWith === null
-      ? latestReplayedRun(context.resultsDir)
+      ? latestReplayedRun(
+          context.resultsDir,
+          (earlier) =>
+            earlier.replay?.recording.name === context.recordings.name &&
+            sameSettings(earlier.proxy.settings, context.settings),
+        )
       : readRunResult(context.resultsDir, context.compareWith);
   const previous: ReplayOutcome[] | null = against?.replay?.outcomes ?? null;
   return {
@@ -242,6 +260,29 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
     totals: totalsOf(outcomes),
     diff: diffReplays(against?.label ?? null, previous, outcomes),
   };
+}
+
+/**
+ * A comparison is only between two runs that evicted by the same settings and, when both replayed,
+ * sent the same recording. Two replays at different T come out different whatever the build, and
+ * before settings were recorded nothing in either document said so.
+ */
+function refuseUnlikeComparison(previous: RunResult, settings: ProxySettings | null, recording: string | null): void {
+  if (!sameSettings(previous.proxy.settings, settings)) {
+    throw new EvalError(
+      `${previous.label} ran its proxy at ${describeSettings(previous.proxy.settings)}, and this run's evicts at ` +
+        `${describeSettings(settings)}. A comparison across settings reports what the settings did, not the ` +
+        `build, so it is refused: run both at the same ONEPASS_TRIP_TOKENS, ONEPASS_EVICT_AFTER_TURNS, ` +
+        `ONEPASS_PROTECT_LAST_TURNS and ONEPASS_BATCH_MIN_TOKENS.`,
+    );
+  }
+  const previousRecording = previous.replay?.recording.name ?? null;
+  if (recording !== null && previousRecording !== null && previousRecording !== recording) {
+    throw new EvalError(
+      `${previous.label} replayed \`${previousRecording}\` and this run replays \`${recording}\`. Two sessions ` +
+        `are not a comparison of two builds, so it is refused.`,
+    );
+  }
 }
 
 /** Anything about the case list a reader has to be told rather than left to notice. */

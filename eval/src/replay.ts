@@ -73,6 +73,15 @@ export interface ReplayOutcome {
   stubExamples: string[];
   estimatedTokensBefore: number | null;
   estimatedTokensSent: number | null;
+  /**
+   * What this request's trip took, in tokens at the ratio the child used for it. Zero when it took
+   * nothing; null when the child logged no size for it, which a build from before this field does.
+   */
+  newlyEvictedTokens: number | null;
+  /** Over T, but the batch came to less than the batch minimum, so this many tokens were held back. */
+  heldBackTokens: number | null;
+  /** Sent more than 40k tokens over T: the floor has outgrown what eviction can hold. */
+  aboveAlarmLine: boolean;
   /** The forwarded body under the run's corpus directory, for reported requests; null otherwise. */
   bodyPath: string | null;
 }
@@ -89,6 +98,8 @@ export interface ReplayOptions {
   reported: ReadonlySet<string>;
   /** Called before each request goes through, so a long sequence shows progress. */
   onRequest?: (recording: Recording, position: number, total: number) => void;
+  /** Extra environment for the child. A run sets none: the child takes T and the rest from its own. */
+  childEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -102,7 +113,8 @@ export async function replayRecordings(options: ReplayOptions): Promise<ReplayOu
   mkdirSync(bodiesDir, { recursive: true });
   const requests = options.recordings.requests;
 
-  return withProxyChild(options.build, { upstreamUrl: options.upstream.url }, async (child) => {
+  const childOptions = { upstreamUrl: options.upstream.url, ...(options.childEnv ? { env: options.childEnv } : {}) };
+  return withProxyChild(options.build, childOptions, async (child) => {
     const outcomes: ReplayOutcome[] = [];
     for (const [index, recording] of requests.entries()) {
       options.onRequest?.(recording, index + 1, requests.length);
@@ -159,6 +171,9 @@ async function replayOne(
     stubExamples: stubs.slice(0, STUB_EXAMPLES),
     estimatedTokensBefore: logged.estimatedTokensBefore,
     estimatedTokensSent: logged.estimatedTokensSent,
+    newlyEvictedTokens: logged.newlyEvictedTokens,
+    heldBackTokens: logged.heldBackTokens,
+    aboveAlarmLine: logged.aboveAlarmLine,
     bodyPath,
   };
 }
@@ -168,6 +183,9 @@ interface LoggedRequest {
   newlyEvicted: number;
   estimatedTokensBefore: number | null;
   estimatedTokensSent: number | null;
+  newlyEvictedTokens: number | null;
+  heldBackTokens: number | null;
+  aboveAlarmLine: boolean;
 }
 
 /**
@@ -184,11 +202,17 @@ async function waitForRequestEntry(logFilePath: string, index: number, id: strin
     const requests = readLog(logFilePath).filter((entry) => entry.kind === "request");
     const entry = requests[index];
     if (entry !== undefined) {
+      const evictedChars = numberOrNull(entry.newlyEvictedCharsRemoved);
+      const charsPerToken = numberOrNull(entry.charsPerToken);
       return {
         overThreshold: entry.overThreshold === true,
         newlyEvicted: typeof entry.newlyEvictedCount === "number" ? entry.newlyEvictedCount : 0,
         estimatedTokensBefore: numberOrNull(entry.estimatedTokensBefore),
         estimatedTokensSent: numberOrNull(entry.estimatedTokensSent),
+        newlyEvictedTokens:
+          evictedChars === null || charsPerToken === null ? null : Math.round(evictedChars / charsPerToken),
+        heldBackTokens: numberOrNull(entry.heldBackTokens),
+        aboveAlarmLine: entry.aboveAlarmLine === true,
       };
     }
     if (Date.now() >= deadline) {
@@ -208,6 +232,10 @@ interface LogEntry {
   newlyEvictedCount?: unknown;
   estimatedTokensBefore?: unknown;
   estimatedTokensSent?: unknown;
+  newlyEvictedCharsRemoved?: unknown;
+  charsPerToken?: unknown;
+  heldBackTokens?: unknown;
+  aboveAlarmLine?: unknown;
 }
 
 function readLog(path: string): LogEntry[] {
@@ -280,9 +308,23 @@ export interface ReplayTotals {
   stubbed: number;
   /** Bytes the proxy forwarded, summed. What eviction bought over the whole session. */
   forwardedBytes: number;
+  /**
+   * Requests that evicted something new. Each one changes the middle of the conversation, so each
+   * makes the API rewrite its cache from there on: this is the number the batch minimum exists to cut.
+   */
+  trips: number;
+  /** The biggest request the proxy sent, by its own estimate; null when it logged no estimate at all. */
+  peakEstimatedTokensSent: number | null;
+  /** Tokens evicted for the first time, summed over the requests the child logged a size for. */
+  newlyEvictedTokens: number;
+  /** Requests over T whose batch was held back under the batch minimum. */
+  heldBack: number;
+  /** Requests sent more than 40k tokens over T. */
+  aboveAlarmLine: number;
 }
 
 export function totalsOf(outcomes: readonly ReplayOutcome[]): ReplayTotals {
+  const sent = outcomes.flatMap((outcome) => (outcome.estimatedTokensSent === null ? [] : [outcome.estimatedTokensSent]));
   return {
     requests: outcomes.length,
     overThreshold: outcomes.filter((outcome) => outcome.overThreshold).length,
@@ -291,6 +333,11 @@ export function totalsOf(outcomes: readonly ReplayOutcome[]): ReplayTotals {
     newlyEvicted: outcomes.reduce((sum, outcome) => sum + outcome.newlyEvicted, 0),
     stubbed: outcomes.reduce((sum, outcome) => sum + outcome.stubbed, 0),
     forwardedBytes: outcomes.reduce((sum, outcome) => sum + outcome.forwardedBytes, 0),
+    trips: outcomes.filter((outcome) => outcome.newlyEvicted > 0).length,
+    peakEstimatedTokensSent: sent.length === 0 ? null : Math.max(...sent),
+    newlyEvictedTokens: outcomes.reduce((sum, outcome) => sum + (outcome.newlyEvictedTokens ?? 0), 0),
+    heldBack: outcomes.filter((outcome) => outcome.heldBackTokens !== null).length,
+    aboveAlarmLine: outcomes.filter((outcome) => outcome.aboveAlarmLine).length,
   };
 }
 

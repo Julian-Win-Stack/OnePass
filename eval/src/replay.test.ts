@@ -13,7 +13,7 @@ import { resolveCorpus } from "./corpus.js";
 import { startFakeUpstream, type FakeUpstream } from "./fakeUpstream.js";
 import { buildProxyUnderTest, type ProxyBuild } from "./proxy.js";
 import { importRecordings, type RecordingSet } from "./recordings.js";
-import { diffReplays, replayRecordings, STUB_PREFIX, type ReplayOutcome } from "./replay.js";
+import { diffReplays, replayRecordings, STUB_PREFIX, totalsOf, type ReplayOutcome } from "./replay.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -37,9 +37,9 @@ function scratch(prefix = "onepass-replay-"): string {
  * A request body shaped like a deep session turn: one large tool result, then enough assistant
  * turns after it that the proxy's age gate has let go of it, and a typed turn at the end.
  */
-function deepBody(resultChars: number, turnsAfter = 10): string {
+function deepBody(resultChars: number, turnsAfter = 10, typedChars = 0): string {
   const messages: unknown[] = [
-    { role: "user", content: [{ type: "text", text: "read the file" }] },
+    { role: "user", content: [{ type: "text", text: `read the file${" please".repeat(typedChars / 7)}` }] },
     { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "x".repeat(resultChars) }] },
   ];
@@ -52,13 +52,19 @@ function deepBody(resultChars: number, turnsAfter = 10): string {
 }
 
 /** A recording of the given bodies, filed into a corpus of its own, in the order they are listed. */
-function recordingOf(bodies: readonly { chars: number; count?: boolean; turnsAfter?: number }[]): RecordingSet {
+function recordingOf(
+  bodies: readonly { chars: number; count?: boolean; turnsAfter?: number; typedChars?: number }[],
+): RecordingSet {
   const dumpDir = scratch("onepass-dump-");
   for (const [index, body] of bodies.entries()) {
     const stamp = `2026-09-08T23-23-${String(index).padStart(2, "0")}-000Z`;
     const suffix = body.count === true ? "_v1_messages_count_tokens.json" : "_v1_messages.json";
     const sequence = String(index + 1).padStart(6, "0");
-    writeFileSync(join(dumpDir, `${stamp}_${sequence}${suffix}`), deepBody(body.chars, body.turnsAfter), "utf8");
+    writeFileSync(
+      join(dumpDir, `${stamp}_${sequence}${suffix}`),
+      deepBody(body.chars, body.turnsAfter, body.typedChars),
+      "utf8",
+    );
   }
   const corpus = resolveCorpus({ ONEPASS_EVAL_CORPUS: scratch("onepass-corpus-") }, scratch("onepass-repo-"));
   return importRecordings(corpus, dumpDir);
@@ -81,6 +87,11 @@ test("a request over the threshold trips the build and comes back stubbed", asyn
   assert.deepEqual(listed, ["1/1 req-0001"], "each request is offered to the caller as it goes");
   assert.equal(outcome.overThreshold, true);
   assert.equal(outcome.newlyEvicted, 1);
+  // (600,000 − 32) chars at the proxy's uncalibrated 3.2 chars per token: what the trip took, in the
+  // unit T and the batch minimum are written in.
+  assert.equal(outcome.newlyEvictedTokens, 187_490);
+  assert.equal(outcome.heldBackTokens, null);
+  assert.equal(outcome.aboveAlarmLine, false, "the stub brought it far under T + 40k");
   // One evictable block in the request, so one stub — and the stub itself is what the model would
   // read in its place, so it is pinned rather than matched on its opening.
   assert.equal(outcome.stubbed, 1, `stubbed ${outcome.stubbed}: ${JSON.stringify(outcome)}`);
@@ -129,6 +140,21 @@ test("a request over the line whose content is too young to take says so, rather
   assert.equal(outcome.newlyEvicted, 0);
   assert.equal(outcome.stubbed, 0);
   assert.equal(outcome.forwardedBytes, outcome.recordedBytes, "nothing was taken, so nothing changed");
+});
+
+test("a batch under the minimum is held back, and a request over T + 40k says it is above the alarm line", async () => {
+  // 700,000 chars of typed text are ~219k tokens the rules may never take. The one block they may,
+  // a 10,000-char result, frees (10,000 − 31) ÷ 3.2 = 3,115 tokens: under a 20k minimum.
+  const [outcome] = (await replayRecordings({
+    ...options(recordingOf([{ chars: 10_000, typedChars: 700_000 }]), []),
+    childEnv: { ONEPASS_TRIP_TOKENS: "110000", ONEPASS_BATCH_MIN_TOKENS: "20000" },
+  })) as [ReplayOutcome];
+
+  assert.equal(outcome.overThreshold, true);
+  assert.equal(outcome.newlyEvicted, 0);
+  assert.equal(outcome.newlyEvictedTokens, 0);
+  assert.equal(outcome.heldBackTokens, 3_115);
+  assert.equal(outcome.aboveAlarmLine, true);
 });
 
 test("a request under the threshold goes through untouched", async () => {
@@ -183,10 +209,35 @@ function outcome(overrides: Partial<ReplayOutcome> & { id: string }): ReplayOutc
     stubExamples: [`${STUB_PREFIX} 600,000 chars]`],
     estimatedTokensBefore: 200_000,
     estimatedTokensSent: 100_000,
+    newlyEvictedTokens: 1_000,
+    heldBackTokens: null,
+    aboveAlarmLine: false,
     bodyPath: "/tmp/body.json",
     ...overrides,
   };
 }
+
+test("the totals count trips, the peak sent, the tokens taken, and what was held back or over the alarm line", () => {
+  const totals = totalsOf([
+    outcome({ id: "req-0001", newlyEvicted: 3, newlyEvictedTokens: 25_000, estimatedTokensSent: 100_000 }),
+    outcome({
+      id: "req-0002",
+      newlyEvicted: 0,
+      newlyEvictedTokens: 0,
+      heldBackTokens: 9_000,
+      aboveAlarmLine: true,
+      estimatedTokensSent: 151_000,
+    }),
+    outcome({ id: "req-0003", newlyEvicted: 5, newlyEvictedTokens: 21_000, estimatedTokensSent: 118_000 }),
+    outcome({ id: "req-0004", newlyEvicted: 0, newlyEvictedTokens: null, estimatedTokensSent: null }),
+  ]);
+
+  assert.equal(totals.trips, 2);
+  assert.equal(totals.peakEstimatedTokensSent, 151_000);
+  assert.equal(totals.newlyEvictedTokens, 46_000);
+  assert.equal(totals.heldBack, 1);
+  assert.equal(totals.aboveAlarmLine, 1);
+});
 
 test("the diff names what moved, and counts what did not", () => {
   // req-0003 is the request that evicted nothing last time, so it is where a change in the

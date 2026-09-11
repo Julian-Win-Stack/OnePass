@@ -17,7 +17,14 @@ function aResult(overrides: Partial<RunResult> = {}): RunResult {
     finishedAt: "2026-09-06T10:11:20.000Z",
     durationMs: 8000,
     comparedWith: null,
-    proxy: { shortSha: "a001c2b", dirty: false, version: "0.2.0", judge: "off", logs: ["/tmp/proxy.log.jsonl"] },
+    proxy: {
+      shortSha: "a001c2b",
+      dirty: false,
+      version: "0.2.0",
+      judge: "off",
+      settings: { evictAfterTurns: 8, protectLastTurns: 4, tripTokens: 30_000, batchMinTokens: 20_000 },
+      logs: ["/tmp/proxy.log.jsonl"],
+    },
     corpusDir: "/tmp/corpus",
     upstream: "https://api.anthropic.com",
     baselines: [
@@ -91,6 +98,7 @@ test("the rendered table names the build, the baseline and the corpus without re
   assert.match(table, /2\.1\.261/);
   assert.match(table, /\/tmp\/corpus/);
   assert.match(table, /judge \| off/);
+  assert.match(table, /evicts by \| T = 30,000 tokens, N = 8, K = 4, batch minimum 20,000 tokens/);
 });
 
 test("an uncommitted build is called out in the table, not only in the label", () => {

@@ -23,6 +23,7 @@ import {
   describeSizing,
   formatTokens,
 } from "./format.js";
+import type { ProxySettings } from "./proxy.js";
 import type { ReplayDiff, ReplayOutcome, ReplayTotals } from "./replay.js";
 
 /** Bumped when a field older result documents carry stops meaning what it did. */
@@ -116,6 +117,12 @@ export interface RunResult {
     version: string;
     /** What the proxy children reported about their judge. Every arm expects "off". */
     judge: string;
+    /**
+     * What the children said they evict by. Two runs of one build at different T are different
+     * runs, and nothing else in the document says so. Null when the child printed nothing readable
+     * as settings; absent from documents written before it was recorded.
+     */
+    settings: ProxySettings | null;
     /** The proxy's own logs, one per child: trips, rebuilds, first-byte latency. */
     logs: string[];
   };
@@ -135,6 +142,33 @@ export interface RunResult {
   problems: Problem[];
   /** Anything a reader has to know to read the numbers honestly. */
   notes: string[];
+}
+
+/** A child's settings in one line, the way the table and a refusal both print them. */
+export function describeSettings(settings: ProxySettings | null | undefined): string {
+  if (settings == null) return "settings it did not record";
+  const tokens = (n: number): string => n.toLocaleString("en-US");
+  const batchMin =
+    settings.batchMinTokens === null
+      ? "no batch minimum (a build from before it)"
+      : settings.batchMinTokens === 0
+        ? "batch minimum off"
+        : `batch minimum ${tokens(settings.batchMinTokens)} tokens`;
+  return (
+    `T = ${tokens(settings.tripTokens)} tokens, N = ${settings.evictAfterTurns}, ` +
+    `K = ${settings.protectLastTurns}, ${batchMin}`
+  );
+}
+
+/** Both known and alike in every field. Unknown settings match nothing, not even each other. */
+export function sameSettings(one: ProxySettings | null | undefined, other: ProxySettings | null | undefined): boolean {
+  if (one == null || other == null) return false;
+  return (
+    one.evictAfterTurns === other.evictAfterTurns &&
+    one.protectLastTurns === other.protectLastTurns &&
+    one.tripTokens === other.tripTokens &&
+    one.batchMinTokens === other.batchMinTokens
+  );
 }
 
 /** `<short sha>[-dirty]-<start time>`, e.g. `a001c2b-20260906T101112Z`. */
@@ -254,6 +288,19 @@ function renderReplay(result: RunResult): string[] {
   row("blocks evicted, first time", before?.newlyEvicted ?? null, totals.newlyEvicted);
   row("stubs sent", before?.stubbed ?? null, totals.stubbed);
   row("bytes forwarded", before === null ? null : formatBytes(before.forwardedBytes), formatBytes(totals.forwardedBytes));
+  // Documents written before these were recorded carry none of them, so a previous column reads
+  // blank for them rather than zero.
+  const was = (value: number | null | undefined): string | null =>
+    before === null ? null : value == null ? "not recorded" : String(value);
+  row("trips (requests that evicted something new)", was(before?.trips), totals.trips);
+  row(
+    "peak estimated tokens sent",
+    before === null ? null : before.peakEstimatedTokensSent == null ? "not recorded" : formatTokens(before.peakEstimatedTokensSent),
+    totals.peakEstimatedTokensSent === null ? "not recorded" : formatTokens(totals.peakEstimatedTokensSent),
+  );
+  row("tokens evicted, first time", was(before?.newlyEvictedTokens), totals.newlyEvictedTokens);
+  row("over T with the batch held back", was(before?.heldBack), totals.heldBack);
+  row("above the alarm line (T + 40k)", was(before?.aboveAlarmLine), totals.aboveAlarmLine);
   lines.push("");
 
   lines.push(...renderReported(result.replay.reported, outcomes));
@@ -297,15 +344,18 @@ function renderReported(reported: readonly string[], outcomes: readonly ReplayOu
   if (rows.length === 0) return [];
   const lines: string[] = [`### The ${rows.length} deepest requests`, ""];
   lines.push(
-    "| request | of | est. before | est. sent | forwarded | over T | new | stubs | stub |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| request | of | est. before | est. sent | forwarded | over T | new | held back | alarm | stubs | stub |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   );
   for (const outcome of rows) {
+    // `?? null`: an outcome from a document written before these fields has neither.
+    const heldBack = outcome.heldBackTokens ?? null;
     lines.push(
       `| ${outcome.id} | ${outcome.position} | ${formatTokens(outcome.estimatedTokensBefore)} | ` +
         `${formatTokens(outcome.estimatedTokensSent)} | ${formatBytes(outcome.forwardedBytes)} | ` +
-        `${outcome.overThreshold ? "yes" : "no"} | ${outcome.newlyEvicted} | ${outcome.stubbed} | ` +
-        `${outcome.stubbed === 0 ? "none" : `\`${outcome.stubDigest}\``} |`,
+        `${outcome.overThreshold ? "yes" : "no"} | ${outcome.newlyEvicted} | ` +
+        `${heldBack === null ? "" : formatTokens(heldBack)} | ${outcome.aboveAlarmLine === true ? "above" : ""} | ` +
+        `${outcome.stubbed} | ${outcome.stubbed === 0 ? "none" : `\`${outcome.stubDigest}\``} |`,
     );
   }
   lines.push("");
@@ -317,11 +367,14 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * The most recent run in `resultsDir` that replayed anything. A scored run holds no replay
- * outcomes, so diffing against one would report every case as newly appeared; only a run that
- * replayed is a build's replay behaviour written down.
+ * The most recent run in `resultsDir` that replayed anything and that `accept` takes. A scored run
+ * holds no replay outcomes, so diffing against one would report every case as newly appeared; only
+ * a run that replayed is a build's replay behaviour written down.
  */
-export function latestReplayedRun(resultsDir: string): RunResult | null {
+export function latestReplayedRun(
+  resultsDir: string,
+  accept: (result: RunResult) => boolean = () => true,
+): RunResult | null {
   let names: string[];
   try {
     names = readdirSync(resultsDir);
@@ -334,7 +387,7 @@ export function latestReplayedRun(resultsDir: string): RunResult | null {
   let latest: RunResult | null = null;
   for (const label of labels) {
     const result = readRunResult(resultsDir, label);
-    if (result?.replay == null || result.replay.outcomes.length === 0) continue;
+    if (result?.replay == null || result.replay.outcomes.length === 0 || !accept(result)) continue;
     if (latest === null || result.startedAt > latest.startedAt) latest = result;
   }
   return latest;
@@ -349,6 +402,7 @@ export function renderRunResult(result: RunResult): string {
   lines.push(`| build | \`${result.proxy.shortSha}\`${result.proxy.dirty ? " **with uncommitted changes**" : ""} |`);
   lines.push(`| proxy version | ${result.proxy.version} |`);
   lines.push(`| judge | ${result.proxy.judge} |`);
+  lines.push(`| evicts by | ${describeSettings(result.proxy.settings)} |`);
   lines.push(`| upstream | ${result.upstream} |`);
   lines.push(`| corpus | ${result.corpusDir} |`);
   lines.push(`| compared with | ${result.comparedWith ?? "nothing"} |`);

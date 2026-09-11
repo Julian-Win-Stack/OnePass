@@ -37,6 +37,18 @@ test("takes a results directory", () => {
   assert.equal(run(["full", "--results-dir", "/tmp/out"]).resultsDir, "/tmp/out");
 });
 
+test("replay takes the recording to send, and defaults to the planning one", () => {
+  assert.equal(run(["replay", "--recording", "harbor-make-mips"]).recording, "harbor-make-mips");
+  assert.equal(run(["replay"]).recording, null);
+});
+
+test("a scored run refuses a recording: it does not replay one", () => {
+  assert.throws(
+    () => parseArgs(["quick", "--recording", "harbor-make-mips"]),
+    (err: unknown) => err instanceof UsageError && /--recording is for replay/.test(err.message),
+  );
+});
+
 test("refuses a missing mode", () => {
   assert.throws(() => parseArgs([]), (err: unknown) => err instanceof UsageError && /no mode given/.test(err.message));
 });
