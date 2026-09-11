@@ -19,6 +19,22 @@ _Avoid_: placeholder, tombstone, summary
 A request whose projected size crossed the threshold, causing new blocks to be evicted.
 _Avoid_: compaction, threshold event
 
+**Batch minimum**:
+The least a trip may newly evict. A batch under it is held back, and that content waits for a
+later request where the batch has grown past the minimum.
+_Avoid_: gate, floor
+
+**Floor**:
+The part of a request no rule may evict: the system prompt, the tool definitions, the last K
+turns, and any segment whose stub would not save enough. It grows with the session, and once it
+passes T every request is over the threshold.
+_Avoid_: baseline, fixed part
+
+**Alarm line**:
+The size above which a sent request is recorded as too big, `T + 40k`. It is written to the log
+and nothing else — it never holds a request back or changes what is evicted.
+_Avoid_: hard line, ceiling
+
 **Recall**:
 Fetching evicted content verbatim from the session transcript, by search or by id.
 _Avoid_: retrieval, memory lookup

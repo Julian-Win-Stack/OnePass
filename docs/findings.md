@@ -89,8 +89,12 @@ Across the 6 largest sessions:
 that point on. Eviction and caching are in direct tension; eviction must happen in batches at
 boundaries, not continuously.
 
-Anthropic's server-side context editing avoids this by editing after cache lookup. A client-side
-proxy cannot.
+Anthropic's server-side context editing does **not** avoid this, and an earlier version of this
+section said it did. Their own documentation is explicit — tool-result clearing invalidates the
+cached prompt prefix — and the `clear_at_least` parameter exists for exactly that reason: it holds
+an edit back until it would remove enough to be worth the rewrite it forces. Server-side or
+client-side, editing the middle of the message array costs a cache rewrite. The only defence is to
+edit rarely and remove a lot each time, which is what §21's batch minimum does.
 
 ## 8. The agent never reaches for its own transcript
 
@@ -940,6 +944,124 @@ answers short. `--setting-sources ""` removes it.
 - The five repos differ in more than the proxy: §19 records that these runs had no recall tools
   registered, so an evicted arm had no recovery path at all.
 
+## 21. The cost was a swarm of tiny trips, and a batch minimum removes it
+
+**Verdict, from replay only — no live run has been made yet.** A trip costs a prompt-cache
+rewrite whatever it removes, so the number that decides the bill is how *often* the proxy trips,
+not how much it evicts. Once a session's un-evictable floor passes T, every request is over the
+line, and the build that ran the $200 Harbor pass (§20's era, proxied runs at ~4× control) tripped
+on almost every one of them to remove a few hundred tokens each: **112 trips in 120 requests** on
+one recording, **50 in 68** on another. Requiring a trip to newly evict at least 20,000 tokens —
+`ONEPASS_BATCH_MIN_TOKENS`, default 20,000, `0` restores the old behaviour — takes those to **5**
+and **1**. The same content still leaves the request; the peak rises by 5.6k–9.2k tokens, which is
+the cost of holding a batch back. On the same evidence the default trip threshold moves **110k →
+80k**.
+
+Three recordings, each every `/v1/messages` body one real proxied Harbor run sent, replayed in
+order through one proxy child against a fake upstream. No model is called and nothing is billed.
+Build `e2fc221`. Trips = requests with `newlyEvicted > 0`; peak = max `estimatedTokensSent`.
+
+**`harbor-make-mips`, 120 requests** (the recording the thresholds were tuned on):
+
+| T | minimum | trips | per 100 | peak sent | newly evicted | requests held back | over the alarm line |
+|---|---|---|---|---|---|---|---|
+| 110k | off | 2 | 1.7 | 100,614 | 100,974 | 0 | 0 |
+| 110k | 15k | 2 | 1.7 | 100,614 | 100,974 | 0 | 0 |
+| 110k | 20k | 2 | 1.7 | 100,614 | 100,974 | 0 | 0 |
+| 110k | 30k | 2 | 1.7 | 100,614 | 100,974 | 0 | 0 |
+| 80k | off | 5 | 4.2 | 79,878 | 119,984 | 0 | 0 |
+| 80k | 20k | 4 | 3.3 | 88,993 | 116,304 | 1 | 0 |
+| 30k | off | **112** | 93.3 | 70,044 | 123,598 | 0 | 1 |
+| 30k | 15k | 6 | 5.0 | 77,644 | 111,148 | 108 | 19 |
+| 30k | 20k | **5** | 4.2 | 77,542 | 118,461 | 108 | 22 |
+| 30k | 30k | 3 | 2.5 | 91,635 | 101,506 | 111 | 54 |
+
+**`harbor-corewars`, 68 requests** (a session whose floor is far above any T tried):
+
+| T | minimum | trips | per 100 | peak sent | newly evicted | requests held back | over the alarm line |
+|---|---|---|---|---|---|---|---|
+| 110k | off | 34 | 50.0 | 150,811 | 27,297 | 0 | 5 |
+| 110k | 20k | **1** | 1.5 | 156,419 | 20,229 | 40 | 10 |
+| 80k | off | **50** | 73.5 | 150,811 | 27,421 | 0 | 22 |
+| 80k | 20k | **1** | 1.5 | 156,419 | 20,229 | 49 | 39 |
+
+**`harbor-sam-cell-seg`, 117 requests:**
+
+| T | minimum | trips | per 100 | peak sent | newly evicted | requests held back | over the alarm line |
+|---|---|---|---|---|---|---|---|
+| 110k | off | 8 | 6.8 | 141,882 | 494,102 | 0 | 0 |
+| 110k | 20k | 4 | 3.4 | 158,046 | 494,506 | 4 | 1 |
+
+**Against the bars, agreed before the numbers** — at each T, the minimum against the same
+recording with the minimum off: trips ≤ 0.2×, peak ≤ +20k, newly evicted ≥ −20k.
+
+| recording | T | trips | peak | evicted |
+|---|---|---|---|---|
+| make-mips | 110k | **fail** (2, needs ≤ 0.4) | pass (equal) | pass |
+| make-mips | 30k | pass (5 ≤ 22.4) | pass (77,542 ≤ 90,044) | pass (118,461 ≥ 103,598) |
+| corewars | 110k | pass (1 ≤ 6.8) | pass (156,419 ≤ 170,811) | pass (20,229 ≥ 7,297) |
+| corewars | 80k | pass (1 ≤ 10.0) | pass (156,419 ≤ 170,811) | pass (20,229 ≥ 7,421) |
+| sam-cell-seg | 110k | **fail** (4, needs ≤ 1.6) | pass (158,046 ≤ 161,882) | pass |
+
+Both failures are the same artefact and neither is a failure of the mechanism: a ratio bar cannot
+be met when the baseline is already small. make-mips at 110k trips **twice** in 120 requests, both
+times evicting ~50k, so 0.2 × 2 = 0.4 is unreachable by anything short of never evicting at all;
+sam-cell-seg trips 8 times and the minimum halves that to 4. The bar bites where it was meant to —
+on the swarms — and there it passes with room to spare. The bars were not moved.
+
+**The faithfulness check passed exactly.** At T=30k with the minimum off the replay makes 112
+trips, which is what the real Harbor run made. That check is what licenses every other number
+here; it failed at first, and the fix is below.
+
+**Tuning record.** 15k, 20k and 30k were tried on make-mips at T=30k, the only arm where a bar
+failed at 20k. 15k passes all three bars; 30k fails two — peak 91,635 against a 90,044 limit, and
+101,506 evicted against a 103,598 floor. 20k passes and sits in the middle of the two, so it
+stays. Nothing else was tuned; every value tried is a row in the tables above.
+
+**80k, decided by the rule written before the measurement** (with the minimum on: ≤ 10 trips per
+100 requests and peak ≤ 140k). make-mips at T=80k gives 3.3 and 88,993. The default moves to 80k.
+Lowering T is close to free here: on corewars the peak is **identical at 110k and 80k** —
+150,811 either way — because the peak is set by the un-evictable floor, not by T.
+
+**Which is also what the alarm line is for.** A request sent over `T + 40k` is recorded and
+nothing else: 39 of corewars' 68 requests at T=80k, against 22 with the minimum off. That is not
+the minimum misbehaving — it is the floor being larger than T + 40k, a condition no amount of
+eviction can fix, and the alarm is how it becomes visible instead of being inferred from a bill. A
+hard ceiling was rejected for the same reason: it could only fail requests the proxy is unable to
+shrink. The `T + 40k` sizing advice in `proxy/README.md` becomes `T + 60k` to match what the
+peaks above actually do.
+
+**The replay had to be fixed before any of this counted.** The proxy sizes requests in real
+tokens, calibrating chars-per-token from each response's `usage`. The fake upstream answered at a
+flat 4 chars/token where the real traffic had run at 2.5–3.5, so every replayed request measured
+~20% small and crossed the threshold late: T=30k with the minimum off gave **97 trips against the
+real run's 112**. All 97 were genuine; 15 were missing. `import-recordings --proxy-log <log>` now
+pairs each recorded body with the usage line it produced and stores the ratio (sent bytes ÷
+input + cache-creation + cache-read tokens), and the fake answers at it. The stored ratio predicts
+the proxy's own next calibration in **117 of 118** requests — the miss is a concurrent
+`count_tokens`. A recording imported without a log still replays at the constant, and the result
+document says so.
+
+**One deviation from the plan.** The plan asked `--compare` to refuse when the batch minimum
+differs between two runs, and then compared a 20k run against a 0 run in its own commands. Since
+that comparison is the entire point, a named `--compare` may cross the batch minimum and the
+result carries a note saying the diff is what the minimum did rather than what the build did;
+T, N and K must still match, and an implicit comparison still requires everything to match.
+
+**Caveats.**
+- Replay, not life. No model is in the path, the agent makes no decisions, and nothing here says
+  what the API charged. A live run through the Harbor rig is still outstanding.
+- Three recordings from two Harbor jobs, all one agent on one kind of task. The floor-above-T
+  case they demonstrate is the one the mechanism targets; how common it is across real sessions is
+  not measured here.
+- The minimum makes requests bigger, by 5.6k on corewars and 7.5k on make-mips at T=30k. That is
+  the trade being made, and the peak bar is what bounds it.
+- corewars evicts only ~27k in total either way: it is a short session with a huge fixed floor, so
+  it shows the trip-frequency effect clearly and says nothing about how much can be evicted.
+- Every ratio in the fidelity fix is an aggregate over a whole request; the proxy's own clamp
+  (2–8 chars/token, ignoring samples under 1,000 tokens) still applies, so a recorded 22.2 on
+  sam-cell-seg is clamped exactly as the live proxy clamped it.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -971,6 +1093,10 @@ answers short. `--setting-sources ""` removes it.
   the wall-clock ordering (35.0 vs 38.0 min) does not, and neither does the imitation count,
   which scales with how many calls got stubbed. The judge's two runs differ in build as well
   as in luck — treat "1 accepted pick" as the order of magnitude, not the number.
+- §21 is replay only: recorded request bodies against a fake upstream, no model and no bill. It
+  measures what the eviction code does with real inputs, not what a session costs. Two of its
+  seven bar sets fail the trips bar, both on recordings whose baseline trips 2 and 8 times, where
+  a 0.2× ratio is unreachable; the section says so rather than restating the bar.
 
 ## Reproducing
 
@@ -1014,6 +1140,24 @@ worktree — whether the arm modified `stores/convex/src/server/index-map.ts` at
 transcript is read, because an arm that never opened the file cannot have had it evicted. Scoring
 the failing assertion by name needs the staged ground-truth tests run without `score.sh`'s own
 `tail -25`, which truncates the failure list.
+
+§21 is reproducible from the eval, with no API key and no network. Import a Harbor job's dumped
+bodies together with the proxy log that job wrote — the log is what carries the real
+chars-per-token ratios, and without it the replay is not faithful:
+
+```
+cd eval && npx tsc
+node dist/main.js import-recordings <job>/agent/onepass/bodies \
+  --name harbor-corewars --proxy-log <job>/agent/onepass/proxy.log.*.jsonl
+ONEPASS_TRIP_TOKENS=80000 ONEPASS_BATCH_MIN_TOKENS=0 \
+  node dist/main.js replay --recording harbor-corewars
+ONEPASS_TRIP_TOKENS=80000 ONEPASS_BATCH_MIN_TOKENS=20000 \
+  node dist/main.js replay --recording harbor-corewars --compare <label of the run above>
+```
+
+`eval/replay-bars.mjs` runs both arms at each T and checks the bars in one command
+(`--min`, `--t`, `--recording`); it exits non-zero when one fails, and is what runs beside
+`npm test` on any change to the eviction code.
 
 §16 is reproducible from the two runs' own artifacts, via the tested reporter rather than an
 ad-hoc script:

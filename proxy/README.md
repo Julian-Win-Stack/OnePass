@@ -88,7 +88,8 @@ Code interactions".
 | `ONEPASS_UPSTREAM` | `https://api.anthropic.com` | Where requests are forwarded |
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
-| `ONEPASS_TRIP_TOKENS` | `110000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run ~30k over T at the default — measured peak 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it. Size T so `T + 40k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
+| `ONEPASS_TRIP_TOKENS` | `80000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run well over T: at T=110k the measured peak was 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The default moved 110k → 80k once the batch minimum existed, because a lower T then costs a handful of larger trips instead of a swarm of small ones (§21). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it — once the floor is above T, no value of T brings the peak down: one recorded session peaked at 150,811 tokens at T=110k and at T=80k alike. Size T so `T + 60k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
+| `ONEPASS_BATCH_MIN_TOKENS` | `20000` | The least a trip may newly evict. A smaller batch is held back, and that content waits for a later request where the batch has grown past the minimum; `0` turns it off. Every trip rewrites the prompt cache, and a cache write costs 1.25× base input against a cache read's 0.1×, so trips are the proxy's main running cost. Without a minimum, a session whose floor has passed T trips on nearly every request for a few hundred tokens each: on one recording at T=80k, **50 trips in 68 requests, against 1** with the default minimum (§21) |
 | `ONEPASS_MIN_SAVED_CHARS` | `50` | A segment is stubbed only when its finished stub is at least this many chars smaller than the content. The stub's own cost decides, so no fixed size floor is needed |
 | `ONEPASS_JUDGE_API_KEY` | unset | Your own Anthropic API key. Unset means **no judge**: the proxy evicts by the rules alone, exactly as it did before. Never set `ANTHROPIC_API_KEY` for this — a `claudep` launched from the same shell would then bill Claude Code to the key instead of your subscription. Judge calls are billed to this key |
 | `ONEPASS_JUDGE_MODEL` | `claude-sonnet-5` | Model the judge runs on |
@@ -308,6 +309,13 @@ evicting nothing, and no judge call at all when no key is configured.
 ### Verified against the real API
 
 Newest evidence first; full numbers in `docs/findings.md`.
+
+**On cost, the target is parity, not a saving.** Each trip rewrites the prompt cache, and a
+rewrite is charged at 1.25× base input where a cache read is 0.1× — so the tokens a trip saves on
+later turns are paid for up front. What the proxy buys is a session that runs to the end without
+compacting, at roughly what an unproxied session costs; it is not a way to spend less. A build
+that tripped on nearly every request cost about 4× control, which is what the batch minimum
+(`ONEPASS_BATCH_MIN_TOKENS`) exists to prevent — docs/findings.md §21.
 
 - **The A/B run against an unproxied control** (§17, CLI 2.1.258, `opus[1m]`, same task, same
   base commit, byte-identical prompt). The current build peaked at **140,253 tokens** over

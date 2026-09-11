@@ -3,6 +3,28 @@
 Things this project taught the hard way. One entry per lesson, dated, with the evidence that
 taught it. Add to the top.
 
+## 2026-09-11 — A replay's fake upstream must answer with the numbers the real one reported
+
+**The lesson.** When replaying recorded traffic against a fake API, the fake must return the
+*measurements* the real API returned, not plausible ones. Anything the code under test calibrates
+from a response is an input to its decisions, and a fake that supplies a constant quietly moves
+every threshold those decisions turn on.
+
+**What taught it.** The proxy sizes a request in real tokens: it reads `usage` out of each
+response and calibrates a live chars-per-token ratio. The replay's fake upstream answered at a
+fixed 4 chars per token; the real traffic had run at 2.5–3.5. Every replayed request therefore
+measured about 20% smaller than it had in life, so it crossed the threshold later. Replaying a
+Harbor session at T=30k gave **97 trips where the real run made 112** — all 97 genuine, 15
+missing — and a tuning decision made on those numbers would have been made on the wrong curve.
+The fix was to record each request's real ratio at import time (sent bytes ÷ the tokens `usage`
+reported) and have the fake answer at it; the replay then reproduced 112 exactly. The recorded
+ratio predicted the proxy's next calibration in 117 of 118 requests, the miss being a concurrent
+`count_tokens`.
+
+**How to apply it here.** `import-recordings --proxy-log <log>` pairs each recorded body with the
+usage line it produced. Import with it; a recording without ratios replays at the old constant and
+says so in the result document.
+
 ## 2026-09-11 — Test an AI system in three layers: unit tests, then replay, then live runs
 
 **The lesson.** When iterating on a system that has a model in the loop, verify changes in

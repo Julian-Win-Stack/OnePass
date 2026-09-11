@@ -33,7 +33,10 @@ const config = {
   upstreamUrl: process.env.ONEPASS_UPSTREAM ?? "https://api.anthropic.com",
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
-  tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
+  // 80k, not the 110k this shipped with: with a batch minimum in front of it, a lower threshold
+  // buys a flatter curve for a handful of larger trips rather than a swarm of small ones
+  // (docs/findings.md §21). Below it the proxy is inert, so T is what decides when it starts.
+  tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 80_000),
   batchMinTokens: envInt("ONEPASS_BATCH_MIN_TOKENS", 20_000),
   minSavedChars: envInt("ONEPASS_MIN_SAVED_CHARS", 50),
   logFilePath: newProxyLogPath(),
