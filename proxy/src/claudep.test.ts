@@ -69,10 +69,17 @@ test("Claude Code is pointed at the proxy, at the full window, without gzip", ()
   assert.equal(env.PATH, "/bin");
 });
 
-test("the proxy child picks its own port and never chains through another proxy", () => {
-  const env = proxyEnv({ ANTHROPIC_BASE_URL: "http://localhost:3777", ONEPASS_TRIP_TOKENS: "90000" });
+test("the proxy child picks its own port, stays on the loopback, and never chains through another proxy", () => {
+  const env = proxyEnv({
+    ANTHROPIC_BASE_URL: "http://localhost:3777",
+    ONEPASS_TRIP_TOKENS: "90000",
+    ONEPASS_HOST: "0.0.0.0",
+  });
   assert.equal(env.ONEPASS_PORT, "0");
   assert.equal(env.ANTHROPIC_BASE_URL, undefined);
+  // This child serves the one session below it; a host from the surrounding shell must not
+  // open it to the network.
+  assert.equal(env.ONEPASS_HOST, "127.0.0.1");
   assert.equal(env.ONEPASS_TRIP_TOKENS, "90000");
 });
 
@@ -93,9 +100,14 @@ test("a base URL that would be lost is called out, and one that would not is lef
 
 test("the banner is read for the port and the log, and needs both", () => {
   const banner =
-    "[onepass] eviction proxy listening on http://localhost:51234\n[onepass] log: /tmp/proxy.log.jsonl\n";
+    "[onepass] eviction proxy listening on http://127.0.0.1:51234\n[onepass] log: /tmp/proxy.log.jsonl\n";
   assert.deepEqual(parseBanner(banner), { port: 51234, logFilePath: "/tmp/proxy.log.jsonl" });
-  assert.equal(parseBanner("[onepass] eviction proxy listening on http://localhost:51234\n"), null);
+  assert.equal(parseBanner("[onepass] eviction proxy listening on http://127.0.0.1:51234\n"), null);
+  // The host is whatever the child bound, so the port is read out from behind any of them.
+  assert.equal(
+    parseBanner("[onepass] eviction proxy listening on http://localhost:51234\n[onepass] log: /tmp/p.jsonl\n")?.port,
+    51234,
+  );
 });
 
 test("recall is registered for this session, without displacing the user's own servers", () => {

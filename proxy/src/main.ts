@@ -24,6 +24,9 @@ function envInt(name: string, fallback: number): number {
 // 0 asks the operating system for a free port. The eval starts a proxy child per case and per
 // tail, several at once, so it uses 0 and reads the port the child reports below.
 const port = envInt("ONEPASS_PORT", 3777);
+// Loopback only. Every request through here carries the user's Claude Code credentials upstream,
+// so a proxy bound to every interface is an open relay for anyone on the same café wifi.
+const host = process.env.ONEPASS_HOST ?? "127.0.0.1";
 const config = {
   upstreamUrl: process.env.ONEPASS_UPSTREAM ?? "https://api.anthropic.com",
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
@@ -48,10 +51,10 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   }
   throw err;
 });
-server.listen(port, () => {
+server.listen(port, host, () => {
   // The requested port may be 0; what a caller has to connect to is the one that got bound.
   const boundPort = (server.address() as AddressInfo).port;
-  console.log(`[onepass] eviction proxy listening on http://localhost:${boundPort}`);
+  console.log(`[onepass] eviction proxy listening on http://${host}:${boundPort}`);
   console.log(`[onepass] upstream: ${config.upstreamUrl}`);
   console.log(
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
@@ -62,6 +65,6 @@ server.listen(port, () => {
   // The flag keeps native-1M models at 1M: Claude Code caps them at 200k behind a non-api.anthropic.com host.
   console.log(
     `[onepass] point Claude Code at it:  ` +
-      `ANTHROPIC_BASE_URL=http://localhost:${boundPort} _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`,
+      `ANTHROPIC_BASE_URL=http://${host}:${boundPort} _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude`,
   );
 });

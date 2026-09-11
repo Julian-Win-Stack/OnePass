@@ -97,11 +97,13 @@ export function claudeEnv(base: NodeJS.ProcessEnv, port: number): NodeJS.Process
 
 /**
  * The proxy child's environment. `ONEPASS_*` settings pass through, so a user who wants a
- * different threshold sets it in their shell as before. `ANTHROPIC_BASE_URL` is dropped: in a
- * shell that already has one, keeping it would chain this proxy through another one.
+ * different threshold sets it in their shell as before. Two are pinned rather than passed:
+ * `ANTHROPIC_BASE_URL` is dropped, since in a shell that already has one, keeping it would chain
+ * this proxy through another one; and `ONEPASS_HOST` is forced to the loopback, because this
+ * child exists to serve the one session below it and nothing else should be able to reach it.
  */
 export function proxyEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, ONEPASS_PORT: "0" };
+  const env: NodeJS.ProcessEnv = { ...base, ONEPASS_PORT: "0", ONEPASS_HOST: "127.0.0.1" };
   delete env.ANTHROPIC_BASE_URL;
   return env;
 }
@@ -133,10 +135,10 @@ export interface Banner {
 
 /** The two lines of the child's banner `claudep` needs. Absent either, it is not ready yet. */
 export function parseBanner(text: string): Banner | null {
-  const port = /listening on http:\/\/localhost:(\d+)/.exec(text);
+  const port = /listening on http:\/\/([^\s:]+):(\d+)/.exec(text);
   const log = /^\[onepass\] log: (.+)$/m.exec(text);
   if (port === null || log === null) return null;
-  return { port: Number(port[1]), logFilePath: (log[1] as string).trim() };
+  return { port: Number(port[2]), logFilePath: (log[1] as string).trim() };
 }
 
 export interface RecallServer {
