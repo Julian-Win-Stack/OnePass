@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`claudep`**: one command to run Claude Code through the proxy. It starts a proxy of its own
+  on a port the operating system picks, runs `claude` against it with the first-party flag set,
+  kills the proxy afterwards and prints one line saying what the session evicted. Every argument
+  is passed through, `claudep mcp …` and `--help` skip the proxy entirely, and a resumed session
+  keeps its own id. A session per proxy is what keeps two sessions' evicted-id sets, calibration
+  and logs from mixing — one shared proxy put one session's stubs in another session's request.
 - `ONEPASS_PORT=0` now works end to end: the startup banner reports the port the operating
   system bound instead of the 0 that was asked for. The eval starts a proxy child per planning
   case and per tail, several at once, and reads each child's port out of that line.

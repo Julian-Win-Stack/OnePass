@@ -18,6 +18,7 @@
     "compaction"
   ],
   "bin": {
+    "claudep": "dist/claudep.js",
     "onepass-proxy": "dist/main.js",
     "onepass-report": "dist/report.js"
   },

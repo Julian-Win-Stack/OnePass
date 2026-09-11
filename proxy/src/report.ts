@@ -4,126 +4,15 @@
 //
 //   npm run report -- <session-jsonl-path> [proxy-log-path]
 
-import { createReadStream, existsSync, readFileSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
-import { formatThousands, measureContentChars } from "./evict.js";
-import {
-  latestProxyLogPath,
-  proxyLogDir,
-  type JudgeLogEntry,
-  type ProxyLogEntry,
-  type RequestLogEntry,
-  type TripLogEntry,
-} from "./log.js";
+import { formatThousands } from "./evict.js";
+import { latestProxyLogPath, proxyLogDir, type JudgeLogEntry, type RequestLogEntry } from "./log.js";
+import { parseProxyLog, scanTranscript } from "./session.js";
 import { describeRebuild, formatDuration, GAUGE_MIN_ESTIMATED_TOKENS, type RebuildKind } from "./speed.js";
 
-const RECALL_TOOL_NAME = /(^|__)recall_(search|get)$/;
 const REBUILD_KINDS: RebuildKind[] = ["first", "after-trip", "after-idle", "unexpected"];
 const BAR_WIDTH = 24;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-interface TranscriptStats {
-  entryCount: number;
-  firstTimestamp: string | null;
-  lastTimestamp: string | null;
-  compactionCount: number;
-  recallResultCount: number;
-  recallChars: number;
-  /** Peak of API-reported context (input + cache_creation + cache_read) across assistant turns. */
-  realUsagePeak: number;
-  realUsageSamples: number;
-  realUsageTurnsAbove150k: number;
-}
-
-async function scanTranscript(path: string): Promise<TranscriptStats> {
-  const stats: TranscriptStats = {
-    entryCount: 0,
-    firstTimestamp: null,
-    lastTimestamp: null,
-    compactionCount: 0,
-    recallResultCount: 0,
-    recallChars: 0,
-    realUsagePeak: 0,
-    realUsageSamples: 0,
-    realUsageTurnsAbove150k: 0,
-  };
-  const recallToolUseIds = new Set<string>();
-
-  const lines = createInterface({ input: createReadStream(path, "utf8"), crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (line.trim() === "") continue;
-    let entry: unknown;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!isRecord(entry)) continue;
-    stats.entryCount++;
-
-    if (typeof entry.timestamp === "string") {
-      stats.firstTimestamp ??= entry.timestamp;
-      stats.lastTimestamp = entry.timestamp;
-    }
-    if (entry.isCompactSummary === true || (entry.compactMetadata !== undefined && entry.compactMetadata !== null)) {
-      stats.compactionCount++;
-    }
-
-    const message = entry.message;
-    if (!isRecord(message)) continue;
-    if (entry.type === "assistant" && isRecord(message.usage)) {
-      const usage = message.usage;
-      const asNumber = (value: unknown): number => (typeof value === "number" ? value : 0);
-      const realContext =
-        asNumber(usage.input_tokens) +
-        asNumber(usage.cache_creation_input_tokens) +
-        asNumber(usage.cache_read_input_tokens);
-      if (realContext > 0) {
-        stats.realUsageSamples++;
-        if (realContext > stats.realUsagePeak) stats.realUsagePeak = realContext;
-        if (realContext > 150_000) stats.realUsageTurnsAbove150k++;
-      }
-    }
-    if (!Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (!isRecord(block)) continue;
-      if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
-        if (RECALL_TOOL_NAME.test(block.name)) recallToolUseIds.add(block.id);
-      } else if (
-        block.type === "tool_result" &&
-        typeof block.tool_use_id === "string" &&
-        recallToolUseIds.has(block.tool_use_id)
-      ) {
-        stats.recallResultCount++;
-        stats.recallChars += measureContentChars(block.content);
-      }
-    }
-  }
-  return stats;
-}
-
-function parseProxyLog(path: string): { requests: RequestLogEntry[]; trips: TripLogEntry[]; judges: JudgeLogEntry[] } {
-  const requests: RequestLogEntry[] = [];
-  const trips: TripLogEntry[] = [];
-  const judges: JudgeLogEntry[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.trim() === "") continue;
-    let entry: ProxyLogEntry;
-    try {
-      entry = JSON.parse(line) as ProxyLogEntry;
-    } catch {
-      continue;
-    }
-    if (entry.kind === "request" && entry.path.split("?")[0] === "/v1/messages") requests.push(entry);
-    else if (entry.kind === "trip") trips.push(entry);
-    else if (entry.kind === "judge") judges.push(entry);
-  }
-  return { requests, trips, judges };
-}
 
 /**
  * What the judge did. Its picks never show up as trips — they are applied by re-stubbing on the
