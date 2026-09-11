@@ -558,27 +558,38 @@ test("stubs an old large tool_use input, leaves its small result, and keeps both
 
 const PASTED_USER_TEXT = "Use tabs, not spaces. Here is the log:\n" + "L".repeat(2961);
 
-function pastedConversation(marker = "go on"): string {
+/**
+ * The paste, and beside it a tool result the rules do evict. The tool result is the control:
+ * without it a green says only that nothing was evicted, which is also what a broken eviction
+ * pass looks like.
+ */
+function pastedConversation(): string {
   return JSON.stringify({
     model: "claude-test",
     max_tokens: 1000,
     messages: [
       { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_read", name: "Read", input: { file_path: "/x.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_read", content: "R".repeat(5000) }] },
       { role: "assistant", content: [{ type: "text", text: "ok" }] },
       { role: "user", content: "next" },
       { role: "assistant", content: [{ type: "text", text: "sure" }] },
-      { role: "user", content: marker },
+      { role: "user", content: "go on" },
     ],
   });
 }
 
-function lastProxiedConversation(): { content: { text?: unknown }[] }[] {
+function lastProxiedConversation(): { content: { text?: unknown; content?: unknown }[] }[] {
   const proxied = recorded.filter((entry) => entry.url === "/v1/messages").at(-1);
   assert.ok(proxied, "the stub upstream recorded no proxied /v1/messages request");
-  return (JSON.parse(proxied.body.toString("utf8")) as { messages: { content: { text?: unknown }[] }[] }).messages;
+  return (
+    JSON.parse(proxied.body.toString("utf8")) as {
+      messages: { content: { text?: unknown; content?: unknown }[] }[];
+    }
+  ).messages;
 }
 
-test("a user's paste goes upstream untouched, however far past the threshold it is", async () => {
+test("a user's paste goes upstream untouched while the tool result beside it is stubbed", async () => {
   const logPath = join(mkdtempSync(join(tmpdir(), "onepass-user-text-test-")), "proxy.log.jsonl");
   const server = createProxyServer({
     upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
@@ -593,22 +604,24 @@ test("a user's paste goes upstream untouched, however far past the threshold it 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${listeningPort(server)}`;
   try {
-    // Twice: the second request is the one that would carry a stub, since eviction applies what
-    // an earlier request put in the evicted set.
+    // Twice: the first request is where the paste could be added to the evicted set, the second
+    // is where it would come back as a stub.
     for (let attempt = 0; attempt < 2; attempt++) {
       await sendRequest(origin, "/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: pastedConversation(),
       });
-      assert.equal(lastProxiedConversation()[0]?.content[0]?.text, PASTED_USER_TEXT);
+      const sent = lastProxiedConversation();
+      assert.equal(sent[0]?.content[0]?.text, PASTED_USER_TEXT);
+      assert.equal(sent[2]?.content[0]?.content, "[onepass: evicted 5,000 chars]");
     }
-    const trips = readFileSync(logPath, "utf8")
+    const evictedIds = readFileSync(logPath, "utf8")
       .split("\n")
       .filter((line) => line.trim() !== "")
       .map((line) => JSON.parse(line) as ProxyLogEntry)
-      .filter((entry) => entry.kind === "trip");
-    assert.deepEqual(trips, [], "there is nothing here the whitelist allows");
+      .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    assert.deepEqual(evictedIds, ["toolu_read"], "the paste's content hash must never enter the set");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

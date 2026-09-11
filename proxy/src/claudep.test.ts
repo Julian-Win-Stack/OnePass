@@ -69,18 +69,18 @@ test("Claude Code is pointed at the proxy, at the full window, without gzip", ()
   assert.equal(env.PATH, "/bin");
 });
 
-test("the proxy child picks its own port, stays on the loopback, and never chains through another proxy", () => {
-  const env = proxyEnv({
-    ANTHROPIC_BASE_URL: "http://localhost:3777",
-    ONEPASS_TRIP_TOKENS: "90000",
-    ONEPASS_HOST: "0.0.0.0",
-  });
+test("the proxy child picks its own port and never chains through another proxy", () => {
+  const env = proxyEnv({ ANTHROPIC_BASE_URL: "http://localhost:3777", ONEPASS_TRIP_TOKENS: "90000" });
   assert.equal(env.ONEPASS_PORT, "0");
   assert.equal(env.ANTHROPIC_BASE_URL, undefined);
-  // This child serves the one session below it; a host from the surrounding shell must not
-  // open it to the network.
-  assert.equal(env.ONEPASS_HOST, "127.0.0.1");
   assert.equal(env.ONEPASS_TRIP_TOKENS, "90000");
+});
+
+// This child exists to serve the one session below it. A host inherited from the surrounding
+// shell would open it to the network, where anyone reaching the port spends the user's
+// subscription.
+test("the proxy child stays on the loopback even when the shell asks for every interface", () => {
+  assert.equal(proxyEnv({ ONEPASS_HOST: "0.0.0.0" }).ONEPASS_HOST, "127.0.0.1");
 });
 
 test("a base URL that would be lost is called out, and one that would not is left alone", () => {
@@ -98,16 +98,23 @@ test("a base URL that would be lost is called out, and one that would not is lef
   assert.equal(upstreamWarning({}), null);
 });
 
-test("the banner is read for the port and the log, and needs both", () => {
-  const banner =
-    "[onepass] eviction proxy listening on http://127.0.0.1:51234\n[onepass] log: /tmp/proxy.log.jsonl\n";
-  assert.deepEqual(parseBanner(banner), { port: 51234, logFilePath: "/tmp/proxy.log.jsonl" });
+const FULL_BANNER =
+  "[onepass] eviction proxy listening on http://127.0.0.1:51234\n[onepass] log: /tmp/proxy.log.jsonl\n";
+
+test("the banner is read for the port and the log", () => {
+  assert.deepEqual(parseBanner(FULL_BANNER), { port: 51234, logFilePath: "/tmp/proxy.log.jsonl" });
+});
+
+// Half a banner is a child that is still starting up, not a child ready to be used.
+test("a banner missing the log line is not yet a banner", () => {
   assert.equal(parseBanner("[onepass] eviction proxy listening on http://127.0.0.1:51234\n"), null);
-  // The host is whatever the child bound, so the port is read out from behind any of them.
-  assert.equal(
-    parseBanner("[onepass] eviction proxy listening on http://localhost:51234\n[onepass] log: /tmp/p.jsonl\n")?.port,
-    51234,
-  );
+});
+
+// The host is whatever `ONEPASS_HOST` made the child bind, so the port has to be readable from
+// behind any of them rather than only `localhost`.
+test("the port is read out from behind whichever host the child bound", () => {
+  const banner = "[onepass] eviction proxy listening on http://192.168.1.4:51234\n[onepass] log: /tmp/p.jsonl\n";
+  assert.deepEqual(parseBanner(banner), { port: 51234, logFilePath: "/tmp/p.jsonl" });
 });
 
 test("recall is registered for this session, without displacing the user's own servers", () => {

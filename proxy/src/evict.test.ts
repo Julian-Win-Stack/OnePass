@@ -149,15 +149,23 @@ test("a small Bash result — the size the old floor refused — stubs to 28 cha
 });
 
 // The attached-file stub names no path, so this marker beside the attachment is the only thing
-// left pointing at the file. However big it grows, it is never a candidate.
+// left pointing at the file. However big it grows, it is never a candidate. The tool result
+// beside it is the control: it is evicted in the same pass, so a green here cannot be eviction
+// having done nothing at all.
 test("the marker naming an attachment's path is never evicted, whatever its size", () => {
   const marker = `<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/x.ts"}${"\n".repeat(9000)}`;
-  const body = requestBody([{ role: "user", content: [{ type: "text", text: marker }] }, ...filler(9)]);
+  const body = requestBody([
+    { role: "user", content: [{ type: "text", text: marker }] },
+    assistantToolUse("toolu_1", "Read", { file_path: "/x.ts" }),
+    userToolResult("toolu_1", "x".repeat(5000)),
+    ...filler(9),
+  ]);
 
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
 
-  assert.equal(outcome.bodyChanged, false);
-  assert.deepEqual(outcome.newlyEvictedIds, []);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+  assert.equal(blockAt(outcome.body, 2).content, "[onepass: evicted 5,000 chars]");
+  assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, marker);
 });
 
 // The recall tool's description is where the agent is told what a stub is and how to get the
@@ -659,18 +667,22 @@ test("a call and its result are both charged to charsRemoved, each by its own si
 // The user's own words are the one thing in the request that exists nowhere else to be
 // recovered from \u2014 no file to re-read, no command to re-run. So the whitelist leaves them
 // out, and this is the test that keeps them out: old, large, over T, and already named in the
-// evicted set, which is every condition eviction has.
+// evicted set, which is every condition eviction has. The tool result beside it is the
+// control \u2014 it is stubbed in the same pass, so a green here cannot be eviction having done
+// nothing at all.
 const PASTED_USER_TEXT = "Use tabs, not spaces. Here is the log:\n" + "L".repeat(2961);
 
 test("never touches the user's own text, whatever its age, size or evicted-set membership", () => {
   const body = requestBody([
     { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+    assistantToolUse("toolu_1", "Read", { file_path: "/tmp/big.ts" }),
+    userToolResult("toolu_1", "x".repeat(5000)),
     ...filler(9),
   ]);
 
   const outcome = evictContextSegments(body, new Set([textSegmentId(PASTED_USER_TEXT)]), ALWAYS_TRIP);
 
-  assert.equal(outcome.bodyChanged, false);
-  assert.deepEqual(outcome.newlyEvictedIds, []);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+  assert.equal(blockAt(outcome.body, 2).content, "[onepass: evicted 5,000 chars]");
   assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, PASTED_USER_TEXT);
 });
