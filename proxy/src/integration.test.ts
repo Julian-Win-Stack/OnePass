@@ -10,8 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createProxyServer } from "./server.js";
-import type { JudgeLogEntry, ProxyLogEntry, RequestLogEntry } from "./log.js";
-import { textSegmentId } from "./evict.js";
+import type { ProxyLogEntry, RequestLogEntry } from "./log.js";
 
 interface RecordedRequest {
   method: string;
@@ -42,27 +41,13 @@ function stubUsage(requestBytes: number): Record<string, number> {
   };
 }
 
-/** What the stub answers a judge call with. Judge calls are the ones carrying output_config. */
-let judgeResponder: (body: string) => { status: number; json: unknown } = () => ({
-  status: 200,
-  json: { type: "message", content: [{ type: "text", text: '{"evict":[]}' }], usage: { input_tokens: 9, output_tokens: 3 } },
-});
-
-function isJudgeRequest(request: RecordedRequest): boolean {
-  return request.url === "/v1/messages" && request.body.toString("utf8").includes('"output_config"');
-}
-
 const upstream = http.createServer((request, response) => {
   const chunks: Buffer[] = [];
   request.on("data", (chunk: Buffer) => chunks.push(chunk));
   request.on("end", () => {
     const body = Buffer.concat(chunks);
     recorded.push({ method: request.method ?? "", url: request.url ?? "", headers: request.headers, body });
-    if (request.url === "/v1/messages" && body.toString("utf8").includes('"output_config"')) {
-      const answer = judgeResponder(body.toString("utf8"));
-      response.writeHead(answer.status, { "content-type": "application/json" });
-      response.end(JSON.stringify(answer.json));
-    } else if (request.url === "/v1/messages" && body.toString("utf8").includes('"stream":true')) {
+    if (request.url === "/v1/messages" && body.toString("utf8").includes('"stream":true')) {
       response.writeHead(200, { "content-type": "text/event-stream" });
       // Under the calibration minimum on purpose: the streaming path is here to prove usage is
       // read out of message_start, not to move the chars-per-token ratio.
@@ -566,43 +551,46 @@ test("stubs an old large tool_use input, leaves its small result, and keeps both
 });
 
 // ---------------------------------------------------------------------------------------
-// The judge. Its own proxy per test: it is enabled by configuration, fires on every trip,
-// and writes to a log the other tests must not see.
+// The user's own text. No rule may evict it: there is no file to re-read and no command to
+// re-run, so a stub in its place would be the one loss recall cannot undo. Its own proxy,
+// configured to evict as eagerly as the settings allow, writing to a log the other tests
+// must not see.
 
-const JUDGE_KEY = "sk-judge-key";
 const PASTED_USER_TEXT = "Use tabs, not spaces. Here is the log:\n" + "L".repeat(2961);
-const PASTED_USER_TEXT_ID = textSegmentId(PASTED_USER_TEXT);
 
-/** No tool results at all: whatever gets stubbed here, only the judge can have chosen it. */
-function pastedConversation(marker = "go on"): string {
+/**
+ * The paste, and beside it a tool result the rules do evict. The tool result is the control:
+ * without it a green says only that nothing was evicted, which is also what a broken eviction
+ * pass looks like.
+ */
+function pastedConversation(): string {
   return JSON.stringify({
     model: "claude-test",
     max_tokens: 1000,
     messages: [
       { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_read", name: "Read", input: { file_path: "/x.ts" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_read", content: "R".repeat(5000) }] },
       { role: "assistant", content: [{ type: "text", text: "ok" }] },
       { role: "user", content: "next" },
       { role: "assistant", content: [{ type: "text", text: "sure" }] },
-      { role: "user", content: marker },
+      { role: "user", content: "go on" },
     ],
   });
 }
 
-/** The judge's own call is recorded too, and it is usually the most recent one. */
-function lastProxiedConversation(): { content: { text?: unknown }[] }[] {
-  const proxied = recorded.filter((entry) => entry.url === "/v1/messages" && !isJudgeRequest(entry)).at(-1);
+function lastProxiedConversation(): { content: { text?: unknown; content?: unknown }[] }[] {
+  const proxied = recorded.filter((entry) => entry.url === "/v1/messages").at(-1);
   assert.ok(proxied, "the stub upstream recorded no proxied /v1/messages request");
-  return (JSON.parse(proxied.body.toString("utf8")) as { messages: { content: { text?: unknown }[] }[] }).messages;
+  return (
+    JSON.parse(proxied.body.toString("utf8")) as {
+      messages: { content: { text?: unknown; content?: unknown }[] }[];
+    }
+  ).messages;
 }
 
-interface JudgeProxy {
-  origin: string;
-  logPath: string;
-  close(): Promise<void>;
-}
-
-async function startJudgeProxy(judge: { apiKey: string; model: string } | undefined): Promise<JudgeProxy> {
-  const logPath = join(mkdtempSync(join(tmpdir(), "onepass-judge-test-")), "proxy.log.jsonl");
+test("a user's paste goes upstream untouched while the tool result beside it is stubbed", async () => {
+  const logPath = join(mkdtempSync(join(tmpdir(), "onepass-user-text-test-")), "proxy.log.jsonl");
   const server = createProxyServer({
     upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
     evictAfterAssistantTurns: 2,
@@ -612,162 +600,30 @@ async function startJudgeProxy(judge: { apiKey: string; model: string } | undefi
     batchMinTokens: 0,
     logFilePath: logPath,
     quiet: true,
-    ...(judge === undefined ? {} : { judge }),
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return {
-    origin: `http://127.0.0.1:${listeningPort(server)}`,
-    logPath,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-  };
-}
-
-function judgeRecords(logPath: string): JudgeLogEntry[] {
-  // The log is created by the first entry written to it, and a judge that has to be retried
-  // writes its first one later than the caller polls. No file yet is no records yet, not a
-  // failure — otherwise the wait below throws on its first attempt instead of waiting.
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as ProxyLogEntry)
-    .filter((entry): entry is JudgeLogEntry => entry.kind === "judge");
-}
-
-/** The judge runs off the request path, so the test has to wait for it like the proxy does. */
-async function waitForJudgeRecords(logPath: string, count: number): Promise<JudgeLogEntry[]> {
-  for (let attempt = 0; attempt < 100; attempt++) {
-    const records = judgeRecords(logPath);
-    if (records.length >= count) return records;
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
-  }
-  assert.fail(`the proxy logged fewer than ${count} judge record(s) within 2s`);
-}
-
-test("a trip runs the judge, and its verdict stubs the user's paste on the next request", async () => {
-  judgeResponder = () => ({
-    status: 200,
-    json: {
-      type: "message",
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            evict: [{ id: PASTED_USER_TEXT_ID, keep: "Use tabs, not spaces.", note: "build log from the auth run" }],
-          }),
-        },
-      ],
-      usage: { input_tokens: 4321, output_tokens: 77 },
-    },
-  });
-  const proxy = await startJudgeProxy({ apiKey: JUDGE_KEY, model: "claude-test-judge" });
+  const origin = `http://127.0.0.1:${listeningPort(server)}`;
   try {
-    await sendRequest(proxy.origin, "/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer oauth-subscription-token" },
-      body: pastedConversation(),
-    });
-    assert.equal(
-      lastProxiedConversation()[0]?.content[0]?.text,
-      PASTED_USER_TEXT,
-      "the tripping request goes up untouched",
-    );
-
-    const [record] = await waitForJudgeRecords(proxy.logPath, 1);
-    assert.equal(record?.model, "claude-test-judge");
-    assert.equal(record?.error, undefined);
-    assert.equal(record?.proposed, 1);
-    assert.equal(record?.accepted, 1);
-    assert.deepEqual(record?.rejected, {
-      unknownId: 0,
-      protectedWindow: 0,
-      tooSmall: 0,
-      keepMismatch: 0,
-      noKeepOrNote: 0,
-      assistantText: 0,
-      keepOnNonUserBlock: 0,
-    });
-    assert.equal(record?.inputTokens, 4321);
-    assert.equal(record?.outputTokens, 77);
-    // 3,000 chars of paste less the whole 187-char stub asserted below — quote, note and all.
-    assert.equal(record?.charsRemovedEstimate, 2813);
-
-    // Anthropic's terms forbid routing anything but Claude Code against a subscription login,
-    // so what the judge call does *not* carry matters as much as what it does.
-    const judgeCall = recorded.filter(isJudgeRequest).at(-1);
-    assert.ok(judgeCall, "the proxy made no judge call");
-    assert.equal(judgeCall.headers["x-api-key"], JUDGE_KEY);
-    assert.equal(judgeCall.headers.authorization, undefined, "Claude Code's own credentials must never be reused");
-    assert.equal(judgeCall.headers["anthropic-version"], "2023-06-01");
-
-    await sendRequest(proxy.origin, "/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: pastedConversation(),
-    });
-    assert.equal(
-      lastProxiedConversation()[0]?.content[0]?.text,
-      'Use tabs, not spaces.\n[onepass: evicted 3,000 chars of user text. ' +
-        "onepass's summary: build log from the auth run. " +
-        'recall_search("Use tabs, not spaces. Here is the log:") for the original]',
-    );
+    // Twice: the first request is where the paste could be added to the evicted set, the second
+    // is where it would come back as a stub.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await sendRequest(origin, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: pastedConversation(),
+      });
+      const sent = lastProxiedConversation();
+      assert.equal(sent[0]?.content[0]?.text, PASTED_USER_TEXT);
+      assert.equal(sent[2]?.content[0]?.content, "[onepass: evicted 5,000 chars]");
+    }
+    const evictedIds = readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as ProxyLogEntry)
+      .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    assert.deepEqual(evictedIds, ["toolu_read"], "the paste's content hash must never enter the set");
   } finally {
-    await proxy.close();
-  }
-});
-
-test("a judge that keeps failing is retried once, then evicts nothing", async () => {
-  let judgeCallCount = 0;
-  judgeResponder = () => {
-    judgeCallCount++;
-    return { status: 500, json: { type: "error", error: { type: "api_error", message: "boom" } } };
-  };
-  const proxy = await startJudgeProxy({ apiKey: JUDGE_KEY, model: "claude-test-judge" });
-  try {
-    await sendRequest(proxy.origin, "/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: pastedConversation(),
-    });
-    const [record] = await waitForJudgeRecords(proxy.logPath, 1);
-    assert.equal(judgeCallCount, 2, "one call plus one retry");
-    assert.ok(typeof record?.error === "string" && record.error.length > 0, "the failure must be recorded");
-    assert.equal(record?.accepted, 0);
-
-    await sendRequest(proxy.origin, "/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: pastedConversation(),
-    });
-    assert.equal(lastProxiedConversation()[0]?.content[0]?.text, PASTED_USER_TEXT, "a failed judge must evict nothing");
-  } finally {
-    await proxy.close();
-  }
-});
-
-test("with no API key configured the proxy never calls a judge", async () => {
-  // A benign answer, not a throwing one: an earlier test's retry can still be in flight, and
-  // an exception inside the stub upstream would leave that call hanging.
-  judgeResponder = () => ({
-    status: 200,
-    json: { type: "message", content: [{ type: "text", text: '{"evict":[]}' }], usage: {} },
-  });
-  const sentinel = "sentinel-for-the-unjudged-proxy";
-  const proxy = await startJudgeProxy(undefined);
-  try {
-    await sendRequest(proxy.origin, "/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: pastedConversation(sentinel),
-    });
-    await new Promise<void>((resolve) => setTimeout(resolve, 150));
-    const judgedThisConversation = recorded
-      .filter(isJudgeRequest)
-      .some((entry) => entry.body.toString("utf8").includes(sentinel));
-    assert.equal(judgedThisConversation, false);
-    assert.equal(judgeRecords(proxy.logPath).length, 0);
-  } finally {
-    await proxy.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 

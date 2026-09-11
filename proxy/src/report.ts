@@ -4,179 +4,15 @@
 //
 //   npm run report -- <session-jsonl-path> [proxy-log-path]
 
-import { createReadStream, existsSync, readFileSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
-import { formatThousands, measureContentChars } from "./evict.js";
-import {
-  latestProxyLogPath,
-  proxyLogDir,
-  type JudgeLogEntry,
-  type ProxyLogEntry,
-  type RequestLogEntry,
-  type TripLogEntry,
-} from "./log.js";
+import { formatThousands } from "./evict.js";
+import { latestProxyLogPath, proxyLogDir, type RequestLogEntry } from "./log.js";
+import { parseProxyLog, scanTranscript } from "./session.js";
 import { describeRebuild, formatDuration, GAUGE_MIN_ESTIMATED_TOKENS, type RebuildKind } from "./speed.js";
 
-const RECALL_TOOL_NAME = /(^|__)recall_(search|get)$/;
 const REBUILD_KINDS: RebuildKind[] = ["first", "after-trip", "after-idle", "unexpected"];
 const BAR_WIDTH = 24;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-interface TranscriptStats {
-  entryCount: number;
-  firstTimestamp: string | null;
-  lastTimestamp: string | null;
-  compactionCount: number;
-  recallResultCount: number;
-  recallChars: number;
-  /** Peak of API-reported context (input + cache_creation + cache_read) across assistant turns. */
-  realUsagePeak: number;
-  realUsageSamples: number;
-  realUsageTurnsAbove150k: number;
-}
-
-async function scanTranscript(path: string): Promise<TranscriptStats> {
-  const stats: TranscriptStats = {
-    entryCount: 0,
-    firstTimestamp: null,
-    lastTimestamp: null,
-    compactionCount: 0,
-    recallResultCount: 0,
-    recallChars: 0,
-    realUsagePeak: 0,
-    realUsageSamples: 0,
-    realUsageTurnsAbove150k: 0,
-  };
-  const recallToolUseIds = new Set<string>();
-
-  const lines = createInterface({ input: createReadStream(path, "utf8"), crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (line.trim() === "") continue;
-    let entry: unknown;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!isRecord(entry)) continue;
-    stats.entryCount++;
-
-    if (typeof entry.timestamp === "string") {
-      stats.firstTimestamp ??= entry.timestamp;
-      stats.lastTimestamp = entry.timestamp;
-    }
-    if (entry.isCompactSummary === true || (entry.compactMetadata !== undefined && entry.compactMetadata !== null)) {
-      stats.compactionCount++;
-    }
-
-    const message = entry.message;
-    if (!isRecord(message)) continue;
-    if (entry.type === "assistant" && isRecord(message.usage)) {
-      const usage = message.usage;
-      const asNumber = (value: unknown): number => (typeof value === "number" ? value : 0);
-      const realContext =
-        asNumber(usage.input_tokens) +
-        asNumber(usage.cache_creation_input_tokens) +
-        asNumber(usage.cache_read_input_tokens);
-      if (realContext > 0) {
-        stats.realUsageSamples++;
-        if (realContext > stats.realUsagePeak) stats.realUsagePeak = realContext;
-        if (realContext > 150_000) stats.realUsageTurnsAbove150k++;
-      }
-    }
-    if (!Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (!isRecord(block)) continue;
-      if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string") {
-        if (RECALL_TOOL_NAME.test(block.name)) recallToolUseIds.add(block.id);
-      } else if (
-        block.type === "tool_result" &&
-        typeof block.tool_use_id === "string" &&
-        recallToolUseIds.has(block.tool_use_id)
-      ) {
-        stats.recallResultCount++;
-        stats.recallChars += measureContentChars(block.content);
-      }
-    }
-  }
-  return stats;
-}
-
-function parseProxyLog(path: string): { requests: RequestLogEntry[]; trips: TripLogEntry[]; judges: JudgeLogEntry[] } {
-  const requests: RequestLogEntry[] = [];
-  const trips: TripLogEntry[] = [];
-  const judges: JudgeLogEntry[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.trim() === "") continue;
-    let entry: ProxyLogEntry;
-    try {
-      entry = JSON.parse(line) as ProxyLogEntry;
-    } catch {
-      continue;
-    }
-    if (entry.kind === "request" && entry.path.split("?")[0] === "/v1/messages") requests.push(entry);
-    else if (entry.kind === "trip") trips.push(entry);
-    else if (entry.kind === "judge") judges.push(entry);
-  }
-  return { requests, trips, judges };
-}
-
-/**
- * What the judge did. Its picks never show up as trips — they are applied by re-stubbing on the
- * next request — so without this section its work is invisible in the report.
- */
-function printJudgeSummary(judges: JudgeLogEntry[]): void {
-  if (judges.length === 0) return;
-  const ran = judges.filter((judge) => judge.skipped !== true && judge.error === undefined);
-  const failed = judges.filter((judge) => judge.error !== undefined);
-  const skipped = judges.filter((judge) => judge.skipped === true);
-  const sum = (pick: (judge: JudgeLogEntry) => number): number => judges.reduce((total, judge) => total + pick(judge), 0);
-  const reasons: [string, number][] = [
-    ["unknown id", sum((judge) => judge.rejected.unknownId)],
-    ["inside the protected window", sum((judge) => judge.rejected.protectedWindow)],
-    ["too small to be worth stubbing", sum((judge) => judge.rejected.tooSmall)],
-    ["quote not found in the block", sum((judge) => judge.rejected.keepMismatch)],
-    ["user block with no quote and no note", sum((judge) => judge.rejected.noKeepOrNote)],
-    ["assistant text", sum((judge) => judge.rejected.assistantText)],
-    ["quote or note on a non-user block", sum((judge) => judge.rejected.keepOnNonUserBlock)],
-  ];
-  const rejectedTotal = reasons.reduce((total, [, count]) => total + count, 0);
-
-  console.log("Judge:");
-  console.log(
-    `  calls: ${ran.length} answered, ${failed.length} failed after retry, ` +
-      `${skipped.length} skipped (one already running)`,
-  );
-  console.log(
-    `  picks: ${sum((judge) => judge.accepted)} accepted of ${sum((judge) => judge.proposed)} proposed — ` +
-      `${formatThousands(sum((judge) => judge.charsRemovedEstimate))} chars of content selected`,
-  );
-  console.log(`  rejected by guard: ${rejectedTotal} total`);
-  for (const [reason, count] of reasons) {
-    if (count > 0) console.log(`    ${String(count).padStart(4)}  ${reason}`);
-  }
-  console.log(
-    `  judge tokens: ${formatThousands(sum((judge) => judge.inputTokens ?? 0))} in, ` +
-      `${formatThousands(sum((judge) => judge.outputTokens ?? 0))} out`,
-  );
-  console.log(
-    `  ${"time".padEnd(8)}  ${"took".padStart(7)}  ${"proposed".padStart(8)}  ${"accepted".padStart(8)}  ` +
-      `${"chars".padStart(9)}  note`,
-  );
-  for (const judge of judges) {
-    const note = judge.skipped === true ? "skipped — a judge was already running" : (judge.error ?? "");
-    console.log(
-      `  ${timeOfDay(judge.timestamp)}  ${formatDuration(judge.durationMs).padStart(7)}  ` +
-        `${String(judge.proposed).padStart(8)}  ${String(judge.accepted).padStart(8)}  ` +
-        `${formatThousands(judge.charsRemovedEstimate).padStart(9)}  ${note}`,
-    );
-  }
-  console.log("");
-}
 
 function timeOfDay(isoTimestamp: string): string {
   const timePart = isoTimestamp.split("T")[1];
@@ -286,13 +122,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  const { requests, trips, judges } = parseProxyLog(proxyLogPath);
+  const { requests, trips } = parseProxyLog(proxyLogPath);
   const evictedIdCount = trips.reduce((sum, trip) => sum + trip.addedToolUseIds.length, 0);
   const tripCharsRemoved = trips.reduce((sum, trip) => sum + trip.charsRemoved, 0);
-  // Judge picks are applied by re-stubbing on a later request, so they never land in a trip
-  // record. Left out of the total, the headline under-reports everything the judge removed.
-  const judgeCharsRemoved = judges.reduce((sum, judge) => sum + judge.charsRemovedEstimate, 0);
-  const tokensEvictedOnce = Math.round((tripCharsRemoved + judgeCharsRemoved) / 4);
+  const tokensEvictedOnce = Math.round(tripCharsRemoved / 4);
   const cumulativeTokensKeptOut = requests.reduce(
     (sum, request) =>
       request.estimatedTokensBefore !== undefined && request.estimatedTokensSent !== undefined
@@ -304,19 +137,14 @@ async function main(): Promise<void> {
   console.log(`Proxy log: ${proxyLogPath}`);
   console.log(`  /v1/messages requests: ${requests.length}`);
   console.log(
-    `  eviction trips: ${trips.length} — ${evictedIdCount} segments evicted by the rules, ` +
+    `  eviction trips: ${trips.length} — ${evictedIdCount} segments evicted, ` +
       `${formatThousands(tripCharsRemoved)} chars removed`,
   );
-  if (judgeCharsRemoved > 0) {
-    console.log(`  judge picks: ${formatThousands(judgeCharsRemoved)} chars selected on top of the rules`);
-  }
-  console.log(`  tokens evicted (one-time, chars/4, rules + judge): ${formatThousands(tokensEvictedOnce)}`);
+  console.log(`  tokens evicted (one-time, chars/4): ${formatThousands(tokensEvictedOnce)}`);
   console.log(`  tokens kept out of requests (cumulative over turns): ${formatThousands(cumulativeTokensKeptOut)}`);
   console.log("");
   console.log(`Product metric — tokens evicted : tokens recalled = ${ratioLine(tokensEvictedOnce, recalledTokens)}`);
   console.log("");
-
-  printJudgeSummary(judges);
 
   if (requests.length === 0) return;
   printSpeedSummary(requests);

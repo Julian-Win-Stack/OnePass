@@ -6,10 +6,9 @@
 //   - attached file content the harness injects as "<system-reminder>\nResult of calling the
 //     Read tool:" user text (recover: read the file from disk, or recall)
 //   - "<task-notification>" user text (recover: read the task's output file, or recall)
-// A fifth kind exists that no rule may touch: the user's own text. It is evictable only where
-// the judge names that exact block, and then only down to what the judge left behind — a
-// verbatim quote, a one-line note of its own, or both. Everything else injected — CLAUDE.md
-// instructions, skill and agent listings, compaction summaries — stays protected by omission.
+// The whitelist is the whole of it: the user's own text is never touched, and neither is
+// anything else injected — CLAUDE.md instructions, skill and agent listings, compaction
+// summaries — which stay protected by omission.
 // No I/O — the caller owns the evicted-id set, the threshold state, and logging.
 
 import { createHash } from "node:crypto";
@@ -106,26 +105,8 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Text the judge must never be offered: the three harness-injected shapes the rules already
- * own, plus anything that is already a stub. A pick on one is wasted at best — a read-input
- * marker is not evictable at all, and the other two take the rule's stub whatever the judge
- * says, silently dropping its quote.
- */
-export function isRuleOwnedText(text: string): boolean {
-  return (
-    text.startsWith(READ_INPUT_PREFIX) ||
-    text.startsWith(ATTACHED_FILE_PREFIX) ||
-    text.startsWith(TASK_NOTIFICATION_PREFIX) ||
-    text.startsWith(STUB_PREFIX)
-  );
-}
-
-/**
- * For each message, how many assistant messages follow it. Every age gate here and in the
- * judge reads this one function, so the two can never drift apart on what "old" means.
- */
-export function assistantTurnsAfterByMessage(messages: unknown[]): number[] {
+/** For each message, how many assistant messages follow it — the age every gate here reads. */
+function assistantTurnsAfterByMessage(messages: unknown[]): number[] {
   const turnsAfter: number[] = new Array<number>(messages.length).fill(0);
   let assistantsSeen = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -210,9 +191,8 @@ function buildEvictedCallSuffix(callPath: string | undefined): string {
 
 /**
  * Chars a stubbed call costs: its emptied input, plus the suffix its result's stub gains for it.
- * The size floor and the judge's own gate both read this, so neither can accept a call the other
- * would refuse. Charged whole even when the result stays live and never gains the suffix, which
- * only ever makes the floor stricter.
+ * Charged whole even when the result stays live and never gains the suffix, which only ever
+ * makes the size floor stricter.
  */
 function evictedCallChars(callPath: string | undefined): number {
   return EMPTY_CALL_INPUT_CHARS + buildEvictedCallSuffix(callPath).length;
@@ -222,38 +202,6 @@ function evictedCallChars(callPath: string | undefined): number {
 // attachment carries it, and that marker is never evicted.
 function buildAttachedFileStub(originalChars: number): string {
   return `${STUB_PREFIX} attached file, ${formatThousands(originalChars)} chars]`;
-}
-
-/** What the judge decided to leave behind for one user-text block; at least one is non-empty. */
-export interface JudgeDecision {
-  /** A verbatim quote from the block. Checked to be a substring of it before it reaches here. */
-  keep: string;
-  /** The judge's own words describing what was removed. Unverifiable, so the stub labels it. */
-  note: string;
-}
-
-// Unverified text from a second model, entering the agent's context. Capped so a malfunctioning
-// judge can put a sentence there, not paragraphs.
-const NOTE_MAX_CHARS = 200;
-
-// The one stub not derived from the block alone. `keep` is the judge's verbatim quote of the
-// instructions inside a block that also carried a paste, already checked character-for-character.
-// `note` is the judge's own description, attributed in the stub so the agent never reads it as
-// something the user wrote.
-function buildUserTextStub(decision: JudgeDecision, originalChars: number, query: string): string {
-  const cleaned = sanitizeForStub(decision.note);
-  const note = cleaned.length > NOTE_MAX_CHARS ? `${cleaned.slice(0, NOTE_MAX_CHARS)}…` : cleaned;
-  const summary = note === "" ? "" : ` onepass's summary: ${note}.`;
-  const pointer =
-    `${STUB_PREFIX} ${formatThousands(originalChars)} chars of user text.${summary} ` +
-    `recall_search("${query}") for the original]`;
-  return decision.keep === "" ? pointer : `${decision.keep}\n${pointer}`;
-}
-
-const RECALL_QUERY_WORDS = 8;
-
-function recallQueryFromText(text: string): string {
-  return sanitizeForStub(text).split(" ").slice(0, RECALL_QUERY_WORDS).join(" ");
 }
 
 // The one stub that still names its target: nothing else in the request carries the task id or
@@ -294,26 +242,6 @@ function stubbedChars(segment: Segment): number {
   return segment.kind === "call" ? evictedCallChars(segment.callPath) : segment.stubText.length;
 }
 
-/** A block about to be stubbed, in whichever shape the size of its stub depends on. */
-export type StubTarget =
-  | { kind: "tool_result"; content: unknown }
-  | { kind: "tool_use"; input: unknown }
-  | { kind: "user_text"; text: string; decision: JudgeDecision };
-
-/**
- * Chars the block will cost once stubbed. The judge gates its picks on the saving this implies,
- * so it can never accept an id the eviction pass then refuses for saving too little.
- */
-export function stubbedCharsFor(target: StubTarget): number {
-  if (target.kind === "user_text") {
-    return buildUserTextStub(target.decision, target.text.length, recallQueryFromText(target.text)).length;
-  }
-  if (target.kind === "tool_result") return buildEvictedStub(measureContentChars(target.content)).length;
-  // A non-object input is passed through untouched, so stubbing it would save nothing.
-  if (!isRecord(target.input)) return measureContentChars(target.input);
-  return evictedCallChars(callPathFrom(target.input));
-}
-
 /** Segment id for a text block: a content hash, so it re-matches when the client resends it. */
 export function textSegmentId(text: string): string {
   return `sha1:${createHash("sha1").update(text).digest("hex")}`;
@@ -324,7 +252,7 @@ export function callSegmentId(toolUseId: string): string {
   return `call:${toolUseId}`;
 }
 
-function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<string, JudgeDecision>): Segment[] {
+function collectSegments(messages: unknown[]): Segment[] {
   const assistantTurnsAfterIndex = assistantTurnsAfterByMessage(messages);
   const segments: Segment[] = [];
 
@@ -339,11 +267,9 @@ function collectSegments(messages: unknown[], judgeDecisionById: ReadonlyMap<str
     } else if (text.startsWith(TASK_NOTIFICATION_PREFIX)) {
       stubText = buildTaskNotificationStub(text, text.length);
     } else {
-      // The user's own text. Off-limits to the rules; evictable only where the judge named
-      // this exact block, and then only down to what it chose to leave behind.
-      const decision = judgeDecisionById.get(id);
-      if (decision === undefined) return;
-      stubText = buildUserTextStub(decision, text.length, recallQueryFromText(text));
+      // Anything else in a user message is the user's own text, or something injected that no
+      // rule owns. Not a segment at all: the whitelist above is the whole of what may be evicted.
+      return;
     }
     segments.push({
       kind: "text",
@@ -494,8 +420,6 @@ export function evictContextSegments(
   body: unknown,
   alreadyEvictedIds: ReadonlySet<string>,
   config: EvictionConfig,
-  /** Judge verdicts for user-text blocks only: block id -> what to leave behind. */
-  judgeDecisionById: ReadonlyMap<string, JudgeDecision> = new Map(),
 ): EvictionOutcome {
   const estimatedTokensBefore = estimateTokens(body, config.charsPerToken);
   const isAboveAlarmLine = (tokensSent: number): boolean =>
@@ -521,7 +445,7 @@ export function evictContextSegments(
   // after. A Read call is the case: emptying its input saves almost nothing, and most of that
   // comes back as the path appended to its result's stub.
   // Dropping the segment here keeps its id out of the evicted set entirely.
-  const candidates = collectSegments(messages, judgeDecisionById).filter(
+  const candidates = collectSegments(messages).filter(
     (segment) =>
       !segment.alreadyStubShaped && segment.contentChars - stubbedChars(segment) >= config.minSavedChars,
   );

@@ -12,7 +12,7 @@ Everything else about Onepass depends on the answer. If the agent won't call rec
 
 | | |
 |---|---|
-| `src/server.ts` | MCP server exposing `recall_search` / `recall_get` over this session's transcript |
+| `src/server.ts` | Moved to `proxy/src/recall.ts`, where it ships as part of the published package. |
 | `librarian.md` | The other retrieval shape: a subagent that greps the transcript and returns verbatim excerpts. Not installed as an agent here — the harness copies it in. |
 | `harness/` | The measured comparison between the two. See [harness/README.md](harness/README.md). |
 | `nudge.sh` | UserPromptSubmit hook, **no longer wired up**. Stated that context may be trimmed and originals exist. |

@@ -11,9 +11,10 @@ Two parts, built in this order:
 Order is load-bearing. Eviction without recall must be timid, which is why the existing
 implementations do not prevent compaction. See [docs/findings.md](docs/findings.md) §6.
 
-`spike/src/` is the recall MCP server — live, not throwaway: `.mcp.json` registers it in every
-session. Its `recall_search` description carries the legend for the proxy's stubs. The throwaway
-parts are the librarian subagent (`librarian.md`) and the harness that raced them (`harness/`).
+`proxy/src/recall.ts` is the recall MCP server, published with the proxy: `.mcp.json` registers it
+for work in this repo, and `claudep` registers it per session with that session's id. Its
+`recall_search` description carries the legend for the proxy's stubs. `spike/` keeps only the
+throwaway parts — the librarian subagent (`librarian.md`) and the harness that raced them.
 
 The proxy runs compiled `dist/`, not `src/`, and it reads no git — uncommitted edits go live once
 built, and switching branches changes what runs. It is not a background service — start

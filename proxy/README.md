@@ -1,11 +1,74 @@
-# Onepass eviction proxy
+# Onepass
 
-A local HTTP proxy between Claude Code and the Anthropic API. Claude Code resends the entire
-conversation on every turn; the proxy replaces old, large, recoverable context segments with
-short deterministic stubs before forwarding, so the context the model sees — and the `usage`
-numbers Claude Code bases its auto-compact decision on — stop growing. Four segment kinds by
-rule, a fixed whitelist (measured against real sessions in docs/findings.md §13 — tool results
-alone are only ~6% of a real request body):
+Run a long Claude Code session to the end without it compacting.
+
+Claude Code resends the whole conversation on every turn, so a long session grows until the
+client summarises it away and you lose the detail. Onepass sits between Claude Code and the
+Anthropic API on your own machine and replaces old, large, **recoverable** context — tool
+results, the calls that made them, files the agent read, background-task output — with short
+stubs, so the conversation stops growing. Nothing is lost: the transcript on disk is untouched,
+and a bundled MCP server (`recall`) fetches any of it back verbatim when the agent asks.
+
+Measured on real sessions: **~1.49M tokens of raw conversation in one sitting, 289 turns, zero
+compactions**, with the task finished correctly. Numbers and caveats under
+[Verification](#verification).
+
+## Install
+
+```bash
+npm install -g onepass-proxy
+```
+
+Needs Node 20+ and the `claude` CLI already on your PATH (2.1.241 or newer).
+
+## Run
+
+```bash
+claudep
+```
+
+That is the whole thing. `claudep` starts a proxy for this session on a port the operating
+system picks, registers `recall` so the agent can fetch evicted content back, runs `claude`
+against it, and shuts the proxy down when you quit. Every argument you pass goes straight to
+`claude`, so `claudep --resume`, `claudep -p "..."` and the rest all work.
+
+When the session ends it prints one line saying what happened:
+
+```
+onepass: evicted 143 segments (~102,318 tokens), recalled 0, compactions 0 (peak ~96,412 tokens)
+```
+
+Run as many sessions as you like at once — each `claudep` gets its own proxy, its own evicted
+set and its own log, so two sessions can never see each other's history.
+
+## Turning it off
+
+Run `claude` instead of `claudep`. Nothing is installed into your shell, no background service
+is left running, and no Claude Code setting is changed — a plain `claude` run has never been
+through the proxy.
+
+## Sharp edges
+
+- **Your credentials pass through untouched and go nowhere else.** The proxy forwards to
+  `api.anthropic.com` and talks to nothing on the internet but that. It logs sizes, ids and
+  paths — **never request or response bodies**.
+- **It listens on `127.0.0.1` only.** Anything that can reach the port can spend your Claude
+  subscription, so it is not reachable from your network. `ONEPASS_HOST` can move it; think
+  twice before you do.
+- **Eviction is not free.** Each trip rewrites Anthropic's prompt cache, and a cache write
+  costs 12.5× a cache read. The target is a session that *finishes* at roughly what an
+  unproxied session costs — not a cheaper session. See
+  [`ONEPASS_BATCH_MIN_TOKENS`](#configuration-env-vars--this-is-all-of-it).
+- **`CLAUDE_CODE_GZIP_REQUEST_BODIES` disables it silently.** A compressed body is forwarded
+  untouched. `claudep` unsets the variable for you; a hand-started proxy cannot.
+- **Not a background service.** Nothing should reach the proxy unless a session opts in.
+
+---
+
+# How it works
+
+Four segment kinds are evictable, a fixed whitelist (measured against real sessions in
+docs/findings.md §13 — tool results alone are only ~6% of a real request body):
 
 - `tool_result` blocks
 - **`tool_use` inputs** — the calls themselves. `Edit` and `Write` carry the whole text they
@@ -16,12 +79,9 @@ alone are only ~6% of a real request body):
 
 Everything else is protected by omission: CLAUDE.md instructions, skill/agent listings,
 compaction summaries, and thinking blocks (the client already manages those via the API's
-`context_management` thinking-clearing). Text the user typed is off-limits to the rules and
-has exactly one exception — the optional judge below may evict a block it names, and then only
-down to what it leaves behind: a verbatim quote of the user's own words, a one-line note in the
-judge's own words (attributed as such in the stub), or both. Assistant text and thinking have no
-exception at all. Evicted content is never lost: the original transcript on disk is untouched,
-and the recall MCP server in `spike/` can fetch any of it back verbatim.
+`context_management` thinking-clearing). **Text the user typed is never touched** — there is no
+file to re-read and no command to re-run, so a stub in its place would be the one loss recall
+could not undo. Assistant text has no exception either.
 
 Stubs are pointers, never summaries — and they name the target once, not three times. A tool
 block stubs to `[onepass: evicted 1,481 chars]` and nothing else: what the block was is
@@ -47,31 +107,37 @@ it holds is left alone and never enters the evicted-id set. A `Read` call is the
 needs this: emptying its input saves almost nothing, and most of that comes straight back as
 the path appended to its result's stub.
 
-Everything runs 100% locally: the proxy forwards requests to `api.anthropic.com` (or your
-`ONEPASS_UPSTREAM`) and nowhere else. Your API key or OAuth token passes through untouched,
-and request/response bodies are never logged.
+## Recall
 
-## Run it
+`recall` is an MCP server over the session transcript, shipped in this package and registered
+by `claudep` for the session it starts. Two tools — `recall_search` over the session's own
+history and `recall_get` for one entry by id — so anything a stub replaced can be fetched back
+character-for-character. Its `recall_search` description is where the agent is told what a stub
+is and how to get the content back.
 
-From a clone of this repo (not published to npm):
+It reads the transcript named by `ONEPASS_SESSION_ID`, which `claudep` sets, and never any
+other. Without it — a hand-started proxy — it falls back to the newest transcript for the
+current directory, which with two sessions open in one repository can be the other session's
+history.
 
+The transcript is read-only to Onepass. Nothing here ever writes to one.
+
+## Running the proxy by hand
+
+You do not need this unless you are working on Onepass itself, or driving Claude Code from
+something that cannot go through `claudep`.
+
+```bash
+onepass-proxy
 ```
-cd proxy
-npm install
-npm run build
-npm start
-```
 
-Or install the bins globally (`npm i -g .` from `proxy/`, which symlinks them to the
-working tree) and run `onepass-proxy` in a terminal for as long as you want it.
-
-Then point Claude Code at it — per session, so an ordinary `claude` run is unaffected.
-Auth passes straight through: `ANTHROPIC_API_KEY` and subscription OAuth both work
+It runs in the foreground until you stop it, and prints the line to launch a session against
+it. Auth passes straight through: `ANTHROPIC_API_KEY` and subscription OAuth both work
 (verified live on CLI 2.1.243 — the CLI does send OAuth credentials to a custom
 `ANTHROPIC_BASE_URL`, whatever the docs say):
 
-```
-ANTHROPIC_BASE_URL=http://localhost:3777 _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:3777 _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 claude
 ```
 
 The second variable is load-bearing. Claude Code decides the context window client-side, and
@@ -80,19 +146,36 @@ a base URL whose host is not `api.anthropic.com` makes it cap native-1M models (
 first-party — it is, the proxy forwards to `api.anthropic.com`. Details under "Known Claude
 Code interactions".
 
+One proxy serves one session. Its evicted-id set, its chars-per-token calibration and its log
+are per-process, so two sessions sharing a proxy put one session's stubs into the other's
+request. `claudep` exists so you never have to think about this.
+
+To register recall by hand, add it to your MCP config with the session id in its environment:
+
+```json
+{
+  "mcpServers": {
+    "onepass": {
+      "command": "onepass-recall",
+      "env": { "ONEPASS_SESSION_ID": "<the session uuid>" }
+    }
+  }
+}
+```
+
 ## Configuration (env vars — this is all of it)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ONEPASS_PORT` | `3777` | Port the proxy listens on |
+| `ONEPASS_PORT` | `3777` | Port the proxy listens on. `0` asks the operating system for a free one, and the startup banner reports what it got |
+| `ONEPASS_HOST` | `127.0.0.1` | Interface the proxy binds. Every request through it carries your Claude Code credentials upstream, so the default is loopback-only; `0.0.0.0` makes it an open relay for anyone who can reach the port. `claudep` pins this to the loopback for its own child whatever the shell says |
 | `ONEPASS_UPSTREAM` | `https://api.anthropic.com` | Where requests are forwarded |
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
 | `ONEPASS_TRIP_TOKENS` | `80000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run well over T: at T=110k the measured peak was 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The default moved 110k → 80k once the batch minimum existed, because a lower T then costs a handful of larger trips instead of a swarm of small ones (§21). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it — once the floor is above T, no value of T brings the peak down: one recorded session peaked at 150,811 tokens at T=110k and at T=80k alike. Size T so `T + 60k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) |
 | `ONEPASS_BATCH_MIN_TOKENS` | `20000` | The least a trip may newly evict. A smaller batch is held back, and that content waits for a later request where the batch has grown past the minimum; `0` turns it off. Every trip rewrites the prompt cache, and a cache write costs 1.25× base input against a cache read's 0.1×, so trips are the proxy's main running cost. Without a minimum, a session whose floor has passed T trips on nearly every request for a few hundred tokens each: on one recording at T=80k, **50 trips in 68 requests, against 1** with the default minimum (§21) |
 | `ONEPASS_MIN_SAVED_CHARS` | `50` | A segment is stubbed only when its finished stub is at least this many chars smaller than the content. The stub's own cost decides, so no fixed size floor is needed |
-| `ONEPASS_JUDGE_API_KEY` | unset | Your own Anthropic API key. Unset means **no judge**: the proxy evicts by the rules alone, exactly as it did before. Never set `ANTHROPIC_API_KEY` for this — a `claudep` launched from the same shell would then bill Claude Code to the key instead of your subscription. Judge calls are billed to this key |
-| `ONEPASS_JUDGE_MODEL` | `claude-sonnet-5` | Model the judge runs on |
+| `ONEPASS_SESSION_ID` | unset | Which session's transcript `recall` reads. `claudep` sets it; without it recall falls back to the newest transcript for the current directory |
 | `ONEPASS_DUMP_DIR` | unset | Debug only: when set, every `/v1/messages` and `/v1/messages/count_tokens` body is written to this directory before eviction — other paths are never dumped. Bodies contain the full conversation — never leave it on |
 
 ## How eviction behaves
@@ -103,9 +186,9 @@ Code interactions".
   verbatim. Responses stream straight through (SSE included), never buffered.
 - Eviction replaces only the content of whitelisted segments: a `tool_result` block's
   `content`, a `tool_use` block's `input`, an attached-file text block's `text`, or a
-  task-notification user message's string content — plus, when the judge is on, a block of the
-  user's own text that the judge named. Block structure, `tool_use_id`, a call's `id`/`name`/`type`,
-  `is_error`, assistant text, thinking blocks, system prompt, and tool definitions are never
+  task-notification user message's string content. Block structure, `tool_use_id`, a call's
+  `id`/`name`/`type`, `is_error`, user text, assistant text, thinking blocks, system prompt,
+  and tool definitions are never
   touched — and injected text is matched by exact prefix, so CLAUDE.md/skill-listing
   `<system-reminder>` blocks (same envelope, different prefix) are never candidates.
   `is_error` results are evicted like any other. An attached-file stub names no path — the
@@ -144,59 +227,6 @@ Code interactions".
   input removes the thing being copied, and an imitated `{}` cannot become a valid call the way
   a kept `{ command }` could.
 
-## The judge (off unless `ONEPASS_JUDGE_API_KEY` is set)
-
-The rules above evict by age and size: they cannot tell a file read the agent has moved past
-from one it is about to use. The judge can. At each trip on `/v1/messages` the proxy sends the
-conversation to a second model and asks it to name blocks that are **superseded** or belong to
-a **finished sub-task**. It is never given a size target. A trip on `count_tokens` does not run
-it — the same conversation for twice the bill.
-
-What it is sent is the conversation **as it went upstream**, existing stubs and all, not the raw
-history. The judge never sees the original of anything the rules already replaced, so it can
-only add to what is evicted, never restore.
-
-**Measured, and it does almost nothing — leave it off unless you are working on it.**
-`docs/findings.md` §17 records two live runs. Across 79 trips the judge answered 18 calls,
-proposed 18 picks and got **one** accepted, worth 7,585 chars — 1.1% of what the rules removed
-on the same run — for ~$3.19 on the operator's key. The run before it accepted zero. It is
-never in the request path, so the cost is money rather than wall clock. Its headroom is bounded
-by the rules by construction: it is only ever offered what the rules declined, and the better
-the rules get, the less is left.
-
-- **Never in the request path.** The tripping request goes upstream as the rules left it, and
-  the agent never waits on the judge. The judge runs alongside it; its verdict is applied by adding the ids it named to
-  the same evicted-id set the rules use, so the stubs appear on the agent's *next* request —
-  trip or not. One judge runs at a time; a trip that arrives while one is running is skipped and
-  logged.
-- **What it may name**: a `tool_result`, a `tool_use` input, or a block of the user's own text.
-  Only those carry an id it can name. Assistant text is shown untagged — the judge needs it to
-  tell what work is finished — and thinking blocks are dropped from its view entirely.
-- **User text is the one case where the judge decides what stays.** It names the block and
-  fills in at least one of two fields: `keep`, a verbatim quote accepted only if it is a
-  character-for-character substring of the block, and `note`, one line in the judge's own words
-  saying what the removed material was. A pure paste with no instructions in it is the `note`-only
-  case. Both empty is a malfunction, not a decision, and the block survives untouched. The note is
-  unverifiable by construction, so the stub attributes it (`onepass's summary: …`) and caps it at
-  200 characters — the agent must never read it as something the user wrote.
-- **What it is never offered**: harness-injected user text (attached-file content, task
-  notifications, `Called the Read tool` markers) and any block already replaced by a stub carry
-  no id at all. The rules own those; a pick on one would be silently dropped or would overwrite
-  the judge's own note, so the judge never sees a handle for them.
-- **The guards it cannot override**, all evaluated against the request being rewritten now, not
-  the snapshot it read: an id the request does not contain; a block inside the protected last-K
-  window, where K is floored at 1 so the newest assistant turn is off-limits even at
-  `ONEPASS_PROTECT_LAST_TURNS=0`; a block below `ONEPASS_MIN_SAVED_CHARS`; a quote that is not
-  an exact substring; a user block with neither quote nor note; assistant text; and a quote or
-  note on a block that is not the user's own text. Each has its own counter in the log and the
-  report, so a systematic mismatch is diagnosable rather than lumped together.
-- **Fails open.** A timeout, a non-2xx, or an unparseable answer is retried once and then
-  recorded as an error — nothing extra is evicted, and the rule pass is unaffected.
-- **Its own credentials only.** The judge call carries `x-api-key` from `ONEPASS_JUDGE_API_KEY`
-  and nothing else; Claude Code's own `authorization` header is never copied onto it.
-- **Never logged**: the prompt and the verdict bodies. The log records counts, sizes, and
-  timings only, like every other record.
-
 ## Known Claude Code interactions (measured against 2.1.241–2.1.258)
 
 - **Compaction really does key off API-reported usage.** From the shipped binary: auto-compact
@@ -208,13 +238,14 @@ the rules get, the less is left.
   2.1.250–2.1.252). The window is decided client-side: 1M if the model name ends in `[1m]`;
   else 1M only if the model is natively 1M *and* the base URL host is exactly
   `api.anthropic.com` or `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` is set; else 200k. So
-  `opus` through `localhost:3777` reports 200,000 while `opus[1m]` reports 1,000,000. Keep the
-  flag in the launch command so the window does not depend on which `/model` entry was last
-  picked — choosing "Opus 5" there persists plain `opus`. `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
-  does not help; it is ignored for known model names.
+  `opus` through `localhost:3777` reports 200,000 while `opus[1m]` reports 1,000,000. `claudep`
+  sets the flag for you; set it yourself if you launch by hand, so the window does not depend
+  on which `/model` entry was last picked — choosing "Opus 5" there persists plain `opus`.
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does not help; it is ignored for known model names.
 - **Gzipped request bodies bypass eviction.** With `CLAUDE_CODE_GZIP_REQUEST_BODIES=1` the
   client compresses `/v1/messages` bodies and the proxy forwards `content-encoding` bodies
-  untouched by design. Unset it for proxied sessions (local desktop sessions don't set it).
+  untouched by design. `claudep` unsets it; unset it yourself for a hand-launched session
+  (local desktop sessions don't set it).
 - **Compaction thrash is fatal, not just slow.** If context refills within 3 turns of a
   compact 3 times in a row, the client's `rapid_refill_breaker` aborts the session
   (docs/findings.md §10). Each compact also stalls the session ~90–100s. This is what the
@@ -274,22 +305,18 @@ only decides what gets a rebuild verdict.
 
 ## Report
 
+```bash
+onepass-report ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
 ```
-npm run report -- ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl [proxy-log-path]
-```
-
-(or `onepass-report …` with the global install)
 
 Reads the session transcript (read-only) plus the proxy log and prints: compaction count
 (target zero), tokens evicted, tokens recalled via `recall_search`/`recall_get`, the
 evicted:recalled ratio (read it as how much the agent had to pay back for eviction, not as
 proof recall is carrying the session — on real workloads it is rarely called at all, see
 Verification), a speed summary (rebuilds by cause, median and max `proxyMs`, median first-byte
-on cached requests versus rebuilt ones), a judge summary when the log holds any judge runs
-(picks proposed and accepted, drops per counter, token spend, and runs that failed or were
-skipped), and a per-request table carrying those numbers next to the estimated tokens sent over
-time (flat is good). The proxy log path defaults to the newest `proxy.log.*.jsonl` under
-`~/.onepass/`.
+on cached requests versus rebuilt ones), and a per-request table carrying those numbers next to
+the estimated tokens sent over time (flat is good). The proxy log path defaults to the newest
+`proxy.log.*.jsonl` under `~/.onepass/`.
 
 ## Verification
 
@@ -298,13 +325,14 @@ pressure pass), plus integration tests that run the proxy against a **recorded s
 upstream** — a local HTTP server that captures exactly what was forwarded. Covered: verbatim
 forwarding of non-messages paths, byte-identical `/v1/messages` bodies when nothing is
 stubbed, stubbing + monotonic re-stub across requests with a single trip logged,
-`count_tokens` evicted identically, chars-per-token calibration from response usage,
+`count_tokens` evicted identically, chars-per-token calibration from response usage, a user's
+paste going upstream untouched however far past the threshold it is,
 malformed bodies passed through, SSE streamed without buffering (the test deadlocks if the
-proxy buffers), and a 502 API-shaped error when the upstream is unreachable. For the judge:
-the conversation rendered with every evictable block tagged and thinking dropped entirely,
-verdict parsing, each guard dropping its own entry, a trip firing the judge and
-its verdict stubbing a paste on the next request, a failing judge retried once and then
-evicting nothing, and no judge call at all when no key is configured.
+proxy buffers), and a 502 API-shaped error when the upstream is unreachable. For `claudep`:
+an end-to-end launch against a fake `claude` and a fake upstream, asserting the exit code is
+passed through, recall is registered for that session id, and the proxy is dead afterwards.
+For recall: a real MCP handshake against the built server, answering out of its own session's
+transcript with a newer decoy transcript planted beside it.
 
 ### Verified against the real API
 
@@ -350,8 +378,8 @@ compact line at ~144–147k, inside the proxy's own peak range. Drop the setting
 
 ### Verified locally (2026-08-25, CLI 2.1.243, subscription OAuth, macOS)
 
-The local pass-through and recall loop are confirmed too — measurements in
-[docs/findings.md](../docs/findings.md) §12:
+The local pass-through and recall loop are confirmed too — measurements in `docs/findings.md`
+§12, in the repository:
 
 1. **Pass-through parity**: `ANTHROPIC_BASE_URL=http://localhost:3777 claude -p …` behaves
    identically to a direct run, on real subscription OAuth from a local machine.
@@ -360,19 +388,21 @@ The local pass-through and recall loop are confirmed too — measurements in
    99:1**; an unannounced probe for evicted content was answered exactly, via
    `recall_search`/`recall_get` — disk first, recall second, no confabulation.
 
-## Deploying (this machine)
+## Working on Onepass itself
 
-The global bins are a symlink to this working tree (`npm i -g .`), so a rebuild is all a
-deploy needs — then restart `onepass-proxy`:
+From a clone of this repo:
 
-```
+```bash
+cd proxy
+npm install
+npm run build
 npm test
-onepass-proxy
 ```
 
-It runs in the foreground, one process for as long as you want it. There is deliberately
-no launchd/systemd unit: nothing should reach the proxy unless a session opts in, so a
-run that forgets the alias is a direct run rather than a silently proxied one.
+`npm i -g .` symlinks the four bins (`claudep`, `onepass-proxy`, `onepass-recall`,
+`onepass-report`) to this
+working tree, so a rebuild is all a deploy needs. The proxy runs compiled `dist/`, not `src/`,
+and reads no git: uncommitted edits go live once built, and switching branches changes what
+runs.
 
-The package is intentionally not published to npm; a tag-push publish workflow exists in
-`.github/` should that ever change.
+Publishing is a tag push — `.github/workflows/publish.yml` publishes this directory on `v*`.

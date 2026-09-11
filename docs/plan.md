@@ -10,14 +10,15 @@
 > - **Auth** — §3 says API key only. Subscription OAuth works too; it passes through
 >   untouched, so nothing had to be built for it.
 > - **Trip threshold** — step 3 says `T` defaults to 150,000 estimated as chars ÷ 4. It is
->   110,000 **real** tokens, live-calibrated from API `usage`; chars ÷ 4 under-counts by
+>   80,000 **real** tokens, live-calibrated from API `usage`; chars ÷ 4 under-counts by
 >   25–79%. A pressure pass, not in this brief, relaxes the age gate when a burst of large
 >   reads outruns it.
-> - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. Two of the
->   three happened: the proxy ships as the `onepass-proxy` package, installed locally and
->   deliberately **not** published to npm, and `spike/` gained the retrieval harness.
-> - **Text eviction** — §7 ruled out evicting user text. It is now allowed, and only, where a
->   judge model names the block; see the amended §7 bullet.
+> - **Scope** — §7 rules out packaging, npm publishing, and changes to `spike/`. All three
+>   happened: the proxy ships as the `onepass-proxy` package, published to npm from
+>   **2026-09-11**, and recall moved out of `spike/` into it.
+> - **Text eviction** — §7 ruled out evicting user text, then briefly allowed it where a judge
+>   model named the block. The judge is gone (see below) and the original rule stands: the
+>   user's own text is never evicted.
 
 Written for a Claude session with **zero prior context**. Everything you need is in this
 file. Read it top to bottom before writing any code.
@@ -89,7 +90,7 @@ threshold is never reached. (Verify this behavior during real-work measurement, 
 |---|---|
 | `CLAUDE.md` | project instructions and rules |
 | `docs/findings.md` | the measured findings cited above |
-| `spike/src/server.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it. Amended 2026-09-02:** its tool *descriptions* may change. The server is registered in every session via `.mcp.json`, so its description is where the legend for the proxy's stubs lives — that is what lets a stub stop repeating the recovery hint in every block. The retrieval code itself is still off-limits. |
+| `proxy/src/recall.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it. Amended 2026-09-02:** its tool *descriptions* may change — the description is where the legend for the proxy's stubs lives, which is what lets a stub stop repeating the recovery hint in every block. **Amended 2026-09-11:** moved here from `spike/src/server.ts` so it ships inside the published package, and its transcript lookup is now session-scoped: `ONEPASS_SESSION_ID`, set by `claudep`, instead of the newest file in the directory, which in a second concurrent session was another session's history. Retrieval is otherwise unchanged and still not to be reworked casually. |
 | `.mcp.json` | registers that server with Claude Code |
 
 The proxy is new. Put it in `proxy/` at the repo root: own `package.json` (mirror
@@ -218,17 +219,22 @@ that reads a session transcript plus the proxy log and prints:
   eviction rebuilds the exact bug this project exists to remove.
 - No embeddings, no semantic search. Keyword recall is proven sufficient.
 - No OAuth/subscription auth work. API key only.
-- No UI, no packaging, no npm publishing.
+- No UI, no packaging, no npm publishing. **Amended 2026-09-11:** all three shipped —
+  `claudep` is the UI, the package is `onepass-proxy`, and it publishes on a `v*` tag.
 - No changes to `spike/`. **Amended 2026-09-02:** the recall server's tool descriptions may
   change — it is registered in every session and is the half that makes eviction safe, so it is
-  not throwaway. The stub legend lives in `recall_search`'s description. Its retrieval logic,
-  and the rest of `spike/`, stay out of scope.
-- No eviction of assistant text or thinking blocks, ever. **Amended:** user text is evictable,
-  but only where the judge names that exact block, and only down to what the judge leaves
-  behind: a verbatim excerpt of the user's own words, a one-line note in the judge's own words,
-  or both, plus a pointer. The note is the one place a summary is allowed anywhere in the
-  proxy — it exists because a pure paste has no words worth quoting, and it is attributed to
-  onepass in the stub and capped so it can never be mistaken for the user's own text.
+  not throwaway. The stub legend lives in `recall_search`'s description. **Amended 2026-09-11:**
+  the server moved into `proxy/src/recall.ts` so a published install cannot have eviction
+  without recall, and its transcript lookup became session-scoped. Its ranking and fetching are
+  otherwise unchanged and still not to be reworked casually.
+- No eviction of assistant text or thinking blocks, ever. **Amended 2026-09-06:** user text
+  is evictable, but only where the judge names that exact block. **Amended 2026-09-11: reverted
+  — the judge was removed from the proxy before publication, so nothing can name a user block
+  and the original rule stands.** Measured across two live runs the judge answered 18 calls for
+  one accepted pick, 1.1% of what the rules removed on the same run (findings.md §17); its
+  headroom was bounded by the rules by construction, and the rules got better. Removing it also
+  removes the only path by which a second model's unverifiable summary could enter the agent's
+  context.
 
 ## 8. Done means
 

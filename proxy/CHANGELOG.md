@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
+The first published release: `npm i -g onepass-proxy`, then `claudep` instead of `claude`.
+0.1.0 and 0.2.0 ran from a clone.
+
+- **The judge is gone** — `ONEPASS_JUDGE_API_KEY`, `ONEPASS_JUDGE_MODEL`, the second model that
+  named blocks the rules could not recognise, and with it the one exception that let a block of
+  the user's own text be evicted. Measured across two live runs it answered 18 calls for one
+  accepted pick, 1.1% of what the rules removed on the same run, at ~$3.19 (docs/findings.md
+  §17). The user's own text is now never touched by anything.
+- **The proxy binds `127.0.0.1`**, not every interface. Every request through it carries the
+  user's Claude Code credentials upstream, so the old bind made it an open relay for anyone on
+  the same network. `ONEPASS_HOST` overrides it; `claudep` pins its own child to the loopback
+  whatever the shell says.
+- **Recall ships with the proxy**: `onepass-recall`, the MCP server that reads the original
+  history back off disk, moved from `spike/src/server.ts` into this package, and `claudep`
+  registers it for the session it starts. Eviction is only safe where what it removes can be
+  fetched back verbatim, so an install that had the proxy without recall had the dangerous half.
+- **Recall reads its own session's transcript**, named by `ONEPASS_SESSION_ID`, rather than the
+  newest file in the project directory — which, with two sessions open in one repository, could
+  be the other session's history. Without the variable it still falls back to the newest.
+- **`claudep`**: one command to run Claude Code through the proxy. It starts a proxy of its own
+  on a port the operating system picks, runs `claude` against it with the first-party flag set,
+  kills the proxy afterwards and prints one line saying what the session evicted. Every argument
+  is passed through, `claudep mcp …` and `--help` skip the proxy entirely, and a resumed session
+  keeps its own id. A session per proxy is what keeps two sessions' evicted-id sets, calibration
+  and logs from mixing — one shared proxy put one session's stubs in another session's request.
 - `ONEPASS_PORT=0` now works end to end: the startup banner reports the port the operating
   system bound instead of the 0 that was asked for. The eval starts a proxy child per planning
   case and per tail, several at once, and reads each child's port out of that line.

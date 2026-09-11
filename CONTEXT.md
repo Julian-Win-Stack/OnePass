@@ -39,10 +39,6 @@ _Avoid_: hard line, ceiling
 Fetching evicted content verbatim from the session transcript, by search or by id.
 _Avoid_: retrieval, memory lookup
 
-**Judge**:
-The proxy's own second model that names blocks the rules cannot recognise as dead.
-_Avoid_: grader, evaluator (those belong to the eval)
-
 **Rebuild**:
 A request the API could not serve from cache because the prefix changed.
 _Avoid_: cache miss, cold request
