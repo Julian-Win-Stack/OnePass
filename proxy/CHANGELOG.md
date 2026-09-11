@@ -1,7 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
+The first published release: `npm i -g onepass-proxy`, then `claudep` instead of `claude`.
+0.1.0 and 0.2.0 ran from a clone.
+
+- **The judge is gone** — `ONEPASS_JUDGE_API_KEY`, `ONEPASS_JUDGE_MODEL`, the second model that
+  named blocks the rules could not recognise, and with it the one exception that let a block of
+  the user's own text be evicted. Measured across two live runs it answered 18 calls for one
+  accepted pick, 1.1% of what the rules removed on the same run, at ~$3.19 (docs/findings.md
+  §17). The user's own text is now never touched by anything.
+- **The proxy binds `127.0.0.1`**, not every interface. Every request through it carries the
+  user's Claude Code credentials upstream, so the old bind made it an open relay for anyone on
+  the same network. `ONEPASS_HOST` overrides it; `claudep` pins its own child to the loopback
+  whatever the shell says.
 - **Recall ships with the proxy**: `onepass-recall`, the MCP server that reads the original
   history back off disk, moved from `spike/src/server.ts` into this package, and `claudep`
   registers it for the session it starts. Eviction is only safe where what it removes can be
