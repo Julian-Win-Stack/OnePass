@@ -20,6 +20,7 @@
   "bin": {
     "claudep": "dist/claudep.js",
     "onepass-proxy": "dist/main.js",
+    "onepass-recall": "dist/recall.js",
     "onepass-report": "dist/report.js"
   },
   "files": [
@@ -39,5 +40,9 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.2"
   }
 }

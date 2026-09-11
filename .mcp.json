@@ -2,7 +2,7 @@
   "mcpServers": {
     "onepass": {
       "command": "node",
-      "args": ["/Users/phyonyanwinn/Project/ProJect/Onepass/spike/dist/server.js"]
+      "args": ["/Users/phyonyanwinn/Project/ProJect/Onepass/proxy/dist/recall.js"]
     }
   }
 }

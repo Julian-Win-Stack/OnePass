@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Recall ships with the proxy**: `onepass-recall`, the MCP server that reads the original
+  history back off disk, moved from `spike/src/server.ts` into this package, and `claudep`
+  registers it for the session it starts. Eviction is only safe where what it removes can be
+  fetched back verbatim, so an install that had the proxy without recall had the dangerous half.
+- **Recall reads its own session's transcript**, named by `ONEPASS_SESSION_ID`, rather than the
+  newest file in the project directory — which, with two sessions open in one repository, could
+  be the other session's history. Without the variable it still falls back to the newest.
 - **`claudep`**: one command to run Claude Code through the proxy. It starts a proxy of its own
   on a port the operating system picks, runs `claude` against it with the first-party flag set,
   kills the proxy afterwards and prints one line saying what the session evicted. Every argument

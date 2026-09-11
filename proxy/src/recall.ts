@@ -1,9 +1,18 @@
-import { readFileSync, readdirSync, statSync, appendFileSync, mkdirSync } from "node:fs";
+#!/usr/bin/env node
+// `onepass-recall` — the MCP server that reads this session's original history back off disk.
+//
+// Half of Onepass by itself: the proxy may only evict what can be recovered verbatim, and this
+// is what recovers it. Its `recall_search` description is also where the legend for the proxy's
+// stubs lives, so a stub does not have to repeat the recovery hint in every block.
+
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { transcriptForSession } from "./transcript.js";
 
 const CALL_LOG = join(homedir(), ".onepass", "recall-calls.log");
 const MAX_RESULT_CHARS = 8000;
@@ -19,28 +28,6 @@ type Entry = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-/** Claude Code stores each session under a slug of the cwd with separators replaced by dashes. */
-function transcriptDir(cwd: string): string {
-  return join(homedir(), ".claude", "projects", cwd.replace(/[/.]/g, "-"));
-}
-
-function newestTranscript(cwd: string): string | null {
-  const dir = transcriptDir(cwd);
-  let names: string[];
-  try {
-    names = readdirSync(dir).filter((n) => n.endsWith(".jsonl"));
-  } catch {
-    return null;
-  }
-  let newest: { path: string; mtimeMs: number } | null = null;
-  for (const name of names) {
-    const path = join(dir, name);
-    const { mtimeMs } = statSync(path);
-    if (!newest || mtimeMs > newest.mtimeMs) newest = { path, mtimeMs };
-  }
-  return newest?.path ?? null;
 }
 
 function blockToText(block: Record<string, unknown>): string {
@@ -119,16 +106,17 @@ function logCall(tool: string, args: unknown, outcome: string): void {
   } catch {
     // the log is spike instrumentation; never fail a recall because it could not be written
   }
-  process.stderr.write(`[onepass-spike] ${line}\n`);
+  process.stderr.write(`[onepass-recall] ${line}\n`);
 }
 
 function loadEntries(): { entries: Entry[]; error?: string } {
-  const path = newestTranscript(process.cwd());
-  if (!path) return { entries: [], error: `No transcript found under ${transcriptDir(process.cwd())}` };
-  return { entries: parseTranscript(path) };
+  const chosen = transcriptForSession(process.env, process.cwd());
+  if (chosen.path === null) return { entries: [], error: chosen.reason };
+  return { entries: parseTranscript(chosen.path) };
 }
 
-const server = new McpServer({ name: "onepass-recall", version: "0.0.0" });
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+const server = new McpServer({ name: "onepass-recall", version });
 
 server.registerTool(
   "recall_search",

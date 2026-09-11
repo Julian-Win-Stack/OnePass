@@ -18,7 +18,6 @@ import { randomUUID } from "node:crypto";
 import {
   claudeArgs,
   claudeEnv,
-  findTranscript,
   isPassthrough,
   parseBanner,
   proxyEnv,
@@ -26,9 +25,11 @@ import {
   sessionIdFromArgs,
   summaryLine,
   upstreamWarning,
+  withRecallMcp,
   type Banner,
 } from "./launch.js";
 import { parseProxyLog, scanTranscript } from "./session.js";
+import { findTranscript } from "./transcript.js";
 
 /** Long enough for a cold `node` start on a loaded machine, short enough to fail a launch. */
 const PROXY_START_TIMEOUT_MS = 20_000;
@@ -204,7 +205,13 @@ async function main(): Promise<void> {
   // says what the log alone can say.
   const resuming = reusesExistingSession(args);
   const sessionId = resuming ? sessionIdFromArgs(args) : randomUUID();
-  const claude = spawn("claude", claudeArgs(args, resuming ? null : sessionId), {
+  const withRecall = withRecallMcp(claudeArgs(args, resuming ? null : sessionId), {
+    node: process.execPath,
+    entry: fileURLToPath(new URL("./recall.js", import.meta.url)),
+    sessionId,
+  });
+  if (withRecall.warning !== null) note(withRecall.warning);
+  const claude = spawn("claude", withRecall.args, {
     stdio: "inherit",
     env: claudeEnv(process.env, proxy.banner.port),
   });

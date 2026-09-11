@@ -89,7 +89,7 @@ threshold is never reached. (Verify this behavior during real-work measurement, 
 |---|---|
 | `CLAUDE.md` | project instructions and rules |
 | `docs/findings.md` | the measured findings cited above |
-| `spike/src/server.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it. Amended 2026-09-02:** its tool *descriptions* may change. The server is registered in every session via `.mcp.json`, so its description is where the legend for the proxy's stubs lives — that is what lets a stub stop repeating the recovery hint in every block. The retrieval code itself is still off-limits. |
+| `proxy/src/recall.ts` | working recall MCP server: `recall_search` (multi-term, ranked) + `recall_get` over the session transcript. **Do not modify it. Amended 2026-09-02:** its tool *descriptions* may change — the description is where the legend for the proxy's stubs lives, which is what lets a stub stop repeating the recovery hint in every block. **Amended 2026-09-11:** moved here from `spike/src/server.ts` so it ships inside the published package, and its transcript lookup is now session-scoped: `ONEPASS_SESSION_ID`, set by `claudep`, instead of the newest file in the directory, which in a second concurrent session was another session's history. Retrieval is otherwise unchanged and still not to be reworked casually. |
 | `.mcp.json` | registers that server with Claude Code |
 
 The proxy is new. Put it in `proxy/` at the repo root: own `package.json` (mirror

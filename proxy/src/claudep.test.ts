@@ -16,7 +16,6 @@ import type { AddressInfo } from "node:net";
 import {
   claudeArgs,
   claudeEnv,
-  findTranscript,
   isPassthrough,
   parseBanner,
   proxyEnv,
@@ -24,9 +23,11 @@ import {
   sessionIdFromArgs,
   summaryLine,
   upstreamWarning,
+  withRecallMcp,
 } from "./launch.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MINE = "1e4f1b2c-1111-4222-8333-444455556666";
 
 test("a subcommand or an information flag skips the proxy", () => {
   assert.equal(isPassthrough(["mcp", "list"]), true);
@@ -97,17 +98,34 @@ test("the banner is read for the port and the log, and needs both", () => {
   assert.equal(parseBanner("[onepass] eviction proxy listening on http://localhost:51234\n"), null);
 });
 
-test("a transcript is found by session id, in whichever project directory holds it", () => {
-  const configDir = mkdtempSync(join(tmpdir(), "onepass-config-"));
-  const id = "1e4f1b2c-1111-4222-8333-444455556666";
-  mkdirSync(join(configDir, "projects", "-some-other-project"), { recursive: true });
-  mkdirSync(join(configDir, "projects", "-a-project"), { recursive: true });
-  writeFileSync(join(configDir, "projects", "-a-project", `${id}.jsonl`), "");
-  assert.equal(
-    findTranscript(id, { CLAUDE_CONFIG_DIR: configDir }),
-    join(configDir, "projects", "-a-project", `${id}.jsonl`),
-  );
-  assert.equal(findTranscript("2e4f1b2c-1111-4222-8333-444455556666", { CLAUDE_CONFIG_DIR: configDir }), null);
+test("recall is registered for this session, without displacing the user's own servers", () => {
+  const recall = { node: "/usr/bin/node", entry: "/pkg/dist/recall.js", sessionId: MINE };
+  const fresh = withRecallMcp(["-p", "hi"], recall);
+  assert.equal(fresh.warning, null);
+  assert.equal(fresh.args[0], "--mcp-config");
+  const config = JSON.parse(fresh.args[1] as string);
+  assert.deepEqual(config.mcpServers.onepass, {
+    command: "/usr/bin/node",
+    args: ["/pkg/dist/recall.js"],
+    env: { ONEPASS_SESSION_ID: MINE },
+  });
+  assert.deepEqual(fresh.args.slice(2), ["-p", "hi"]);
+
+  // The user's own --mcp-config is extended, not replaced: ours becomes one more of its values.
+  const alongside = withRecallMcp(["--mcp-config", "mine.json", "-p", "hi"], recall);
+  assert.equal(alongside.args[0], "--mcp-config");
+  assert.equal(alongside.args[2], "mine.json");
+  assert.deepEqual(alongside.args.slice(3), ["-p", "hi"]);
+
+  // The `=` spelling takes one value only, so recall is declined out loud rather than silently
+  // replacing what the user asked for.
+  const equals = withRecallMcp(["--mcp-config=mine.json"], recall);
+  assert.deepEqual(equals.args, ["--mcp-config=mine.json"]);
+  assert.match(equals.warning ?? "", /leaves out onepass recall/);
+
+  // A resumed session nobody named carries no id, and recall falls back to the newest transcript.
+  const resumed = withRecallMcp(["-c"], { ...recall, sessionId: null });
+  assert.equal(JSON.parse(resumed.args[1] as string).mcpServers.onepass.env, undefined);
 });
 
 test("the summary says what it knows and no more", () => {
@@ -245,9 +263,14 @@ test("a session runs through a proxy of its own, which does not outlive it", asy
   assert.match(result.record.baseUrl ?? "", /^http:\/\/127\.0\.0\.1:\d+$/);
   assert.equal(result.record.firstParty, "1");
   assert.equal(result.record.gzip, null);
-  assert.equal(result.record.argv[0], "--session-id");
-  assert.match(result.record.argv[1] as string, UUID);
-  assert.deepEqual(result.record.argv.slice(2), ["-p", "hi"]);
+  assert.equal(result.record.argv[0], "--mcp-config");
+  const mcp = JSON.parse(result.record.argv[1] as string);
+  assert.match(mcp.mcpServers.onepass.args[0] as string, /recall\.js$/);
+  assert.equal(result.record.argv[2], "--session-id");
+  assert.match(result.record.argv[3] as string, UUID);
+  // Recall is told which session it is serving, and it is this one.
+  assert.equal(mcp.mcpServers.onepass.env.ONEPASS_SESSION_ID, result.record.argv[3]);
+  assert.deepEqual(result.record.argv.slice(4), ["-p", "hi"]);
   // And the proxy really forwarded it.
   assert.deepEqual(upstreamRequests, ["/v1/messages"]);
 

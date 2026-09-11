@@ -3,9 +3,6 @@
 //
 // Separated from `claudep.ts` so every decision here is testable without spawning anything.
 
-import { existsSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { formatThousands } from "./evict.js";
 
 /**
@@ -142,29 +139,48 @@ export function parseBanner(text: string): Banner | null {
   return { port: Number(port[1]), logFilePath: (log[1] as string).trim() };
 }
 
-/** Where Claude Code keeps its sessions. `CLAUDE_CONFIG_DIR` moves the whole directory. */
-export function claudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.CLAUDE_CONFIG_DIR;
-  return configured !== undefined && configured !== "" ? configured : join(homedir(), ".claude");
+export interface RecallServer {
+  /** The `node` that runs it — the same one running `claudep`, not whatever is on PATH. */
+  node: string;
+  /** Path to the built `recall.js`. */
+  entry: string;
+  /** Null on a resumed session whose id the user did not name; recall then falls back. */
+  sessionId: string | null;
 }
 
 /**
- * This session's transcript, by id. Every project directory is searched rather than the one the
- * cwd slugifies to: the slug rule is Claude Code's and can change, while a session id is unique.
+ * Adds the recall MCP server to Claude Code's arguments, carrying this session's id so it reads
+ * this session's transcript and no other. Recall is half of Onepass: eviction is only safe
+ * because what it removes can be fetched back verbatim.
+ *
+ * A `--mcp-config` the user passed is extended rather than replaced — our entry is spliced in
+ * as one more value of their own flag. The `--mcp-config=x` spelling takes a single value and
+ * cannot be extended that way, and a second flag would replace theirs, so that one is declined
+ * out loud instead.
  */
-export function findTranscript(sessionId: string, env: NodeJS.ProcessEnv = process.env): string | null {
-  const projects = join(claudeConfigDir(env), "projects");
-  let directories: string[];
-  try {
-    directories = readdirSync(projects);
-  } catch {
-    return null;
+export function withRecallMcp(args: string[], recall: RecallServer): { args: string[]; warning: string | null } {
+  const config = JSON.stringify({
+    mcpServers: {
+      onepass: {
+        command: recall.node,
+        args: [recall.entry],
+        ...(recall.sessionId === null ? {} : { env: { ONEPASS_SESSION_ID: recall.sessionId } }),
+      },
+    },
+  });
+  const flagIndex = args.indexOf("--mcp-config");
+  if (flagIndex !== -1) {
+    return { args: [...args.slice(0, flagIndex + 1), config, ...args.slice(flagIndex + 1)], warning: null };
   }
-  for (const directory of directories) {
-    const path = join(projects, directory, `${sessionId}.jsonl`);
-    if (existsSync(path)) return path;
+  if (args.some((arg) => arg.startsWith("--mcp-config="))) {
+    return {
+      args: [...args],
+      warning:
+        "claudep: --mcp-config=… keeps your servers but leaves out onepass recall, so evicted context " +
+        "cannot be fetched back. Use the spaced form (--mcp-config file.json) to get both.",
+    };
   }
-  return null;
+  return { args: ["--mcp-config", config, ...args], warning: null };
 }
 
 export interface SessionSummary {

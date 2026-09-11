@@ -165,11 +165,11 @@ test("the marker naming an attachment's path survives even a judge pick", () => 
 // content back, and it quotes the format. Nothing else ties the two files together, so a
 // reworded stub would leave that legend describing a string the proxy no longer sends.
 test("the recall tool's description quotes the prefix the stubs actually carry", () => {
-  const recallServer = readFileSync(new URL("../../spike/src/server.ts", import.meta.url), "utf8");
+  const recallServer = readFileSync(new URL("../src/recall.ts", import.meta.url), "utf8");
 
   assert.ok(
     recallServer.includes(`\`${STUB_PREFIX} N chars]\``),
-    `spike/src/server.ts no longer quotes "${STUB_PREFIX} N chars]"`,
+    `proxy/src/recall.ts no longer quotes "${STUB_PREFIX} N chars]"`,
   );
 });
 
