@@ -136,7 +136,7 @@ test("what the stub saves decides, not what the block holds", () => {
 // named its target cost more than the block held.
 test("a small Bash result — the size the old floor refused — stubs to 28 chars", () => {
   const gitStatus =
-    " M proxy/src/evict.ts\n M proxy/src/evict.test.ts\n M proxy/src/judge.ts\n M proxy/src/main.ts\n" +
+    " M proxy/src/evict.ts\n M proxy/src/evict.test.ts\n M proxy/src/speed.ts\n M proxy/src/main.ts\n" +
     " M proxy/src/server.ts\n M proxy/README.md\n M CLAUDE.md\n?? docs/agents/\n";
   const body = requestBody([
     assistantToolUse("toolu_status", "Bash", { command: "git status --short" }),
@@ -149,27 +149,34 @@ test("a small Bash result — the size the old floor refused — stubs to 28 cha
 });
 
 // The attached-file stub names no path, so this marker beside the attachment is the only thing
-// left pointing at the file. Neither its size nor a judge naming it may take it away.
-test("the marker naming an attachment's path survives even a judge pick", () => {
+// left pointing at the file. However big it grows, it is never a candidate. The tool result
+// beside it is the control: it is evicted in the same pass, so a green here cannot be eviction
+// having done nothing at all.
+test("the marker naming an attachment's path is never evicted, whatever its size", () => {
   const marker = `<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/x.ts"}${"\n".repeat(9000)}`;
-  const body = requestBody([{ role: "user", content: [{ type: "text", text: marker }] }, ...filler(9)]);
-  const judged = new Map([[textSegmentId(marker), { keep: "", note: "a read marker" }]]);
+  const body = requestBody([
+    { role: "user", content: [{ type: "text", text: marker }] },
+    assistantToolUse("toolu_1", "Read", { file_path: "/x.ts" }),
+    userToolResult("toolu_1", "x".repeat(5000)),
+    ...filler(9),
+  ]);
 
-  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP, judged);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
 
-  assert.equal(outcome.bodyChanged, false);
-  assert.deepEqual(outcome.newlyEvictedIds, []);
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+  assert.equal(blockAt(outcome.body, 2).content, "[onepass: evicted 5,000 chars]");
+  assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, marker);
 });
 
 // The recall tool's description is where the agent is told what a stub is and how to get the
 // content back, and it quotes the format. Nothing else ties the two files together, so a
 // reworded stub would leave that legend describing a string the proxy no longer sends.
 test("the recall tool's description quotes the prefix the stubs actually carry", () => {
-  const recallServer = readFileSync(new URL("../../spike/src/server.ts", import.meta.url), "utf8");
+  const recallServer = readFileSync(new URL("../src/recall.ts", import.meta.url), "utf8");
 
   assert.ok(
     recallServer.includes(`\`${STUB_PREFIX} N chars]\``),
-    `spike/src/server.ts no longer quotes "${STUB_PREFIX} N chars]"`,
+    `proxy/src/recall.ts no longer quotes "${STUB_PREFIX} N chars]"`,
   );
 });
 
@@ -657,76 +664,25 @@ test("a call and its result are both charged to charsRemoved, each by its own si
   assert.equal(measureContentChars(blockAt(outcome.body, 1).content), 60);
 });
 
-// A judge-selected user block: 3,000 chars, an instruction followed by a paste.
+// The user's own words are the one thing in the request that exists nowhere else to be
+// recovered from \u2014 no file to re-read, no command to re-run. So the whitelist leaves them
+// out, and this is the test that keeps them out: old, large, over T, and already named in the
+// evicted set, which is every condition eviction has. The tool result beside it is the
+// control \u2014 it is stubbed in the same pass, so a green here cannot be eviction having done
+// nothing at all.
 const PASTED_USER_TEXT = "Use tabs, not spaces. Here is the log:\n" + "L".repeat(2961);
-const PASTED_USER_TEXT_ID = textSegmentId(PASTED_USER_TEXT);
 
-const pointerWith = (summary: string): string =>
-  `[onepass: evicted 3,000 chars of user text.${summary} ` +
-  `recall_search("Use tabs, not spaces. Here is the log:") for the original]`;
-
-const NOTE = "build log from the failing auth test";
-const SUMMARY = ` onepass's summary: ${NOTE}.`;
-
-for (const { name, decision, expected } of [
-  {
-    name: "the quote above a pointer when only a quote was kept",
-    decision: { keep: "Use tabs, not spaces.", note: "" },
-    expected: `Use tabs, not spaces.\n${pointerWith("")}`,
-  },
-  {
-    name: "an attributed summary alone when the block was a pure paste",
-    decision: { keep: "", note: NOTE },
-    expected: pointerWith(SUMMARY),
-  },
-  {
-    name: "the quote above an attributed summary when the judge gave both",
-    decision: { keep: "Use tabs, not spaces.", note: NOTE },
-    expected: `Use tabs, not spaces.\n${pointerWith(SUMMARY)}`,
-  },
-]) {
-  test(`stubs a judge-selected user block as ${name}, with no trip`, () => {
-    const body = requestBody([
-      { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
-      ...filler(3),
-    ]);
-
-    const outcome = evictContextSegments(
-      body,
-      new Set([PASTED_USER_TEXT_ID]),
-      NEVER_TRIP,
-      new Map([[PASTED_USER_TEXT_ID, decision]]),
-    );
-
-    assert.equal(outcome.overThreshold, false, "a verdict applies on the next request whether or not it trips");
-    assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, expected);
-  });
-}
-
-// The note is the judge's own words, unverifiable by construction. A cap is the only thing
-// standing between a malfunctioning judge and paragraphs of invented text in the context.
-test("truncates a judge note that runs past the cap", () => {
+test("never touches the user's own text, whatever its age, size or evicted-set membership", () => {
   const body = requestBody([
     { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
-    ...filler(3),
+    assistantToolUse("toolu_1", "Read", { file_path: "/tmp/big.ts" }),
+    userToolResult("toolu_1", "x".repeat(5000)),
+    ...filler(9),
   ]);
 
-  const outcome = evictContextSegments(
-    body,
-    new Set([PASTED_USER_TEXT_ID]),
-    NEVER_TRIP,
-    new Map([[PASTED_USER_TEXT_ID, { keep: "", note: "N".repeat(500) }]]),
-  );
+  const outcome = evictContextSegments(body, new Set([textSegmentId(PASTED_USER_TEXT)]), ALWAYS_TRIP);
 
-  const stub = String((blockAt(outcome.body, 0) as { text?: unknown }).text);
-  assert.ok(stub.includes(`onepass's summary: ${"N".repeat(200)}\u2026.`), stub.slice(0, 120));
-});
-
-test("leaves a user block alone when the judge never selected it", () => {
-  const body = requestBody([
-    { role: "user", content: [{ type: "text", text: PASTED_USER_TEXT }] },
-    ...filler(3),
-  ]);
-  const outcome = evictContextSegments(body, new Set([PASTED_USER_TEXT_ID]), ALWAYS_TRIP);
-  assert.equal(outcome.bodyChanged, false, "only judge-selected user text is evictable");
+  assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
+  assert.equal(blockAt(outcome.body, 2).content, "[onepass: evicted 5,000 chars]");
+  assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, PASTED_USER_TEXT);
 });

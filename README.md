@@ -1,6 +1,15 @@
 # Onepass
 
-Context management for coding agents. **Work in progress — nothing here is finished.**
+Context management for coding agents. Run a long Claude Code session to the end without it
+compacting:
+
+```bash
+npm install -g onepass-proxy
+claudep
+```
+
+`claudep` is `claude` with the context problem taken care of. Everything runs on your own
+machine. See [proxy/README.md](proxy/README.md).
 
 ## The problem
 
@@ -22,13 +31,13 @@ and let the agent fetch the original back word-for-word if it turns out to matte
 
 ## The two pieces
 
-**Recall** (`spike/`) — an MCP server that searches and fetches from the session transcript, so
-anything removed from context can be retrieved verbatim. Working.
+**Recall** (`proxy/src/recall.ts`) — an MCP server that searches and fetches from the session
+transcript, so anything removed from context can be retrieved verbatim. Ships with the proxy,
+and `claudep` registers it for the session it starts.
 
 **The eviction proxy** (`proxy/`) — a local HTTP proxy between Claude Code and the API. Before
 each request goes upstream it replaces old tool results, tool inputs, and injected file content
 with short stubs, so the context the model sees stops growing and compaction never triggers.
-This is what we're building now.
 
 Order matters: recall first, then eviction. Eviction without a way to get content back has to be
 timid, which is why it doesn't help.
@@ -39,5 +48,8 @@ is how we'll know if it works.
 
 ## Status
 
-Not done. The proxy runs and evicts; whether it holds up on real work is the open question the
-eval exists to answer. Nothing is published — everything runs locally from a clone.
+Published as `onepass-proxy` on npm, and measured: ~1.49M tokens of raw conversation in one
+session, 289 turns, zero compactions. What is still open is whether eviction costs the agent
+anything on real work — that is the question the eval exists to answer, and the recall half has
+had one deliberate probe rather than a workload behind it. Read `proxy/README.md` before
+trusting it with a long session.
