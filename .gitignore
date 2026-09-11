@@ -10,3 +10,4 @@ eval/smoke/dist/
 .claude/worktrees/
 __pycache__/
 *.pyc
+eval/results/

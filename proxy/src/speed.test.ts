@@ -33,6 +33,14 @@ const usageCases: { scenario: string; responseText: string; expected: ResponseUs
     responseText: '{"usage":{}}',
     expected: null,
   },
+  {
+    // The proxy caps its scan of the response, and a stream can be cut mid-object. Half a usage
+    // object is not a measurement — reading the numbers out of it anyway would move the live
+    // chars-per-token ratio on a body whose real size was never seen.
+    scenario: "returns null where the usage object is never closed",
+    responseText: '{"id":"msg_3","usage":{"input_tokens":5,"cache_read_input_tokens":900',
+    expected: null,
+  },
 ];
 
 for (const { scenario, responseText, expected } of usageCases) {
