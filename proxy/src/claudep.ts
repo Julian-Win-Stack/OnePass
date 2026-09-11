@@ -25,6 +25,7 @@ import {
   reusesExistingSession,
   sessionIdFromArgs,
   summaryLine,
+  upstreamWarning,
   type Banner,
 } from "./launch.js";
 import { parseProxyLog, scanTranscript } from "./session.js";
@@ -194,12 +195,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (process.env.ANTHROPIC_BASE_URL !== undefined && process.env.ONEPASS_UPSTREAM === undefined) {
-    note(
-      `claudep: ignoring ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL} — the proxy forwards to ` +
-        `api.anthropic.com. Set ONEPASS_UPSTREAM to send it somewhere else.`,
-    );
-  }
+  const warning = upstreamWarning(process.env);
+  if (warning !== null) note(warning);
 
   const proxy = await startProxy();
   // A resumed conversation already has an id, and Claude Code rejects a second one. Its own id

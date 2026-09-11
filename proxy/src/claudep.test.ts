@@ -23,6 +23,7 @@ import {
   reusesExistingSession,
   sessionIdFromArgs,
   summaryLine,
+  upstreamWarning,
 } from "./launch.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -72,6 +73,21 @@ test("the proxy child picks its own port and never chains through another proxy"
   assert.equal(env.ONEPASS_PORT, "0");
   assert.equal(env.ANTHROPIC_BASE_URL, undefined);
   assert.equal(env.ONEPASS_TRIP_TOKENS, "90000");
+});
+
+test("a base URL that would be lost is called out, and one that would not is left alone", () => {
+  assert.match(
+    upstreamWarning({ ANTHROPIC_BASE_URL: "https://gateway.internal" }) ?? "",
+    /ignoring ANTHROPIC_BASE_URL=https:\/\/gateway\.internal/,
+  );
+  // Already forwarded there: saying so would be noise on every launch.
+  assert.equal(upstreamWarning({ ANTHROPIC_BASE_URL: "https://api.anthropic.com/" }), null);
+  // The user has already said where to forward.
+  assert.equal(
+    upstreamWarning({ ANTHROPIC_BASE_URL: "https://gateway.internal", ONEPASS_UPSTREAM: "https://gateway.internal" }),
+    null,
+  );
+  assert.equal(upstreamWarning({}), null);
 });
 
 test("the banner is read for the port and the log, and needs both", () => {

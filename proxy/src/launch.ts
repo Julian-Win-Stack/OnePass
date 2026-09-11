@@ -109,6 +109,26 @@ export function proxyEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env;
 }
 
+/** Where the proxy forwards unless `ONEPASS_UPSTREAM` says otherwise (see main.ts). */
+const DEFAULT_UPSTREAM = "https://api.anthropic.com";
+
+/**
+ * `claudep` overwrites `ANTHROPIC_BASE_URL`, so a shell that pointed Claude Code at a gateway
+ * would silently lose it. Warn rather than obey: the fix is `ONEPASS_UPSTREAM`, which is what
+ * decides where the proxy forwards. Nothing is lost when the variable names the default
+ * upstream — that is where the proxy was going to send it anyway — so that case stays quiet.
+ */
+export function upstreamWarning(env: NodeJS.ProcessEnv): string | null {
+  const base = env.ANTHROPIC_BASE_URL;
+  if (base === undefined || base === "") return null;
+  if (env.ONEPASS_UPSTREAM !== undefined && env.ONEPASS_UPSTREAM !== "") return null;
+  if (base.replace(/\/+$/, "") === DEFAULT_UPSTREAM) return null;
+  return (
+    `claudep: ignoring ANTHROPIC_BASE_URL=${base} — the proxy forwards to ${DEFAULT_UPSTREAM}. ` +
+    `Set ONEPASS_UPSTREAM to send it somewhere else.`
+  );
+}
+
 export interface Banner {
   port: number;
   logFilePath: string;
