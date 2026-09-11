@@ -946,9 +946,8 @@ answers short. `--setting-sources ""` removes it.
 
 ## 21. The cost was a swarm of tiny trips, and a batch minimum removes it
 
-**Verdict, from replay only — no live run has been made yet.** A trip costs a prompt-cache
-rewrite whatever it removes, so the number that decides the bill is how *often* the proxy trips,
-not how much it evicts. Once a session's un-evictable floor passes T, every request is over the
+**Verdict, from replay only.** A trip costs a prompt-cache rewrite whatever it removes, so the
+number that decides the bill is how *often* the proxy trips, not how much it evicts. Once a session's un-evictable floor passes T, every request is over the
 line, and the build that ran the $200 Harbor pass (§20's era, proxied runs at ~4× control) tripped
 on almost every one of them to remove a few hundred tokens each: **112 trips in 120 requests** on
 one recording and, on another, **34 in 68** at that build's own 110k threshold — 50 in 68 at the
@@ -1062,7 +1061,14 @@ T, N and K must still match, and an implicit comparison still requires everythin
 
 **Caveats.**
 - Replay, not life. No model is in the path, the agent makes no decisions, and nothing here says
-  what the API charged. A live run through the Harbor rig is still outstanding.
+  what the API charged. A live run through the Harbor rig was considered and declined: the replay
+  reproduces the real run's trip count exactly and its peak to within 0.07%, so what a live run
+  would add is the price, not the mechanism. What stays unmeasured is the billed cache-write share
+  and a real `cost_usd` — every figure in dollars here is arithmetic over §20's rates, not an
+  invoice. If it is ever wanted, `make-mips-interpreter` is the task to spend it on rather than
+  `winning-avg-corewars`, which §3.3 of the plan would have picked: it carries the larger real
+  swarm (112 trips against 63), it finishes inside half the wall clock instead of timing out, and
+  its peak bar can actually pass, where corewars' is failed in advance by a floor above T.
 - Three recordings from two Harbor jobs, all one agent on one kind of task. The floor-above-T
   case they demonstrate is the one the mechanism targets; how common it is across real sessions is
   not measured here.
