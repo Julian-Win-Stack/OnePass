@@ -89,7 +89,18 @@ export interface CaseSelection {
 /** What replay did. Absent on a scored run, which does not replay. */
 export interface ReplayReport {
   /** The recording it replayed, and how much of it. */
-  recording: { name: string; dir: string; requests: number; messages: number; countTokens: number };
+  recording: {
+    name: string;
+    dir: string;
+    requests: number;
+    messages: number;
+    countTokens: number;
+    /**
+     * How many requests were answered at the ratio the real API reported for them, rather than at
+     * four characters a token. Absent from documents written before replay could do that.
+     */
+    realCharsPerToken?: number;
+  };
   /**
    * Every recorded request, in order. All of them, not only the reported ones: the sequence is what
    * the diff is over, because a change the report does not print is still a change in the build.

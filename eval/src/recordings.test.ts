@@ -166,3 +166,80 @@ test("two requests inside one millisecond keep the order they arrived in", () =>
   // The count is not part of the timestamp, which is a label a person reads.
   assert.deepEqual(new Set(set.requests.map((request) => request.receivedAt)), new Set(["2026-09-08T23:23:51.000Z"]));
 });
+
+/** A proxy log the way the recording proxy wrote one: a probe, then one entry per request, in order. */
+function proxyLog(entries: readonly { path: "messages" | "count"; sent: number; tokens?: number }[]): string {
+  const lines = [{ kind: "request", method: "HEAD", path: "/api/hello", status: 200 }];
+  for (const entry of entries) {
+    lines.push({
+      kind: "request",
+      method: "POST",
+      path: entry.path === "count" ? "/v1/messages/count_tokens?beta=true" : "/v1/messages?beta=true",
+      status: 200,
+      sentBodyBytes: entry.sent,
+      // Split the way the API splits a cached turn, so the total is what has to be read back.
+      ...(entry.tokens === undefined
+        ? {}
+        : { inputTokens: 2, cacheCreationInputTokens: 8, cacheReadInputTokens: entry.tokens - 10 }),
+    } as never);
+  }
+  const path = join(scratch("onepass-log-"), "proxy.log.jsonl");
+  writeFileSync(path, lines.map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
+  return path;
+}
+
+test("with the recording proxy's log, each request carries the chars per token the real API reported", () => {
+  const dir = dumpDir([
+    { stamp: "2026-09-08T23-23-51-000Z", chars: 10 },
+    { stamp: "2026-09-08T23-23-52-000Z", path: "count", chars: 20 },
+    { stamp: "2026-09-08T23-23-53-000Z", chars: 30 },
+  ]);
+  const log = proxyLog([
+    { path: "messages", sent: 25_000, tokens: 10_000 },
+    // The API's count-tokens answer is not logged, so there is nothing to read for it.
+    { path: "count", sent: 20 },
+    { path: "messages", sent: 16_000, tokens: 5_000 },
+  ]);
+  const corpus = corpusFor();
+
+  const set = importRecordings(corpus, dir, { proxyLog: log });
+
+  assert.deepEqual(
+    set.requests.map((request) => request.realCharsPerToken),
+    [2.5, null, 3.2],
+  );
+  assert.deepEqual(
+    readRecordings(corpus, set.name).requests.map((request) => request.realCharsPerToken),
+    [2.5, null, 3.2],
+    "the ratios are filed with the recording, not read from a log outside the corpus",
+  );
+});
+
+test("without a log, no request claims a ratio", () => {
+  const set = importRecordings(corpusFor(), dumpDir([{ stamp: "2026-09-08T23-23-51-000Z", chars: 10 }]));
+  assert.deepEqual(
+    set.requests.map((request) => request.realCharsPerToken),
+    [null],
+  );
+});
+
+test("a log that does not line up with the bodies is refused, rather than pairing ratios with the wrong requests", () => {
+  const dir = dumpDir([
+    { stamp: "2026-09-08T23-23-51-000Z", chars: 10 },
+    { stamp: "2026-09-08T23-23-52-000Z", chars: 30 },
+  ]);
+  assert.throws(
+    () => importRecordings(corpusFor(), dir, { proxyLog: proxyLog([{ path: "messages", sent: 10, tokens: 1_000 }]) }),
+    (err: unknown) => err instanceof EvalError && /1 request/.test(err.message) && /2 recorded/.test(err.message),
+  );
+  assert.throws(
+    () =>
+      importRecordings(corpusFor(), dir, {
+        proxyLog: proxyLog([
+          { path: "messages", sent: 10, tokens: 1_000 },
+          { path: "count", sent: 30 },
+        ]),
+      }),
+    (err: unknown) => err instanceof EvalError && /req-0002/.test(err.message),
+  );
+});

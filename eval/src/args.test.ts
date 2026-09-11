@@ -16,6 +16,17 @@ function imported(argv: string[]): ImportCommand {
   return command as ImportCommand;
 }
 
+test("import-recordings takes the recording proxy's log, to read the ratios the real API reported", () => {
+  assert.deepEqual(parseArgs(["import-recordings", "/tmp/bodies", "--name", "x", "--proxy-log", "/tmp/proxy.log.jsonl"]), {
+    kind: "import-recordings",
+    dumpDir: "/tmp/bodies",
+    name: "x",
+    proxyLog: "/tmp/proxy.log.jsonl",
+  });
+  assert.equal((parseArgs(["import-recordings", "/tmp/bodies"]) as { proxyLog: unknown }).proxyLog, null);
+  assert.match(USAGE, /--proxy-log/);
+});
+
 test("reads each mode", () => {
   assert.equal(run(["replay"]).mode, "replay");
   assert.equal(run(["quick"]).mode, "quick");

@@ -53,6 +53,12 @@ export interface Recording {
   /** When the proxy received it, read from the name the proxy gave the dump. */
   receivedAt: string;
   bytes: number;
+  /**
+   * Bytes of body per token, as the real API reported it for this request: what the recording
+   * proxy sent over the tokens the answer said it held. Read from that proxy's log at import; null
+   * without one, or where the log holds no usage, which a count-tokens call's entry does not.
+   */
+  realCharsPerToken: number | null;
 }
 
 export interface RecordingSet {
@@ -67,6 +73,8 @@ export interface RecordingSet {
 export interface ImportRecordingsOptions {
   /** What the recording is filed under in the corpus. Defaults to `planning`. */
   name?: string | null;
+  /** The recording proxy's log, one request entry per dumped body, to read the real ratios from. */
+  proxyLog?: string | null;
 }
 
 /**
@@ -96,17 +104,70 @@ export function importRecordings(corpus: Corpus, dumpDir: string, options: Impor
     for (const file of dumpFiles(source)) copyFileSync(join(source, file), join(dir, file));
   }
 
-  const requests = readDumps(dir);
-  if (requests.length === 0) {
+  const dumped = readDumps(dir);
+  if (dumped.length === 0) {
     throw new EvalError(
       `${dir} holds no dumped request bodies. The proxy writes them only when ONEPASS_DUMP_DIR is ` +
         `set, so a session recorded without it leaves nothing behind.`,
     );
   }
+  const proxyLog = options.proxyLog ?? null;
+  const requests = proxyLog === null ? dumped : withRatiosFrom(proxyLog, dumped);
 
   const manifestPath = join(corpus.recordings, `${name}.import.json`);
-  writeFileSync(manifestPath, `${JSON.stringify(manifest(name, dir, source, requests), null, 2)}\n`, "utf8");
+  writeFileSync(
+    manifestPath,
+    `${JSON.stringify(manifest(name, dir, source, proxyLog, requests), null, 2)}\n`,
+    "utf8",
+  );
   return { name, dir, manifestPath, requests };
+}
+
+/**
+ * The dumped requests, each with the ratio the recording proxy's log says the real API reported
+ * for it. The log holds one request entry per request the proxy forwarded, in the order it handled
+ * them, and the dumps are in the order it received them — so they pair one for one, and a log that
+ * does not line up is refused rather than handing a request another request's ratio.
+ */
+function withRatiosFrom(proxyLog: string, requests: readonly Recording[]): Recording[] {
+  let text: string;
+  try {
+    text = readFileSync(proxyLog, "utf8");
+  } catch (err: unknown) {
+    throw new EvalError(`the proxy log ${proxyLog} is unreadable: ${messageOf(err)}`);
+  }
+  const entries = text
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter(
+      (entry) =>
+        entry.kind === "request" &&
+        entry.method === "POST" &&
+        typeof entry.path === "string" &&
+        entry.path.startsWith("/v1/messages"),
+    );
+  if (entries.length !== requests.length) {
+    throw new EvalError(
+      `the proxy log ${proxyLog} holds ${entries.length} request${entries.length === 1 ? "" : "s"} to ` +
+        `/v1/messages and the recording holds ${requests.length} recorded bodies, so they cannot be paired ` +
+        `one for one. Give the log of the proxy that dumped these bodies.`,
+    );
+  }
+  return requests.map((request, index) => {
+    const entry = entries[index] as Record<string, unknown>;
+    const loggedPath = String(entry.path).split("?")[0];
+    if (loggedPath !== request.path) {
+      throw new EvalError(
+        `${request.id} was recorded as ${request.path}, and the proxy log ${proxyLog} has ${loggedPath} ` +
+          `in its place, so the log is not the log of these bodies.`,
+      );
+    }
+    const count = (field: string): number => (typeof entry[field] === "number" ? (entry[field] as number) : 0);
+    const tokens = count("inputTokens") + count("cacheCreationInputTokens") + count("cacheReadInputTokens");
+    const sent = count("sentBodyBytes");
+    return { ...request, realCharsPerToken: tokens > 0 && sent > 0 ? sent / tokens : null };
+  });
 }
 
 /** The recording filed under `name`, read back from the corpus. */
@@ -123,8 +184,17 @@ export function readRecordings(corpus: Corpus, name: string): RecordingSet {
   }
   // The bodies are read from the directory rather than from the manifest's list: the manifest says
   // what was found at import, and the directory is what replay will actually send. If they have
-  // drifted apart, the directory is the truth and the count in the report will say so.
-  return { name, dir, manifestPath, requests: readDumps(dir) };
+  // drifted apart, the directory is the truth and the count in the report will say so. The ratios
+  // are the one thing only the manifest holds, so they are matched back by file name.
+  const ratios = new Map<string, number>();
+  const filed = JSON.parse(readFileSync(manifestPath, "utf8")) as { requests?: Partial<Recording>[] };
+  for (const request of filed.requests ?? []) {
+    if (typeof request.file === "string" && typeof request.realCharsPerToken === "number") {
+      ratios.set(request.file, request.realCharsPerToken);
+    }
+  }
+  const requests = readDumps(dir).map((request) => ({ ...request, realCharsPerToken: ratios.get(request.file) ?? null }));
+  return { name, dir, manifestPath, requests };
 }
 
 /** The bytes of one recorded body, exactly as the proxy received them. */
@@ -177,6 +247,7 @@ function readDumps(dir: string): Recording[] {
     path: pathOf(file),
     receivedAt: receivedAtOf(file),
     bytes: statSync(join(dir, file)).size,
+    realCharsPerToken: null,
   }));
 }
 
@@ -220,7 +291,13 @@ function recordingName(name: string | null): string {
   return chosen;
 }
 
-function manifest(name: string, dir: string, source: string, requests: readonly Recording[]): unknown {
+function manifest(
+  name: string,
+  dir: string,
+  source: string,
+  proxyLog: string | null,
+  requests: readonly Recording[],
+): unknown {
   const conversation = conversationRequests(requests);
   return {
     schema: RECORDINGS_SCHEMA,
@@ -228,6 +305,7 @@ function manifest(name: string, dir: string, source: string, requests: readonly 
     importedAt: new Date().toISOString(),
     source,
     dir,
+    proxyLog,
     counts: {
       requests: requests.length,
       messages: conversation.length,
@@ -260,6 +338,12 @@ export function renderRecordingsImport(set: RecordingSet): string {
   say(`  counted only          ${set.requests.length - conversation.length}  (/v1/messages/count_tokens)`);
   say(`  first                 ${set.requests[0]?.receivedAt ?? "none"}`);
   say(`  last                  ${set.requests[set.requests.length - 1]?.receivedAt ?? "none"}`);
+  const ratios = set.requests.flatMap((request) => (request.realCharsPerToken === null ? [] : [request.realCharsPerToken]));
+  if (ratios.length > 0) {
+    const sorted = [...ratios].sort((left, right) => left - right);
+    const at = (fraction: number): string => (sorted[Math.floor(fraction * (sorted.length - 1))] as number).toFixed(2);
+    say(`  real chars per token  ${ratios.length} of them, from ${at(0)} to ${at(1)}, median ${at(0.5)}`);
+  }
   say();
   say(`How deep they got`);
   say(`  biggest body          ${describeDepth(Math.max(...bytes))}`);

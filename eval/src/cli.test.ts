@@ -369,6 +369,7 @@ test("replay sends every recorded request through one proxy child and reports wh
     requests: RECORDED_REQUESTS,
     messages: RECORDED_REQUESTS,
     countTokens: 0,
+    realCharsPerToken: 0,
   });
 
   // The state carried across the sequence, which is the whole reason there is one child. The tool

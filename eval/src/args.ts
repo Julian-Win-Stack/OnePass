@@ -41,6 +41,8 @@ export interface ImportRecordingsCommand {
   dumpDir: string;
   /** What the recording is filed under in the corpus, or null for `planning`. */
   name: string | null;
+  /** The recording proxy's own log, to read the ratio the real API reported for each request. */
+  proxyLog: string | null;
 }
 
 export interface PromptsCommand {
@@ -97,6 +99,9 @@ Import-recordings
   order the proxy received them. eval/record.sh produces one.
 
   --name <name>          File the recording under this name instead of \`planning\`.
+  --proxy-log <file>     The recording proxy's own log. Files the chars per token the real API
+                         reported for each request, so replay answers at them and the proxy
+                         calibrates the way it did live, rather than at a fixed four.
 
 Prompts
   Writes the prompts of an imported session to a directory, one file per prompt, numbered in the
@@ -172,13 +177,18 @@ function parseImport(argv: readonly string[]): ImportCommand {
 }
 
 function parseImportRecordings(argv: readonly string[]): ImportRecordingsCommand {
-  const { positionals, values } = splitArgs(argv, ["--name"]);
+  const { positionals, values } = splitArgs(argv, ["--name", "--proxy-log"]);
   if (positionals.length === 0) {
     throw new UsageError("import-recordings needs the path of the directory the proxy dumped bodies into");
   }
   if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
 
-  return { kind: "import-recordings", dumpDir: positionals[0] as string, name: values.get("--name") ?? null };
+  return {
+    kind: "import-recordings",
+    dumpDir: positionals[0] as string,
+    name: values.get("--name") ?? null,
+    proxyLog: values.get("--proxy-log") ?? null,
+  };
 }
 
 function parsePrompts(argv: readonly string[]): PromptsCommand {

@@ -53,7 +53,7 @@ function importOne(command: ImportCommand): number {
 
 function importRecordingsCommand(command: ImportRecordingsCommand): number {
   const corpus = resolveCorpus(process.env, repositoryRoot());
-  console.log(renderRecordingsImport(importRecordings(corpus, command.dumpDir, { name: command.name })));
+  console.log(renderRecordingsImport(importRecordings(corpus, command.dumpDir, { name: command.name, proxyLog: command.proxyLog })));
   return 0;
 }
 

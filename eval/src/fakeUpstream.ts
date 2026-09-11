@@ -76,6 +76,12 @@ export interface FakeUpstream {
   port: number;
   /** Every request that reached it, in order, bodies included. */
   requests: RecordedRequest[];
+  /**
+   * Reports usage from now on at this many bytes of body per token, or at four characters per
+   * token again when null. The proxy calibrates its estimator on the usage an answer reports, so
+   * this is how replay makes it learn the ratio the real API taught it when the session was recorded.
+   */
+  answerAt(charsPerToken: number | null): void;
   close(): Promise<void>;
 }
 
@@ -88,6 +94,11 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
   // interleave, and a tool result is matched to its call by id alone.
   let toolUses = 0;
   const nextToolUseId = (): string => `toolu_fake_${(toolUses += 1)}`;
+  let charsPerToken: number | null = null;
+  // Bytes rather than characters when a ratio is set, because the ratio is the one the proxy
+  // computed — its body's byte length over the tokens the API reported.
+  const tokensOf = (body: string): number =>
+    charsPerToken === null ? countTokens(body) : Math.ceil(Buffer.byteLength(body) / charsPerToken);
 
   const server = http.createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -99,11 +110,11 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
       const path = url.split("?")[0];
 
       if (path === "/v1/messages/count_tokens") {
-        json(response, 200, { input_tokens: countTokens(body) });
+        json(response, 200, { input_tokens: tokensOf(body) });
         return;
       }
       if (path === "/v1/messages") {
-        const tokens = countTokens(body);
+        const tokens = tokensOf(body);
         if (body.includes('"stream":true')) {
           streamedMessage(response, ANSWER, tokens);
           return;
@@ -132,6 +143,9 @@ export async function startFakeUpstream(options: FakeUpstreamOptions = {}): Prom
     url: `http://127.0.0.1:${port}`,
     port,
     requests,
+    answerAt: (ratio) => {
+      charsPerToken = ratio;
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

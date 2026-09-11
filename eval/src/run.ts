@@ -37,6 +37,7 @@ import {
   REPORTED_REQUESTS,
   readRecordings,
   PLANNING_RECORDING,
+  type Recording,
   type RecordingSet,
 } from "./recordings.js";
 import { diffReplays, replayRecordings, totalsOf, type ReplayOutcome } from "./replay.js";
@@ -244,6 +245,8 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
           context.resultsDir,
           (earlier) =>
             earlier.replay?.recording.name === context.recordings.name &&
+            // Answered at other ratios, the child calibrated differently and every decision moved.
+            (earlier.replay.recording.realCharsPerToken ?? 0) === withRealRatio(context.recordings.requests) &&
             sameSettings(earlier.proxy.settings, context.settings),
         )
       : readRunResult(context.resultsDir, context.compareWith);
@@ -255,6 +258,7 @@ async function runReplay(context: ReplayContext): Promise<ReplayReport> {
       requests: requests.length,
       messages: conversationRequests(requests).length,
       countTokens: requests.length - conversationRequests(requests).length,
+      realCharsPerToken: withRealRatio(requests),
     },
     outcomes,
     reported: reported.map((request) => request.id),
@@ -415,13 +419,25 @@ function notesFor(mode: RunCommand["mode"], list: CaseList, replay: ReplayReport
         `a session driven by that session's prompts and recorded through the proxy — the proxy's own view of a ` +
         `real deep session, which is the only thing that carries what Claude Code injects.`,
     );
+    const answered = replay.recording.realCharsPerToken ?? 0;
     notes.push(
-      "Replay's fake upstream reports usage at four characters per token, so the proxy calibrates to that " +
-        "rather than to the ~3.2 a real session teaches it. Every build sees the same fake, so a comparison " +
-        "between builds is unaffected; the estimated sizes in the table are not the sizes the API would report.",
+      answered > 0
+        ? `Replay's fake upstream answered ${answered} of the ${replay.recording.requests} requests at the chars ` +
+            `per token the real API reported for them, read from the recording proxy's log, and left the last ` +
+            `ratio standing for the rest. The proxy calibrates on that usage, so it estimated each request the way ` +
+            `the recording proxy did.`
+        : "Replay's fake upstream reports usage at four characters per token, so the proxy calibrates to that " +
+            "rather than to the ~3.2 a real session teaches it. Every build sees the same fake, so a comparison " +
+            "between builds is unaffected; the estimated sizes in the table are not the sizes the API would " +
+            "report. Import the recording with --proxy-log to answer at the real ratios.",
     );
   }
   return notes;
+}
+
+/** How many of a recording's requests carry the ratio the real API reported for them. */
+function withRealRatio(requests: readonly Recording[]): number {
+  return requests.filter((request) => request.realCharsPerToken !== null).length;
 }
 
 /** The two worlds the arms run in, and whether either holds control answers yet. */

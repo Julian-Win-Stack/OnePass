@@ -51,9 +51,19 @@ function deepBody(resultChars: number, turnsAfter = 10, typedChars = 0): string 
   return JSON.stringify({ model: "claude-opus-5", max_tokens: 1_024, messages });
 }
 
-/** A recording of the given bodies, filed into a corpus of its own, in the order they are listed. */
+/**
+ * A recording of the given bodies, filed into a corpus of its own, in the order they are listed.
+ * A body given `realCharsPerToken` is filed with a proxy log saying the real API reported that
+ * ratio for it.
+ */
 function recordingOf(
-  bodies: readonly { chars: number; count?: boolean; turnsAfter?: number; typedChars?: number }[],
+  bodies: readonly {
+    chars: number;
+    count?: boolean;
+    turnsAfter?: number;
+    typedChars?: number;
+    realCharsPerToken?: number;
+  }[],
 ): RecordingSet {
   const dumpDir = scratch("onepass-dump-");
   for (const [index, body] of bodies.entries()) {
@@ -67,7 +77,18 @@ function recordingOf(
     );
   }
   const corpus = resolveCorpus({ ONEPASS_EVAL_CORPUS: scratch("onepass-corpus-") }, scratch("onepass-repo-"));
-  return importRecordings(corpus, dumpDir);
+  if (!bodies.some((body) => body.realCharsPerToken !== undefined)) return importRecordings(corpus, dumpDir);
+
+  const proxyLog = join(scratch("onepass-log-"), "proxy.log.jsonl");
+  const entries = bodies.map((body) => ({
+    kind: "request",
+    method: "POST",
+    path: body.count === true ? "/v1/messages/count_tokens" : "/v1/messages",
+    sentBodyBytes: 100_000,
+    ...(body.realCharsPerToken === undefined ? {} : { inputTokens: 100_000 / body.realCharsPerToken }),
+  }));
+  writeFileSync(proxyLog, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+  return importRecordings(corpus, dumpDir, { proxyLog });
 }
 
 /** Everything replay is given except the recording, which each test names. */
@@ -157,6 +178,35 @@ test("a batch under the minimum is held back, and a request over T + 40k says it
   assert.equal(outcome.aboveAlarmLine, true);
 });
 
+test("a recording that carries the real API's ratios is answered at them, so the child calibrates as it did live", async () => {
+  // The child reads each answer's usage against the body it sent and uses that ratio for the next
+  // request. A fake at a fixed four characters a token teaches it four, which is not what the
+  // recorded session's proxy was taught, and every threshold decision after that drifts.
+  const outcomes = await replayRecordings(
+    options(
+      // Big enough that every answer, even at five characters a token, clears the child's
+      // 1,000-token floor for calibrating; small enough to stay under T.
+      recordingOf([
+        { chars: 8_000, realCharsPerToken: 2.5 },
+        { chars: 8_000, count: true },
+        { chars: 8_000, realCharsPerToken: 5 },
+        { chars: 8_000 },
+      ]),
+      [],
+    ),
+  );
+
+  assert.deepEqual(
+    outcomes.map((one) => one.charsPerToken),
+    // 3.2 before any answer; 2.5 taught by the first; the count-tokens request carries no ratio of its
+    // own, so the fake stays at the last one and teaches it again; then 5.
+    [3.2, 2.5, 2.5, 5],
+  );
+
+  const plain = await replayRecordings(options(recordingOf([{ chars: 8_000 }, { chars: 8_000 }]), []));
+  assert.equal(plain[1]?.charsPerToken, 4, "a recording without ratios is answered at four, whatever ran before it");
+});
+
 test("a request under the threshold goes through untouched", async () => {
   const [outcome] = (await replayRecordings(options(recordingOf([{ chars: 4_000 }]), []))) as [ReplayOutcome];
 
@@ -212,6 +262,7 @@ function outcome(overrides: Partial<ReplayOutcome> & { id: string }): ReplayOutc
     newlyEvictedTokens: 1_000,
     heldBackTokens: null,
     aboveAlarmLine: false,
+    charsPerToken: 3.2,
     bodyPath: "/tmp/body.json",
     ...overrides,
   };

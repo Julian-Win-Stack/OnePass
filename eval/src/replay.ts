@@ -82,6 +82,11 @@ export interface ReplayOutcome {
   heldBackTokens: number | null;
   /** Sent more than 40k tokens over T: the floor has outgrown what eviction can hold. */
   aboveAlarmLine: boolean;
+  /**
+   * The characters per token the child estimated this request at: what the answer before it
+   * taught it. Null when the child logged none.
+   */
+  charsPerToken: number | null;
   /** The forwarded body under the run's corpus directory, for reported requests; null otherwise. */
   bodyPath: string | null;
 }
@@ -114,14 +119,24 @@ export async function replayRecordings(options: ReplayOptions): Promise<ReplayOu
   const requests = options.recordings.requests;
 
   const childOptions = { upstreamUrl: options.upstream.url, ...(options.childEnv ? { env: options.childEnv } : {}) };
-  return withProxyChild(options.build, childOptions, async (child) => {
-    const outcomes: ReplayOutcome[] = [];
-    for (const [index, recording] of requests.entries()) {
-      options.onRequest?.(recording, index + 1, requests.length);
-      outcomes.push(await replayOne(recording, index, child.baseUrl, child.logFilePath, options, bodiesDir));
-    }
-    return outcomes;
-  });
+  // A recording that carries the real API's ratios is answered at them, request by request, so the
+  // child calibrates the way the recording proxy did. One without them is answered at four, and so is
+  // whatever the same fake serves next.
+  options.upstream.answerAt(null);
+  try {
+    return await withProxyChild(options.build, childOptions, async (child) => {
+      const outcomes: ReplayOutcome[] = [];
+      for (const [index, recording] of requests.entries()) {
+        options.onRequest?.(recording, index + 1, requests.length);
+        // A request the log has no usage for — a count-tokens call — leaves the last ratio standing.
+        if (recording.realCharsPerToken !== null) options.upstream.answerAt(recording.realCharsPerToken);
+        outcomes.push(await replayOne(recording, index, child.baseUrl, child.logFilePath, options, bodiesDir));
+      }
+      return outcomes;
+    });
+  } finally {
+    options.upstream.answerAt(null);
+  }
 }
 
 async function replayOne(
@@ -174,6 +189,7 @@ async function replayOne(
     newlyEvictedTokens: logged.newlyEvictedTokens,
     heldBackTokens: logged.heldBackTokens,
     aboveAlarmLine: logged.aboveAlarmLine,
+    charsPerToken: logged.charsPerToken,
     bodyPath,
   };
 }
@@ -186,6 +202,7 @@ interface LoggedRequest {
   newlyEvictedTokens: number | null;
   heldBackTokens: number | null;
   aboveAlarmLine: boolean;
+  charsPerToken: number | null;
 }
 
 /**
@@ -213,6 +230,7 @@ async function waitForRequestEntry(logFilePath: string, index: number, id: strin
           evictedChars === null || charsPerToken === null ? null : Math.round(evictedChars / charsPerToken),
         heldBackTokens: numberOrNull(entry.heldBackTokens),
         aboveAlarmLine: entry.aboveAlarmLine === true,
+        charsPerToken,
       };
     }
     if (Date.now() >= deadline) {
