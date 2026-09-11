@@ -121,10 +121,9 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
   const problems: Problem[] = [];
   try {
     // One child, started and stopped the way every arm will start and stop one. It is what says
-    // the build under test runs at all, that its judge is off, and that a port was free — all
-    // three before a model call is paid for.
+    // the build under test runs at all and that a port was free — both before a model call is
+    // paid for.
     const child = await withProxyChild(build, { upstreamUrl: upstream }, async (started) => ({
-      judge: started.judge,
       logFilePath: started.logFilePath,
       settings: started.settings,
     }));
@@ -175,7 +174,6 @@ export async function runEval(context: RunContext): Promise<RunOutcome> {
         shortSha: build.shortSha,
         dirty: build.dirty,
         version: build.version,
-        judge: child.judge,
         settings: child.settings,
         logs: [child.logFilePath],
       },

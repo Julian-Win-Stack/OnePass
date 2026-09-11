@@ -46,7 +46,7 @@ lists its cases, replays them if asked, and writes a result document with no sco
   `ONEPASS_EVAL_DIR`, which defaulted to `/tmp/onepass-eval`, is a different variable and still
   belongs to `run.sh`.)
 - **The proxy under test.** The command compiles `proxy/` itself and starts a child on a port the
-  operating system picks, with the judge held off, and tears it down after. The globally running
+  operating system picks, and tears it down after. The globally running
   `onepass-proxy` is never used, and a build you forgot to make cannot be what gets measured.
 - **The control baseline.** Control answers are recorded once under a model, effort and Claude
   Code version key, and reused by every later run, so an iteration pays for the proxied arm

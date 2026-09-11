@@ -125,8 +125,7 @@ Environment
   ONEPASS_EVAL_UPSTREAM               Where a scored run's proxy children send what they forward.
                                       Replay serves its own fake upstream instead and never
                                       reaches the network. Defaults to the Anthropic API.
-  ANTHROPIC_API_KEY                   Used by the graders, when they land. Never by replay, and
-                                      never for the proxy's judge, which stays off in every arm.`;
+  ANTHROPIC_API_KEY                   Used by the graders, when they land. Never by replay.`;
 
 /**
  * `argv` is the arguments after the program name. Throws `UsageError` on anything it cannot read,

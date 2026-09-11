@@ -83,7 +83,7 @@ is shown but never decides.
 28. As the proxy's author, I want time reported as request count, cached and rebuilt first-byte latency, rebuild count and total API time, so that the proxy's own overhead is separated from the model's.
 29. As the proxy's author, I want path metrics such as turns, tool calls, recall calls, redundant reads and imitations shown as diagnostics, so that I can see how a build changed behaviour without them deciding the result.
 30. As the proxy's author, I want the eval to launch the proxy build under test itself, so that I never forget to restart it after a build.
-31. As the proxy's author, I want the proxy's judge held off in every arm, so that the eval measures the rules alone.
+31. Dropped: the judge was removed from the proxy, so there is nothing to hold off.
 32. As the proxy's author, I want session content kept outside the repo, so that my transcripts and request dumps are never committed.
 33. As the proxy's author, I want the scripts, price table and result documents committed, with each result carrying the case list it ran, so that a stranger can see exactly what was run and rerun it.
 34. As the proxy's author, I want the bar written down after the first result and before the second run, so that I cannot move it to fit a result.
@@ -102,7 +102,7 @@ is shown but never decides.
 
 - The eval becomes a package beside the proxy with the proxy's conventions: TypeScript, compiled before running, tests under Node's built-in runner. The current shell scripts and analyzer are folded into it.
 - One entry command with three modes, replay, quick and full. Replay makes no model calls: it builds a request body from each case's message list with a placeholder system prompt, since eviction acts on messages and not on the system prompt, runs it through a fresh proxy child against the eval's fake upstream, and writes a diff of trips, segments evicted, stub text, body sizes and rebuild count against the previous build, listing each case and its prefix size as it goes; it is not scored and the bar rule ignores it. Quick is three proxied tails and every second eligible planning case; full is five proxied tails and every eligible case. Quick and full are run once per behavioural change, replay after every fix.
-- The command builds and starts the proxy under test itself, one process per planning case and one per proxied tail, each on an ephemeral port with the judge unset. The globally running proxy is never used. Restarting per case is what makes each replay fresh.
+- The command builds and starts the proxy under test itself, one process per planning case and one per proxied tail, each on an ephemeral port. The globally running proxy is never used. Restarting per case is what makes each replay fresh.
 - All session content lives under one corpus directory outside the repo, set by an environment variable: transcript copies, replay-mode bodies, fork outputs, grader outputs, hand labels and case and tail worktrees. Only the scripts, price table, calibration summary and result documents are written inside the repo.
 - Every run is labelled by the proxy's git short SHA and the time it started, so two runs of the same build never collide. Results are one JSON document per run plus a rendered Markdown table. The report takes the current run and the label of the previous run to compare against.
 - Control is a stored baseline in the corpus directory, keyed by model, effort and Claude Code version. Control planning samples and control tails are recorded on the first run and reused by every later run; the eval re-records them only when the key changes, and the report names the baseline it used.
@@ -129,7 +129,7 @@ is shown but never decides.
 ### Planning arms
 
 - Three samples per case: one proxied per build, two control from the stored baseline. The proxied sample against each control sample gives two pairs; the two control samples give one noise-floor pair. The noise floor and its grader verdicts are computed once with the baseline and reused.
-- Every sample is a Claude Code fork through the Agent SDK at the 1M window, with full tool access inside its throwaway worktree, the same as the tails. The proxied fork's base URL is the proxy child process, with the assume-first-party flag; control forks talk to the API directly. Both run on Claude Code's own login. My API key is used only for count-tokens and the graders; the proxy's judge key is never set.
+- Every sample is a Claude Code fork through the Agent SDK at the 1M window, with full tool access inside its throwaway worktree, the same as the tails. The proxied fork's base URL is the proxy child process, with the assume-first-party flag; control forks talk to the API directly. Both run on Claude Code's own login. My API key is used only for count-tokens and the graders.
 - Usage from every fork is taken from the SDK's result message in the four token classes, together with request count, API time and the proxy's own log of trips, rebuilds and first-byte latency.
 
 ### Implementation corpus and tails
@@ -186,7 +186,6 @@ A good test drives the eval from the outside and reads only what a user of it wo
 - Continuous integration or scheduled runs.
 - A pass threshold before the first result.
 - Fable as grader, or as the model answering in any arm. Fable-recorded history is in the corpus, since the deepest cases come from a stretch it recorded; Opus answers both arms there.
-- Evaluating the proxy's judge; it is off in every arm.
 - Comparing with the findings runs 3–6, which used a different model and effort.
 
 ## Further Notes
