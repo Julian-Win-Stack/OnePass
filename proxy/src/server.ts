@@ -94,9 +94,16 @@ function formatLiveLine(entry: RequestLogEntry): string {
       `est ${formatTokensShort(entry.estimatedTokensBefore)} -> ${formatTokensShort(entry.estimatedTokensSent)} tok, ` +
         `${entry.stubbedResultCount ?? 0} stubbed (${entry.newlyEvictedCount ?? 0} new)`,
     );
-    // Over the line with nothing to take is the state worth reading off a live log: the proxy is
-    // doing its arithmetic and finding nothing it is allowed to evict.
-    if (entry.overThreshold === true && (entry.newlyEvictedCount ?? 0) === 0) parts.push("over T, nothing eligible");
+    // Over the line with nothing taken is the state worth reading off a live log: either the proxy
+    // found nothing it is allowed to evict, or what it found was too small to be worth a trip.
+    if (entry.overThreshold === true && (entry.newlyEvictedCount ?? 0) === 0) {
+      parts.push(
+        entry.heldBackTokens === undefined
+          ? "over T, nothing eligible"
+          : `over T, batch of ${formatTokensShort(entry.heldBackTokens)} held back`,
+      );
+    }
+    if (entry.aboveAlarmLine === true) parts.push("ABOVE ALARM LINE (T + 40k)");
   }
   const rebuildNote =
     entry.rebuild === undefined
@@ -141,6 +148,9 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     overThreshold: boolean;
     stubbedResultCount: number;
     newlyEvictedCount: number;
+    newlyEvictedCharsRemoved: number;
+    heldBackTokens?: number;
+    aboveAlarmLine?: true;
     charsPerToken: number;
   }
 
@@ -405,6 +415,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         protectLastAssistantTurns: config.protectLastAssistantTurns,
         minSavedChars: config.minSavedChars,
         tripThresholdTokens: config.tripThresholdTokens,
+        batchMinTokens: config.batchMinTokens,
         charsPerToken: requestCharsPerToken,
       }, judgeDecisionById);
       for (const id of outcome.newlyEvictedIds) evictedSegmentIds.add(id);
@@ -437,6 +448,9 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         overThreshold: outcome.tripped,
         stubbedResultCount: outcome.stubbedIds.length,
         newlyEvictedCount: outcome.newlyEvictedIds.length,
+        newlyEvictedCharsRemoved: outcome.newlyEvictedCharsRemoved,
+        ...(outcome.heldBackTokens !== undefined ? { heldBackTokens: outcome.heldBackTokens } : {}),
+        ...(outcome.aboveAlarmLine ? { aboveAlarmLine: true as const } : {}),
         charsPerToken: requestCharsPerToken,
       };
     } catch {

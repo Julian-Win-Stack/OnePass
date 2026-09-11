@@ -37,6 +37,15 @@ export interface RequestLogEntry {
   overThreshold?: boolean;
   stubbedResultCount?: number;
   newlyEvictedCount?: number;
+  /** Chars the blocks evicted for the first time on this request took out. */
+  newlyEvictedCharsRemoved?: number;
+  /**
+   * Over T, but what a trip would newly evict came to less than the batch minimum, so it was held
+   * back: this many tokens of it. Absent when nothing was held back.
+   */
+  heldBackTokens?: number;
+  /** Sent more than 40k tokens over T: the floor has outgrown what eviction can hold. Absent below it. */
+  aboveAlarmLine?: true;
   /** Chars-per-token ratio used for this request's token estimates (calibrated from API usage). */
   charsPerToken?: number;
 }

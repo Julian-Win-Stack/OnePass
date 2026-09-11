@@ -34,6 +34,7 @@ const config = {
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
   tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 110_000),
+  batchMinTokens: envInt("ONEPASS_BATCH_MIN_TOKENS", 20_000),
   minSavedChars: envInt("ONEPASS_MIN_SAVED_CHARS", 50),
   logFilePath: newProxyLogPath(),
   ...(judgeApiKey !== undefined && judgeApiKey !== ""
@@ -60,7 +61,7 @@ server.listen(port, () => {
   console.log(
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
       `protect last K=${config.protectLastAssistantTurns}, trip over T=${config.tripThresholdTokens} real tokens (live-calibrated), ` +
-      `min chars saved per stub ${config.minSavedChars}`,
+      `min chars saved per stub ${config.minSavedChars}, batch min ${config.batchMinTokens} tokens`,
   );
   console.log(
     config.judge === undefined

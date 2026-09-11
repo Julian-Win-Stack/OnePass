@@ -16,6 +16,7 @@ const ALWAYS_TRIP: EvictionConfig = {
   minSavedChars: 50,
   tripThresholdTokens: 0,
   charsPerToken: 4,
+  batchMinTokens: 0,
 };
 
 const NEVER_TRIP: EvictionConfig = { ...ALWAYS_TRIP, tripThresholdTokens: 1_000_000_000 };

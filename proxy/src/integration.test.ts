@@ -107,6 +107,7 @@ before(async () => {
     protectLastAssistantTurns: 1,
     minSavedChars: 50,
     tripThresholdTokens: 0,
+    batchMinTokens: 0,
     logFilePath,
     quiet: true,
   });
@@ -442,6 +443,7 @@ test("answers 502 with an API-shaped error when the upstream is unreachable", as
     protectLastAssistantTurns: 1,
     minSavedChars: 50,
     tripThresholdTokens: 0,
+    batchMinTokens: 0,
     logFilePath: join(mkdtempSync(join(tmpdir(), "onepass-proxy-test-")), "proxy.log.jsonl"),
     quiet: true,
   });
@@ -454,6 +456,54 @@ test("answers 502 with an API-shaped error when the upstream is unreachable", as
     assert.equal(parsed.error?.type, "api_error");
   } finally {
     await new Promise<void>((resolve) => deadUpstreamProxy.close(() => resolve()));
+  }
+});
+
+test("a batch held back under the minimum, and a request above the alarm line, both reach the request log line", async () => {
+  const ownLog = join(mkdtempSync(join(tmpdir(), "onepass-proxy-test-")), "proxy.log.jsonl");
+  const batchingProxy = createProxyServer({
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    evictAfterAssistantTurns: 2,
+    protectLastAssistantTurns: 1,
+    minSavedChars: 50,
+    tripThresholdTokens: 0,
+    batchMinTokens: 1_000_000,
+    logFilePath: ownLog,
+    quiet: true,
+  });
+  await new Promise<void>((resolve) => batchingProxy.listen(0, "127.0.0.1", resolve));
+  try {
+    // The aged 5,000-char result is the whole batch: (5,000 − 30) chars at the uncalibrated 3.2
+    // chars per token is 1,553 tokens, far under the minimum. The 200,000 chars of typed text in
+    // front of it are ~62k tokens the rules may never touch, which is over T = 0 plus 40k.
+    const conversation = JSON.parse(agedConversation()) as { messages: unknown[] };
+    const body = JSON.stringify({
+      ...conversation,
+      messages: [{ role: "user", content: "p".repeat(200_000) }, ...conversation.messages],
+    });
+    await sendRequest(`http://127.0.0.1:${listeningPort(batchingProxy)}`, "/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+
+    const deadline = Date.now() + 2000;
+    let entries: ProxyLogEntry[] = [];
+    while (!entries.some((entry) => entry.kind === "request") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      entries = existsSync(ownLog)
+        ? readFileSync(ownLog, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as ProxyLogEntry)
+        : [];
+    }
+    const request = entries.find((entry): entry is RequestLogEntry => entry.kind === "request");
+    assert.ok(request, "the proxy logged no request entry");
+    assert.equal(request.overThreshold, true);
+    assert.equal(request.newlyEvictedCount, 0);
+    assert.equal(request.heldBackTokens, 1_553);
+    assert.equal(request.aboveAlarmLine, true);
+    assert.equal(entries.filter((entry) => entry.kind === "trip").length, 0, "a held-back batch is not a trip");
+  } finally {
+    await new Promise<void>((resolve) => batchingProxy.close(() => resolve()));
   }
 });
 
@@ -559,6 +609,7 @@ async function startJudgeProxy(judge: { apiKey: string; model: string } | undefi
     protectLastAssistantTurns: 1,
     minSavedChars: 50,
     tripThresholdTokens: 0,
+    batchMinTokens: 0,
     logFilePath: logPath,
     quiet: true,
     ...(judge === undefined ? {} : { judge }),
@@ -733,6 +784,7 @@ test("dumped bodies are named so that name order is the order they arrived in", 
     protectLastAssistantTurns: 1,
     minSavedChars: 50,
     tripThresholdTokens: 0,
+    batchMinTokens: 0,
     logFilePath: join(mkdtempSync(join(tmpdir(), "onepass-dump-log-")), "proxy.log.jsonl"),
     quiet: true,
     dumpDir,

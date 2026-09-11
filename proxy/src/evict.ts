@@ -32,6 +32,13 @@ export interface EvictionConfig {
    */
   tripThresholdTokens: number;
   /**
+   * The batch minimum: a trip happens only when what it would newly evict is worth at least this
+   * many tokens; under it, nothing new is taken and the existing stubs stay as they are. A trip
+   * rewrites the cached conversation after the first changed message, ~100k tokens at the cache
+   * write price, so a trip that frees a few hundred tokens costs far more than it saves. 0 is off.
+   */
+  batchMinTokens: number;
+  /**
    * Chars-per-token ratio used to convert body size to tokens. The server calibrates this
    * from the API's reported usage on the previous response; 4 is the uncalibrated fallback.
    * Real code averages ~3.2, so chars ÷ 4 alone under-counts by ~25% — enough to let a
@@ -67,7 +74,25 @@ export interface EvictionOutcome {
   newlyEvictedCharsRemoved: number;
   estimatedTokensBefore: number;
   estimatedTokensSent: number;
+  /**
+   * Tokens a trip would have newly evicted but held back, because they came to less than the
+   * batch minimum. Absent when nothing was held back.
+   */
+  heldBackTokens?: number;
+  /**
+   * The request went out more than {@link ALARM_LINE_MARGIN_TOKENS} over T. Changes nothing about
+   * eviction; it is how a reader learns the floor has outgrown what eviction can hold.
+   */
+  aboveAlarmLine: boolean;
 }
+
+/**
+ * The alarm line sits this far above T. Peaks already run ~30k over T and a held-back batch adds up
+ * to the batch minimum, so a request past it means the floor itself has grown too big. There is
+ * deliberately no line above which the minimum is waived: that would bring the tiny trips back in
+ * exactly the sessions where they cost most.
+ */
+export const ALARM_LINE_MARGIN_TOKENS = 40_000;
 
 export const STUB_PREFIX = "[onepass: evicted";
 
@@ -473,6 +498,8 @@ export function evictContextSegments(
   judgeDecisionById: ReadonlyMap<string, JudgeDecision> = new Map(),
 ): EvictionOutcome {
   const estimatedTokensBefore = estimateTokens(body, config.charsPerToken);
+  const isAboveAlarmLine = (tokensSent: number): boolean =>
+    tokensSent > config.tripThresholdTokens + ALARM_LINE_MARGIN_TOKENS;
   const passthrough: EvictionOutcome = {
     body,
     bodyChanged: false,
@@ -484,6 +511,7 @@ export function evictContextSegments(
     newlyEvictedCharsRemoved: 0,
     estimatedTokensBefore,
     estimatedTokensSent: estimatedTokensBefore,
+    aboveAlarmLine: isAboveAlarmLine(estimatedTokensBefore),
   };
   if (!isRecord(body) || !Array.isArray(body.messages)) return passthrough;
 
@@ -522,7 +550,7 @@ export function evictContextSegments(
   const newTargets = tripped
     ? candidates.filter((segment) => isNewTarget(segment, config.evictAfterAssistantTurns))
     : [];
-  const afterNew = applyStubs(afterExisting.messages, newTargets);
+  let afterNew = applyStubs(afterExisting.messages, newTargets);
 
   // Pressure pass: a burst of fresh large results can leave the request above T with nothing
   // aged past N yet. Rather than let the client cross its compaction threshold, relax the age
@@ -544,9 +572,22 @@ export function evictContextSegments(
     }
   }
 
+  // The batch minimum, applied to the normal and pressure targets together: a trip rewrites the
+  // cached conversation from the first message it changes, so one that frees too little is held
+  // back whole. Nothing held back joins the evicted set, so all of it is a candidate again next
+  // request, when one more turn's worth may carry the batch over the line.
+  const batchChars = afterNew.charsRemoved + afterPressure.charsRemoved;
+  const heldBack: { heldBackTokens?: number } = {};
+  if (batchChars > 0 && batchChars < config.batchMinTokens * config.charsPerToken) {
+    heldBack.heldBackTokens = Math.round(batchChars / config.charsPerToken);
+    pressure = false;
+    afterNew = { messages: afterExisting.messages, charsRemoved: 0, stubbedIds: [] };
+    afterPressure = afterNew;
+  }
+
   const newlyEvictedIds = [...afterNew.stubbedIds, ...afterPressure.stubbedIds];
   const stubbedIds = [...afterExisting.stubbedIds, ...newlyEvictedIds];
-  if (stubbedIds.length === 0) return { ...passthrough, tripped };
+  if (stubbedIds.length === 0) return { ...passthrough, tripped, ...heldBack };
 
   // A pair earns a suffix only when both halves were stubbed on this request: a live result
   // still names its own file, and a live call still carries its own input.
@@ -559,6 +600,7 @@ export function evictContextSegments(
   const namedMessages = nameEvictedCallsInResultStubs(afterPressure.messages, suffixByToolUseId);
 
   const finalBody = { ...body, messages: namedMessages };
+  const estimatedTokensSent = estimateTokens(finalBody, config.charsPerToken);
   return {
     body: finalBody,
     bodyChanged: true,
@@ -569,6 +611,8 @@ export function evictContextSegments(
     charsRemoved: afterExisting.charsRemoved + afterNew.charsRemoved + afterPressure.charsRemoved,
     newlyEvictedCharsRemoved: afterNew.charsRemoved + afterPressure.charsRemoved,
     estimatedTokensBefore,
-    estimatedTokensSent: estimateTokens(finalBody, config.charsPerToken),
+    estimatedTokensSent,
+    ...heldBack,
+    aboveAlarmLine: isAboveAlarmLine(estimatedTokensSent),
   };
 }
