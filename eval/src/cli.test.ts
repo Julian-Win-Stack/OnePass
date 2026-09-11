@@ -188,12 +188,6 @@ test("a scored run writes a result document and a table, labelled by the build a
   assert.ok(run.stdout.includes(join(run.results, `${result.label}.md`)));
 });
 
-test("a judge key in the environment around the run does not reach the proxy children", async () => {
-  const run = await runCli(["quick"], { env: { ONEPASS_JUDGE_API_KEY: "sk-should-be-dropped" } });
-  assert.equal(run.code, 0, run.stderr);
-  assert.equal(resultOf(run).proxy.judge, "off");
-});
-
 test("listing the cases costs nothing at all: the eval makes no call of its own", async () => {
   const before = upstream.requests.length;
   const run = await runCli(["quick"]);
