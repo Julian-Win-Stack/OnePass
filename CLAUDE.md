@@ -25,6 +25,9 @@ Treat it as read-only — never write to or mutate a transcript.
 Measured properties of this data live in [docs/findings.md](docs/findings.md). Read it before
 proposing a context strategy; several obvious approaches are already ruled out there.
 
+What this project learned the hard way lives in [docs/lessons.md](docs/lessons.md) — read it
+before verifying a change, especially one that needs a live run.
+
 ## Agent skills
 
 ### Issue tracker
