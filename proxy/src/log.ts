@@ -44,7 +44,8 @@ export interface RequestLogEntry {
    * back: this many tokens of it. Absent when nothing was held back.
    */
   heldBackTokens?: number;
-  /** Sent more than 40k tokens over T: the floor has outgrown what eviction can hold. Absent below it. */
+  /** Sent past the alarm line, `ALARM_LINE_MARGIN_TOKENS` over T: the floor has outgrown what
+   * eviction can hold. Absent below it. */
   aboveAlarmLine?: true;
   /** Chars-per-token ratio used for this request's token estimates (calibrated from API usage). */
   charsPerToken?: number;

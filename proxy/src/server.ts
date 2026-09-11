@@ -3,6 +3,7 @@ import * as https from "node:https";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  ALARM_LINE_MARGIN_TOKENS,
   evictContextSegments,
   formatThousands,
   isRecord,
@@ -103,7 +104,7 @@ function formatLiveLine(entry: RequestLogEntry): string {
           : `over T, batch of ${formatTokensShort(entry.heldBackTokens)} held back`,
       );
     }
-    if (entry.aboveAlarmLine === true) parts.push("ABOVE ALARM LINE (T + 40k)");
+    if (entry.aboveAlarmLine === true) parts.push(`ABOVE ALARM LINE (T + ${ALARM_LINE_MARGIN_TOKENS / 1_000}k)`);
   }
   const rebuildNote =
     entry.rebuild === undefined
@@ -439,13 +440,13 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         }
       }
       if (outcome.bodyChanged) forwardBody = Buffer.from(JSON.stringify(outcome.body), "utf8");
-      tripped = outcome.tripped;
+      tripped = outcome.overThreshold;
       const sentBody = outcome.body;
       if (isRecord(sentBody) && Array.isArray(sentBody.messages)) lastSentMessages = sentBody.messages;
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
-        overThreshold: outcome.tripped,
+        overThreshold: outcome.overThreshold,
         stubbedResultCount: outcome.stubbedIds.length,
         newlyEvictedCount: outcome.newlyEvictedIds.length,
         newlyEvictedCharsRemoved: outcome.newlyEvictedCharsRemoved,

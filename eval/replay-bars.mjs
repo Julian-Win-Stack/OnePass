@@ -42,19 +42,22 @@ function replay(tripTokens, batchMinTokens, compareWith) {
   const label = /^\[onepass-eval\] (\S+): replay mode/m.exec(run.stdout)?.[1];
   if (label === undefined) throw new Error(`no label in the replay's output:\n${run.stdout.slice(-2000)}`);
   const result = JSON.parse(readFileSync(join(here, "results", `${label}.json`), "utf8"));
-  const outcomes = result.replay.outcomes;
+  // The totals the result document already carries, rather than a second copy of the same
+  // arithmetic over `outcomes`: two copies would have to be kept in step by hand, and this one
+  // silently produced NaN whenever a request logged no size estimate.
+  const totals = result.replay.totals;
   return {
     label,
-    requests: outcomes.length,
-    trips: outcomes.filter((one) => one.newlyEvicted > 0).length,
-    peak: Math.max(...outcomes.map((one) => one.estimatedTokensSent)),
-    evicted: outcomes.reduce((sum, one) => sum + (one.newlyEvictedTokens ?? 0), 0),
-    heldBack: outcomes.filter((one) => one.heldBackTokens != null).length,
-    alarm: outcomes.filter((one) => one.aboveAlarmLine).length,
+    requests: totals.requests,
+    trips: totals.trips,
+    peak: totals.peakEstimatedTokensSent,
+    evicted: totals.newlyEvictedTokens,
+    heldBack: totals.heldBack,
+    alarm: totals.aboveAlarmLine,
   };
 }
 
-const k = (n) => `${Math.round(n / 1000)}k`;
+const k = (n) => (n === null ? "n/a" : `${Math.round(n / 1000)}k`);
 let failed = false;
 const lines = [
   `recording \`${recording}\`, minimum ${minimum.toLocaleString("en-US")} tokens`,
@@ -77,14 +80,32 @@ for (const tripTokens of thresholds) {
     if (!holds) failed = true;
     verdicts.push(`- T=${k(tripTokens)}: ${holds ? "pass" : "FAIL"} — ${text}`);
   };
+  // Reported, and deliberately not counted as a failure. A ratio bar needs a baseline with a
+  // passing value in it: at 4 trips or fewer, 0.2 × trips is under 1, so nothing but evicting
+  // nothing at all could pass, and a run that evicted nothing is not the outcome being asked for.
+  // That is a degenerate denominator, not a regression — see docs/findings.md §21, which records
+  // which recordings hit it. The bar itself is unchanged, and a baseline of 5 or more is judged.
+  const notEvaluable = (text) => verdicts.push(`- T=${k(tripTokens)}: not evaluable — ${text}`);
   if (tripTokens === 30_000) {
     bar(
       Math.abs(off.trips - HARBOR_TRIPS_AT_30K) <= FAITHFUL_WITHIN,
       `min=0 reproduces Harbor's ${HARBOR_TRIPS_AT_30K} trips ±${FAITHFUL_WITHIN}: ${off.trips}`,
     );
   }
-  bar(on.trips <= 0.2 * off.trips, `trips ${on.trips} ≤ 0.2 × ${off.trips} = ${(0.2 * off.trips).toFixed(1)}`);
-  bar(on.peak <= off.peak + 20_000, `peak ${k(on.peak)} ≤ ${k(off.peak)} + 20k`);
+  if (0.2 * off.trips < 1) {
+    notEvaluable(
+      `trips: the baseline trips ${off.trips} time(s), so 0.2 × ${off.trips} = ` +
+        `${(0.2 * off.trips).toFixed(1)} leaves no passing value. The minimum held ${on.heldBack} ` +
+        `request(s) back and left ${on.trips} trip(s)`,
+    );
+  } else {
+    bar(on.trips <= 0.2 * off.trips, `trips ${on.trips} ≤ 0.2 × ${off.trips} = ${(0.2 * off.trips).toFixed(1)}`);
+  }
+  if (on.peak === null || off.peak === null) {
+    notEvaluable("peak: one of the two runs logged no size estimate at all");
+  } else {
+    bar(on.peak <= off.peak + 20_000, `peak ${k(on.peak)} ≤ ${k(off.peak)} + 20k`);
+  }
   bar(
     on.evicted >= off.evicted - 20_000,
     `evicted ${on.evicted.toLocaleString("en-US")} ≥ ${off.evicted.toLocaleString("en-US")} − 20,000`,

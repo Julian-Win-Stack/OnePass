@@ -69,7 +69,7 @@ test("stubs an old large tool result with the exact deterministic stub text", ()
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
 
   assert.equal(outcome.bodyChanged, true);
-  assert.equal(outcome.tripped, true);
+  assert.equal(outcome.overThreshold, true);
   assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
   assert.deepEqual(outcome.stubbedIds, ["toolu_1"]);
 
@@ -232,7 +232,7 @@ test("already-evicted ids stay stubbed between trips; nothing new is added", () 
     ...filler(4),
   ]);
   const outcome = evictContextSegments(body, new Set(["toolu_1"]), NEVER_TRIP);
-  assert.equal(outcome.tripped, false);
+  assert.equal(outcome.overThreshold, false);
   assert.deepEqual(outcome.stubbedIds, ["toolu_1"]);
   assert.deepEqual(outcome.newlyEvictedIds, []);
   assert.equal(outcome.newlyEvictedCharsRemoved, 0);
@@ -259,7 +259,7 @@ test("below the size threshold nothing new is evicted", () => {
     ...filler(4),
   ]);
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, NEVER_TRIP);
-  assert.equal(outcome.tripped, false);
+  assert.equal(outcome.overThreshold, false);
   assert.equal(outcome.bodyChanged, false);
 });
 
@@ -275,7 +275,7 @@ test("the trip threshold is measured after re-applying existing stubs", () => {
   ]);
   const config: EvictionConfig = { ...ALWAYS_TRIP, tripThresholdTokens: 50_000 };
   const outcome = evictContextSegments(body, new Set(["toolu_huge"]), config);
-  assert.equal(outcome.tripped, false);
+  assert.equal(outcome.overThreshold, false);
   assert.deepEqual(outcome.stubbedIds, ["toolu_huge"]);
   assert.equal(blockAt(outcome.body, 3).content, "n".repeat(5000));
 });
@@ -437,7 +437,7 @@ test("an evicted text segment stays stubbed on later requests via its content ha
   assert.ok(evictedId !== undefined);
 
   const second = evictContextSegments(build(), new Set([evictedId]), NEVER_TRIP);
-  assert.equal(second.tripped, false);
+  assert.equal(second.overThreshold, false);
   assert.deepEqual(second.stubbedIds, [evictedId]);
   assert.deepEqual(second.newlyEvictedIds, []);
   assert.equal(
@@ -579,7 +579,7 @@ test("stubbing a big call leaves its small result alone, on this request and the
 
   // The re-stub pass has no size check, so a shared id would stub the tiny result forever.
   const second = evictContextSegments(build(), new Set(["call:toolu_edit"]), NEVER_TRIP);
-  assert.equal(second.tripped, false);
+  assert.equal(second.overThreshold, false);
   assert.deepEqual(second.stubbedIds, ["call:toolu_edit"]);
   assert.deepEqual(second.newlyEvictedIds, []);
   assert.equal(blockAt(second.body, 1).content, confirmation);
@@ -698,7 +698,7 @@ for (const { name, decision, expected } of [
       new Map([[PASTED_USER_TEXT_ID, decision]]),
     );
 
-    assert.equal(outcome.tripped, false, "a verdict applies on the next request whether or not it trips");
+    assert.equal(outcome.overThreshold, false, "a verdict applies on the next request whether or not it trips");
     assert.equal((blockAt(outcome.body, 0) as { text?: unknown }).text, expected);
   });
 }
