@@ -50,8 +50,12 @@ export interface EvictionOutcome {
   /** Transformed body — or the original value, untouched, when nothing applied or parsing failed. */
   body: unknown;
   bodyChanged: boolean;
-  /** The size threshold was exceeded on this request (even if nothing new was eligible). */
-  tripped: boolean;
+  /**
+   * The size threshold was exceeded on this request. Deliberately not called `tripped`: crossing
+   * the line is not a trip on its own, since nothing may have been eligible and a batch under the
+   * minimum is held back. A trip is a request that evicted something, which is `newlyEvictedIds`.
+   */
+  overThreshold: boolean;
   /** Ids evicted for the first time on this request; the caller must add them to its set. */
   newlyEvictedIds: string[];
   /** Every id stubbed in this request, previously evicted ones included. */
@@ -416,6 +420,11 @@ function nameEvictedCallsInResultStubs(
   });
 }
 
+/** A pass that stubbed nothing: the messages exactly as they stand, with an empty tally. */
+function nothingStubbed(messages: StubApplication["messages"]): StubApplication {
+  return { messages, charsRemoved: 0, stubbedIds: [] };
+}
+
 export function evictContextSegments(
   body: unknown,
   alreadyEvictedIds: ReadonlySet<string>,
@@ -427,7 +436,7 @@ export function evictContextSegments(
   const passthrough: EvictionOutcome = {
     body,
     bodyChanged: false,
-    tripped: false,
+    overThreshold: false,
     newlyEvictedIds: [],
     stubbedIds: [],
     pressure: false,
@@ -466,12 +475,12 @@ export function evictContextSegments(
       ? estimateTokens({ ...body, messages: afterExisting.messages }, config.charsPerToken)
       : estimatedTokensBefore;
 
-  const tripped = estimatedTokensAfterExisting > config.tripThresholdTokens;
+  const overThreshold = estimatedTokensAfterExisting > config.tripThresholdTokens;
   const isNewTarget = (segment: Segment, minAge: number): boolean =>
     !alreadyEvictedIds.has(segment.id) &&
     segment.assistantTurnsAfter >= minAge &&
     segment.assistantTurnsAfter >= config.protectLastAssistantTurns;
-  const newTargets = tripped
+  const newTargets = overThreshold
     ? candidates.filter((segment) => isNewTarget(segment, config.evictAfterAssistantTurns))
     : [];
   let afterNew = applyStubs(afterExisting.messages, newTargets);
@@ -480,8 +489,8 @@ export function evictContextSegments(
   // aged past N yet. Rather than let the client cross its compaction threshold, relax the age
   // gate down to K — the last K turns stay untouchable, everything older is fair game.
   let pressure = false;
-  let afterPressure: StubApplication = { messages: afterNew.messages, charsRemoved: 0, stubbedIds: [] };
-  if (tripped) {
+  let afterPressure: StubApplication = nothingStubbed(afterNew.messages);
+  if (overThreshold) {
     const stillOverThreshold =
       estimateTokens({ ...body, messages: afterNew.messages }, config.charsPerToken) > config.tripThresholdTokens;
     if (stillOverThreshold) {
@@ -501,17 +510,19 @@ export function evictContextSegments(
   // back whole. Nothing held back joins the evicted set, so all of it is a candidate again next
   // request, when one more turn's worth may carry the batch over the line.
   const batchChars = afterNew.charsRemoved + afterPressure.charsRemoved;
-  const heldBack: { heldBackTokens?: number } = {};
-  if (batchChars > 0 && batchChars < config.batchMinTokens * config.charsPerToken) {
-    heldBack.heldBackTokens = Math.round(batchChars / config.charsPerToken);
+  const isHeldBack = batchChars > 0 && batchChars < config.batchMinTokens * config.charsPerToken;
+  // Spread, not assigned: the field is absent altogether when nothing was held back, which is how
+  // a reader of the log tells "this request had no batch to weigh" from "its batch was too small".
+  const heldBack = isHeldBack ? { heldBackTokens: Math.round(batchChars / config.charsPerToken) } : {};
+  if (isHeldBack) {
     pressure = false;
-    afterNew = { messages: afterExisting.messages, charsRemoved: 0, stubbedIds: [] };
-    afterPressure = afterNew;
+    afterNew = nothingStubbed(afterExisting.messages);
+    afterPressure = nothingStubbed(afterExisting.messages);
   }
 
   const newlyEvictedIds = [...afterNew.stubbedIds, ...afterPressure.stubbedIds];
   const stubbedIds = [...afterExisting.stubbedIds, ...newlyEvictedIds];
-  if (stubbedIds.length === 0) return { ...passthrough, tripped, ...heldBack };
+  if (stubbedIds.length === 0) return { ...passthrough, overThreshold, ...heldBack };
 
   // A pair earns a suffix only when both halves were stubbed on this request: a live result
   // still names its own file, and a live call still carries its own input.
@@ -528,7 +539,7 @@ export function evictContextSegments(
   return {
     body: finalBody,
     bodyChanged: true,
-    tripped,
+    overThreshold,
     newlyEvictedIds,
     stubbedIds,
     pressure,

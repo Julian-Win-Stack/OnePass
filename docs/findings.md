@@ -946,12 +946,12 @@ answers short. `--setting-sources ""` removes it.
 
 ## 21. The cost was a swarm of tiny trips, and a batch minimum removes it
 
-**Verdict, from replay only — no live run has been made yet.** A trip costs a prompt-cache
-rewrite whatever it removes, so the number that decides the bill is how *often* the proxy trips,
-not how much it evicts. Once a session's un-evictable floor passes T, every request is over the
+**Verdict, from replay only.** A trip costs a prompt-cache rewrite whatever it removes, so the
+number that decides the bill is how *often* the proxy trips, not how much it evicts. Once a session's un-evictable floor passes T, every request is over the
 line, and the build that ran the $200 Harbor pass (§20's era, proxied runs at ~4× control) tripped
 on almost every one of them to remove a few hundred tokens each: **112 trips in 120 requests** on
-one recording, **50 in 68** on another. Requiring a trip to newly evict at least 20,000 tokens —
+one recording and, on another, **34 in 68** at that build's own 110k threshold — 50 in 68 at the
+80k now shipped. Requiring a trip to newly evict at least 20,000 tokens —
 `ONEPASS_BATCH_MIN_TOKENS`, default 20,000, `0` restores the old behaviour — takes those to **5**
 and **1**. The same content still leaves the request; the peak rises by 5.6k–9.2k tokens, which is
 the cost of holding a batch back. On the same evidence the default trip threshold moves **110k →
@@ -997,26 +997,33 @@ recording with the minimum off: trips ≤ 0.2×, peak ≤ +20k, newly evicted �
 
 | recording | T | trips | peak | evicted |
 |---|---|---|---|---|
-| make-mips | 110k | **fail** (2, needs ≤ 0.4) | pass (equal) | pass |
+| make-mips | 110k | **not evaluable** (baseline 2) | pass (equal) | pass |
 | make-mips | 30k | pass (5 ≤ 22.4) | pass (77,542 ≤ 90,044) | pass (118,461 ≥ 103,598) |
 | corewars | 110k | pass (1 ≤ 6.8) | pass (156,419 ≤ 170,811) | pass (20,229 ≥ 7,297) |
 | corewars | 80k | pass (1 ≤ 10.0) | pass (156,419 ≤ 170,811) | pass (20,229 ≥ 7,421) |
 | sam-cell-seg | 110k | **fail** (4, needs ≤ 1.6) | pass (158,046 ≤ 161,882) | pass |
 
-Both failures are the same artefact and neither is a failure of the mechanism: a ratio bar cannot
-be met when the baseline is already small. make-mips at 110k trips **twice** in 120 requests, both
-times evicting ~50k, so 0.2 × 2 = 0.4 is unreachable by anything short of never evicting at all;
-sam-cell-seg trips 8 times and the minimum halves that to 4. The bar bites where it was meant to —
-on the swarms — and there it passes with room to spare. The bars were not moved.
+The two are not the same thing, and the difference matters. make-mips at 110k trips **twice** in
+120 requests, so the bar asks for 0.2 × 2 = 0.4 trips: no run can pass it except one that evicts
+nothing at all, which is not the outcome being asked for. That is a degenerate denominator, and it
+is reported as **not evaluable** rather than scored — the bar is unchanged, and `replay-bars.mjs`
+applies the same rule wherever the baseline trips 4 times or fewer. sam-cell-seg is a genuine
+**failure**: it trips 8 times, 0.2 × 8 = 1.6 is a real target, and the minimum only halves it to 4.
+Its trips are large ones (494k evicted in total), so there is little small-batch traffic for a
+minimum to remove. The bar bites where it was meant to — on the swarms — and there it passes with
+room to spare. The bars themselves were not moved.
 
 **The faithfulness check passed exactly.** At T=30k with the minimum off the replay makes 112
 trips, which is what the real Harbor run made. That check is what licenses every other number
 here; it failed at first, and the fix is below.
 
-**Tuning record.** 15k, 20k and 30k were tried on make-mips at T=30k, the only arm where a bar
-failed at 20k. 15k passes all three bars; 30k fails two — peak 91,635 against a 90,044 limit, and
-101,506 evicted against a 103,598 floor. 20k passes and sits in the middle of the two, so it
-stays. Nothing else was tuned; every value tried is a row in the tables above.
+**Tuning record.** 15k, 20k and 30k were tried on make-mips at T=30k. The bars already pass there
+at 20k; the other two were run to see whether either did better. 15k passes all three; 30k fails
+two — peak 91,635 against a 90,044 limit, and 101,506 evicted against a 103,598 floor. 20k passes
+and sits between them, so it stays. The two arms where 20k does not pass are the ratio cases
+above, which no value of the minimum can fix: one has no passing value and the other has too
+little small-batch traffic to remove. Nothing else was tuned; every value tried is a row in the
+tables above.
 
 **80k, decided by the rule written before the measurement** (with the minimum on: ≤ 10 trips per
 100 requests and peak ≤ 140k). make-mips at T=80k gives 3.3 and 88,993. The default moves to 80k.
@@ -1028,8 +1035,12 @@ nothing else: 39 of corewars' 68 requests at T=80k, against 22 with the minimum 
 the minimum misbehaving — it is the floor being larger than T + 40k, a condition no amount of
 eviction can fix, and the alarm is how it becomes visible instead of being inferred from a bill. A
 hard ceiling was rejected for the same reason: it could only fail requests the proxy is unable to
-shrink. The `T + 40k` sizing advice in `proxy/README.md` becomes `T + 60k` to match what the
-peaks above actually do.
+shrink. The `T + 40k` sizing advice in `proxy/README.md` becomes `T + 60k` to match what the peaks
+above actually do — **and that is still not a promise.** corewars at the shipped 80k peaks at
+156,419, which is T + 76k. Where the floor is already above T, no margin written as `T + x` holds,
+because the peak is the floor's and the floor answers to nothing the proxy controls. The honest
+rule is: size T by `T + 60k` and then read the alarm line in your own log, which is the only thing
+that reports the case where that rule has stopped applying.
 
 **The replay had to be fixed before any of this counted.** The proxy sizes requests in real
 tokens, calibrating chars-per-token from each response's `usage`. The fake upstream answered at a
@@ -1050,7 +1061,14 @@ T, N and K must still match, and an implicit comparison still requires everythin
 
 **Caveats.**
 - Replay, not life. No model is in the path, the agent makes no decisions, and nothing here says
-  what the API charged. A live run through the Harbor rig is still outstanding.
+  what the API charged. A live run through the Harbor rig was considered and declined: the replay
+  reproduces the real run's trip count exactly and its peak to within 0.07%, so what a live run
+  would add is the price, not the mechanism. What stays unmeasured is the billed cache-write share
+  and a real `cost_usd` — every figure in dollars here is arithmetic over §20's rates, not an
+  invoice. If it is ever wanted, `make-mips-interpreter` is the task to spend it on rather than
+  `winning-avg-corewars`, which §3.3 of the plan would have picked: it carries the larger real
+  swarm (112 trips against 63), it finishes inside half the wall clock instead of timing out, and
+  its peak bar can actually pass, where corewars' is failed in advance by a floor above T.
 - Three recordings from two Harbor jobs, all one agent on one kind of task. The floor-above-T
   case they demonstrate is the one the mechanism targets; how common it is across real sessions is
   not measured here.

@@ -129,7 +129,7 @@ test("holding a batch back never sends more than 20k tokens over what the minimu
 test("a batch one token under the minimum is held back and says how big it was; at the minimum it is taken", () => {
   // Request 9 of a fresh session: results 1–5 are at least K turns old, 5 × 493 = 2,465 tokens.
   const under = evictContextSegments(requestAt(9), new Set(), { ...BASE, batchMinTokens: 2_466 });
-  assert.equal(under.tripped, true, "over T whatever came of it");
+  assert.equal(under.overThreshold, true, "over T whatever came of it");
   assert.deepEqual(under.newlyEvictedIds, []);
   assert.deepEqual(under.stubbedIds, []);
   assert.equal(under.heldBackTokens, 2_465);
@@ -150,7 +150,7 @@ test("a result held back is taken on the request its batch reaches the minimum, 
   assert.equal(takenAt, 45);
 
   const fifth = steps[4]?.outcome;
-  assert.equal(fifth?.tripped, true, "request 5 is over T");
+  assert.equal(fifth?.overThreshold, true, "request 5 is over T");
   assert.deepEqual(fifth?.newlyEvictedIds, [], "and holds its batch of one result back");
 
   for (const [index, step] of steps.entries()) {

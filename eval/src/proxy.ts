@@ -239,13 +239,13 @@ function shortSha(repoRoot: string): string {
   return git(repoRoot, ["rev-parse", "--short", "HEAD"]).trim();
 }
 
-/** Tracked or untracked changes anywhere: what makes the run differ from the SHA in its label. */
 /**
- * Anything uncommitted in the repository, except the eval's own result documents: the run before
- * this one wrote those, and a build is not a different build because a run of it was written down.
+ * Tracked or untracked changes anywhere: what makes the run differ from the SHA in its label.
+ * `eval/results/` is gitignored rather than excluded here, so this stays the flat "anything
+ * uncommitted" the label promises — a run's own output must not be able to launder a dirty tree.
  */
 function hasUncommittedChanges(repoRoot: string): boolean {
-  return git(repoRoot, ["status", "--porcelain", "--", ".", ":(exclude)eval/results"]).trim() !== "";
+  return git(repoRoot, ["status", "--porcelain"]).trim() !== "";
 }
 
 function git(repoRoot: string, args: string[]): string {

@@ -2,7 +2,12 @@ import * as http from "node:http";
 import * as https from "node:https";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { evictContextSegments, formatThousands, type EvictionConfig } from "./evict.js";
+import {
+  ALARM_LINE_MARGIN_TOKENS,
+  evictContextSegments,
+  formatThousands,
+  type EvictionConfig,
+} from "./evict.js";
 import { createProxyLogWriter, type RequestLogEntry } from "./log.js";
 import {
   classifyRebuild,
@@ -94,7 +99,7 @@ function formatLiveLine(entry: RequestLogEntry): string {
           : `over T, batch of ${formatTokensShort(entry.heldBackTokens)} held back`,
       );
     }
-    if (entry.aboveAlarmLine === true) parts.push("ABOVE ALARM LINE (T + 40k)");
+    if (entry.aboveAlarmLine === true) parts.push(`ABOVE ALARM LINE (T + ${ALARM_LINE_MARGIN_TOKENS / 1_000}k)`);
   }
   const rebuildNote =
     entry.rebuild === undefined
@@ -352,7 +357,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
-        overThreshold: outcome.tripped,
+        overThreshold: outcome.overThreshold,
         stubbedResultCount: outcome.stubbedIds.length,
         newlyEvictedCount: outcome.newlyEvictedIds.length,
         newlyEvictedCharsRemoved: outcome.newlyEvictedCharsRemoved,

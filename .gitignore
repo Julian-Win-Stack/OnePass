@@ -7,6 +7,9 @@ proxy/proxy.log.jsonl
 .env
 eval/dist/
 eval/smoke/dist/
+# A run's own result documents. Ignored rather than excluded from the eval's dirty check, so that
+# "uncommitted changes anywhere" stays literally true and a run's output cannot launder a dirty tree.
+eval/results/
 .claude/worktrees/
 __pycache__/
 *.pyc

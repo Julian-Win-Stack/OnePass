@@ -16,18 +16,21 @@ The short pointer left in place of an evicted block, naming what was removed and
 _Avoid_: placeholder, tombstone, summary
 
 **Trip**:
-A request whose projected size crossed the threshold, causing new blocks to be evicted.
+A request whose projected size crossed the threshold, causing new blocks to be evicted. Crossing
+the threshold is not enough by itself: where nothing is eligible, or the batch minimum holds the
+batch back, the request goes out over the line having evicted nothing. The log calls that state
+`overThreshold`, and it is not a trip.
 _Avoid_: compaction, threshold event
 
 **Batch minimum**:
-The least a trip may newly evict. A batch under it is held back, and that content waits for a
-later request where the batch has grown past the minimum.
+The least a trip may newly evict, in tokens. A batch under it is held back, and that content waits
+for a later request where the batch has grown past the minimum.
 _Avoid_: gate, floor
 
 **Floor**:
-The part of a request no rule may evict: the system prompt, the tool definitions, the last K
-turns, and any segment whose stub would not save enough. It grows with the session, and once it
-passes T every request is over the threshold.
+The part of a request no rule may evict: the system prompt, the user's own text, the assistant's
+replies, everything inside the last K turns, and any segment whose stub would not save enough. It
+grows with the session, and once it passes T every request is over the threshold.
 _Avoid_: baseline, fixed part
 
 **Alarm line**:
