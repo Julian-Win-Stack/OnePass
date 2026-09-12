@@ -2,6 +2,8 @@
 
 Onepass is a context-management layer for coding agents. The goal is to let a user work a single long task from start to finish in one session — no session hopping, no waiting on compaction, no degradation as the session runs long.
 
+Of those three, **degradation is the pitch**. Readers are on 1M-token windows, where auto-compaction does not fire until around 890k, so avoiding compaction is not on its own a reason to run this. The reason is that models get dumber as the context fills, well before the window is full. Frame docs and results around keeping peak context low, not around compaction counts. The compaction result in the README is a 1M-window session the user compacted twice by hand, at 173k and 291k — auto-compaction never fired. Cite it as evidence of degradation, not of hitting the limit.
+
 Two parts, built in this order:
 
 1. **Recall** — search + fetch over the session transcript, so anything dropped from context can
