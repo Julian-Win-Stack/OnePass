@@ -9,9 +9,9 @@ results, the calls that made them, files the agent read, background-task output 
 stubs, so the conversation stops growing. Nothing is lost: the transcript on disk is untouched,
 and a bundled MCP server (`recall`) fetches any of it back verbatim when the agent asks.
 
-Measured on real sessions: **~1.49M tokens of raw conversation in one sitting, 289 turns, zero
-compactions**, with the task finished correctly. Numbers and caveats under
-[Verification](#verification).
+Measured on real sessions: the longest session on record peaked at **291k tokens and compacted
+twice** unproxied; the same prompts through the proxy peaked at **199k with zero compactions**.
+Numbers and caveats under [Verification](#verification).
 
 ## Install
 
@@ -227,7 +227,7 @@ To register recall by hand, add it to your MCP config with the session id in its
   input removes the thing being copied, and an imitated `{}` cannot become a valid call the way
   a kept `{ command }` could.
 
-## Known Claude Code interactions (measured against 2.1.241–2.1.258)
+## Known Claude Code interactions (measured against 2.1.241–2.1.269)
 
 - **Compaction really does key off API-reported usage.** From the shipped binary: auto-compact
   fires when `input_tokens + cache_creation_input_tokens + cache_read_input_tokens (+ output)`
@@ -345,6 +345,20 @@ compacting, at roughly what an unproxied session costs; it is not a way to spend
 that tripped on nearly every request cost about 4× control, which is what the batch minimum
 (`ONEPASS_BATCH_MIN_TOKENS`) exists to prevent — docs/findings.md §21.
 
+- **Two live runs of the 0.3.0 build** (§22, CLI 2.1.269, subscription). The task where the old
+  build cost the most, re-run on this one with everything else held: **$8.72 against $44.93**,
+  control $6.46; 112 trips became 5; cache reads went from 28% of input to 94%; same pass. And
+  the longest recorded session (57 prompts, unproxied peak 290,591 with two compactions),
+  replayed prompt by prompt through the proxy at defaults: **peak 199,457, zero compactions**,
+  12 trips over 311 requests.
+- **Three proxied against three control** (§19, CLI 2.1.265, `opus[1m]`, same task, base commit
+  and prompt as the run below, all five launched in parallel). Controls peaked at 284,494 and
+  284,938 with 142 and 118 turns above 150k; proxied runs peaked at **112,947, 112,633 and
+  114,353** with none. Ground-truth tests: 64/65 for every control and for two proxied runs of
+  three; the third scored 62/65 having never opened the file the failing assertions cover, with
+  nothing about that file ever evicted. §20 then had a blind code-review grader rank the same
+  five repos: both controls above every proxied arm, which is one-in-ten under no effect at all
+  — a suggestive number, not a finding.
 - **The A/B run against an unproxied control** (§17, CLI 2.1.258, `opus[1m]`, same task, same
   base commit, byte-identical prompt). The current build peaked at **140,253 tokens** over
   **588 assistant turns** with **zero compactions, zero turns above 150k, and zero unexpected
@@ -363,8 +377,8 @@ that tripped on nearly every request cost about 4× control, which is what the b
   early context mid-task. The agent re-read files instead of trusting stubs; no confabulation.
   OAuth/subscription auth passes through untouched — an API key is not required after all.
 
-**What is still unproven: the recovery path.** Across the three real proxied runs the agent
-called `recall_search`/`recall_get` **zero** times — evicted:recalled is 178,594 : 0. It never
+**What is still unproven: the recovery path.** Across every real proxied run on record — §17's
+three and §19's five — the agent called `recall_search`/`recall_get` **zero** times — evicted:recalled is 178,594 : 0. It never
 needed to: it re-read from disk instead, and never once mentioned eviction, missing context, or
 recall. The earlier build put an explicit `recall_search("<path>")` hint in every stub and it
 was still never followed. So the eviction half is measured on real work and the recall half is

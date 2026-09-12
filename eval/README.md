@@ -32,7 +32,9 @@ node dist/main.js quick                       # three proxied tails, every secon
 node dist/main.js full --compare a001c2b-20260906T101112Z
 ```
 
-**No arm is measured yet.** What exists is the spine the arms are written into — the command and
+**No arm is measured by this package yet.** (The proxy itself has been measured live — see
+`docs/findings.md` §19–§22 — through `run.sh`, `eval/harbor/` and `eval/grade/`, not through this
+command.) What exists is the spine the arms are written into — the command and
 its modes, the corpus directory, the control baseline, the proxy child, and the result document
 every later ticket writes into — the corpus import that gives them a session to read, the case
 list every mode covers, the replay that checks a build's eviction on those cases for nothing, and
@@ -65,7 +67,7 @@ lists its cases, replays them if asked, and writes a result document with no sco
 
 ## Cases
 
-A case is a prompt I typed whose request was past the proxy's trip threshold of 110k tokens.
+A case is a prompt I typed whose request was past the proxy's trip threshold of 80k tokens.
 Below that the proxy evicts nothing, both arms send byte-identical requests, and the model call
 buys no information — so those turns are listed and left alone.
 
@@ -97,7 +99,7 @@ second case; full and replay take all of them.
   transcript does not hold what was sent, so the rebuild came out 17k short on the shallowest
   corpus case and 54k on the deepest, and the threshold had been cut to 80k to stop that silently
   dropping turns. Reading the answer's own usage has no shortfall to work around, so the eval cuts
-  at the proxy's own 110k again.
+  at the proxy's own threshold again — which has since moved to 80k itself (§21).
 - **Whether the recorded answer used tools does not decide eligibility.** It is a label, and the
   result document reports the groups apart.
 
@@ -190,7 +192,7 @@ classified against it; the field is gone rather than reported as a permanent zer
 **Over the threshold with nothing evicted is counted in its own right.** The proxy writes a `trip`
 log entry only when it actually evicted something, so a request that went over the line and found
 nothing it was allowed to take used to read as a small quiet request — case `turn-724` of
-`3d1bb98-20260908T232351Z.json` reported 121,463 estimated tokens, past the proxy's own 110k, with
+`3d1bb98-20260908T232351Z.json` reported 121,463 estimated tokens, past the proxy's then-110k threshold, with
 `tripped: false`. The proxy now records the threshold decision on every request entry, and replay
 reports it as its own total. It is the failure most worth catching.
 
@@ -214,6 +216,8 @@ every model call the eval makes for itself sits behind the same HTTP boundary th
   chosen at random for the pair, and the order is recorded. The grader is never told which arm
   wrote which. Position bias, if there is any, shows in the control-versus-control noise floor
   drifting off an even split — that is what pays for grading each pair once instead of twice.
+  (The grader that has actually run — §20, `eval/grade/` — is a separate driver, and it grades
+  each pair in both orderings.)
 - **Nothing that stopped early hides inside an Unknown.** A call is capped at 40 model turns. A
   capped call is told from a finished one by the final message's stop reason and whether a tool
   call was left unanswered; that call, and one whose text carries no `Verdict:` line, are both
@@ -343,7 +347,8 @@ Three tools, three kinds of number.
 **`score.sh <arm>` — did it do the work?** Saves whatever tests the agent wrote to
 `$ONEPASS_EVAL_DIR/<arm>-tests/`, overwrites them with the ground-truth pair, and runs vitest.
 The score to compare is passing assertions out of 65. Runs 3, 4 and 5 all scored 63/65 against
-an unproxied control's 64/65.
+an unproxied control's 64/65. §19 later ran three controls against three proxied runs on the
+same task: 64/65 for every control, and 64, 62 and 64 for the proxied runs.
 
 **`npm run report` in `proxy/` — what did the proxy do?** Compactions, tokens evicted,
 evicted:recalled, the speed summary and the per-request table:

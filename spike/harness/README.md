@@ -25,7 +25,8 @@ tokens, so 4 reads beat 42.
 
 The arm name's first letter picks the mechanism.
 
-- `K*` — keyword: the [recall MCP server](../src/server.ts), `recall_search` + `recall_get`.
+- `K*` — keyword: the [recall MCP server](../../proxy/src/recall.ts), `recall_search` + `recall_get`
+  (it lived at `spike/src/server.ts` when these arms ran).
   No subagent.
 - `L*` — librarian: [`spike/librarian.md`](../librarian.md) installed as a project-local subagent,
   with `__TRANSCRIPT__` replaced by the session's transcript path. No MCP.
@@ -39,7 +40,8 @@ felt like reaching for.
 
 ```
 export ONEPASS_HARNESS_DIR=/tmp/onepass-harness   # optional, this is the default
-npm --prefix .. run build                          # K arms need spike/dist/server.js
+npm --prefix ../../proxy run build                 # the server is now proxy/dist/recall.js;
+                                                   # setup.sh still names spike/dist/server.js
 ./setup.sh K1
 ./drive.sh  K1
 node analyze.mjs K1
