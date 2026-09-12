@@ -1,21 +1,19 @@
 # Onepass
 
 Keep a long Claude Code session in the part of the context window where the agent is still
-sharp and I notice that models get dumber as the context fills. 
+sharp.
+
+Models get dumber as the context fills. A bigger window does not fix that, it just means
+longer spent in the range where the work is already degrading.
 
 Onepass is a small proxy that sits between Claude Code and the Anthropic API on your
 machine. Before each request goes out, it removes old tool output and file reads that are
 still on disk, so the context stops growing. On a real 30-minute implementation task, peak
 context went from 284k to 113k. Anything it removes can be fetched back word for word.
 
-If you know how prompt caching works, the obvious worry is that removing anything from the
-middle of the context invalidates the cache, so you pay full price for everything after it.
-That is real, and it is why Onepass only evicts when at least 20k tokens can go at once, a
-handful of times in a session rather than every turn. Most sessions cost about the same: one
-that never crosses the threshold is forwarded untouched, and on a 30-minute implementation task
-two of three proxied runs came in at the same price as the unproxied ones. The worst case
-measured was 1.35x, on the heaviest task in the set, which still served 94% of its input
-from cache.
+Removing context invalidates the prompt cache, so Onepass only evicts when at least 20k
+tokens can go at once, a handful of times in a session rather than every turn. Most
+sessions cost about the same. The worst case measured was 1.35x.
 
 Building this was the easy part. [How I knew it worked](docs/how-i-solved-it.md) is the part
 I'd want a reviewer to read.
@@ -81,32 +79,12 @@ links above.
 
 - **Your key or login passes through to api.anthropic.com and nowhere else.** The proxy
   listens on your machine only.
-- **It is not cheaper.** Removing context rewrites Anthropic's prompt cache, so the aim is
-  a session that costs about the same.
+- **It is not cheaper.** Heavy sessions cost somewhat more, up to 1.35x on the worst
+  measured.
 - **A huge paste in your own message stays.** Your text is never touched, so one big paste
   can outweigh everything else in the session.
 - **The agent usually re-reads a file itself** rather than calling recall. Recall is there
   for what is not on disk.
-
-## Why I built it
-
-Sometimes I take on a really big task, and a big task rarely fits in one session. The agent
-gets noticeably dumber somewhere past 150k tokens, and the task was never done by then. So I kept starting new sessions, either by writing a handoff file or by letting
-compaction run. Both take minutes, and both drop things. A handoff file only holds what I
-remembered to put in it. A compaction summary only holds what the model chose to keep.
-Decisions from an hour earlier were gone, and the agent started contradicting them.
-
-I wanted the session to just keep going, and to stay sharp while it did. That meant finding out what actually fills the
-context, removing only the parts that can be recovered, and then measuring it hard enough
-to trust it.
-
-## How it was tested
-
-Three ways, cheapest first. Unit tests on the eviction code, which is plain deterministic
-logic. A replay of recorded real traffic through a changed build, with the API faked, which
-answers in seconds and is what caught the one expensive bug. Live runs last, to confirm
-what the first two already showed. The details are in
-[how I knew it worked](docs/how-i-solved-it.md).
 
 ## License
 
