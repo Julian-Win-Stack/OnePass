@@ -1062,6 +1062,101 @@ T, N and K must still match, and an implicit comparison still requires everythin
   (2–8 chars/token, ignoring samples under 1,000 tokens) still applies, so a recorded 22.2 on
   sam-cell-seg is clamped exactly as the live proxy clamped it.
 
+## 22. Live re-runs of the 0.3.0 proxy: the 7x cost blow-up is gone, and a session under the trip line costs nothing
+
+Two live runs on 2026-09-11 against the proxy at `main` = `468c43f` (the 0.3.0 line: judge
+deleted, batch minimum in, default T=80k). Both through the subscription, no API key. The
+question each answers is narrow and is stated with it.
+
+### 22a. The task where the old proxy cost the most, re-run on the new one
+
+§21 found the old proxy's cost was a swarm of tiny trips, each rewriting the prompt cache. The
+Terminal-Bench first pass ([eval/harbor/RESULT.md](../eval/harbor/RESULT.md)) is where that
+showed up as money: proxied $201.91 against control $47.91 across 20 tasks, with the tokens
+*down* 19%. Per task, the worst was `make-mips-interpreter`: **$44.93 proxied vs $6.46
+control, 7.0x**, both arms passing. That is the task re-run here, once, with the `main` proxy
+and everything else held: same Harbor agent class, same model (`claude-opus-5`), same
+`ONEPASS_TRIP_TOKENS=30000` stress dose (not the shipped default — the point was to move only
+the proxy code), same Daytona environment. The control is the stored one; it was not re-run.
+
+| | control (2026-09-10) | old proxy `1ddb4fa` (2026-09-09) | new proxy `468c43f` (2026-09-11) |
+|---|---|---|---|
+| reward | 1.0 | 1.0 | **1.0** |
+| Harbor reported cost | $6.46 | $44.93 | **$8.72** |
+| input tokens incl. cache | 7,215,551 | 5,848,328 | 6,356,962 |
+| of them cache reads | 7,099,384 (98%) | 1,612,015 (**28%**) | 5,977,268 (**94%**) |
+| output tokens | 70,143 | 70,592 | 77,511 |
+| agent steps | 84 | 120 | 104 |
+| peak context (max `prompt_tokens`) | 126,095 | 65,828 | 88,188 |
+| proxy trips / segments evicted | — | 112 / 197 | **5 / 164** |
+| Claude Code | 2.1.267 | 2.1.267 | 2.1.269 |
+| agent wall clock | 18 min | 20 min | 31 min (incl. clone+build) |
+
+Read it as three numbers. The old proxy tripped on 112 of 119 requests and got 28% of its input
+from cache; the new one tripped 5 times in 103 requests and got 94% — within four points of
+the control's 98%. The cost went from 7.0x control to **1.35x**, a 5.2x drop on the same task,
+with the same pass. The batch minimum did that: what used to be a hundred trips of a few
+hundred tokens each is now five trips that each evict enough to be worth the cache rewrite.
+
+What it cost in context: the peak is 88k, not 66k. Holding a trip back until a batch is worth
+taking means the request sits above T for longer, so at T=30k the ceiling is about a third
+higher than the old proxy's — and still 30% under the control's 126k. That is the trade §21
+chose on a replay; this is it measured live, on the task where it mattered most.
+
+One run of one task. The old control's own cost varied by 2x between nearby tasks of the same
+length, so the $8.72 is a point, not a distribution; the 28% → 94% cache-read rate is the
+number that does not move much run to run, and it is the mechanism.
+
+Job: `~/onepass-corpus/harbor/jobs/onepass-rerun-mips-proxied-main468c43f-20260911T230151Z`,
+run with `ONEPASS_TASKS_FILE=<one line: make-mips-interpreter> ONEPASS_N_CONCURRENT=1
+./eval/harbor/run.sh first-pass proxied` from a checkout at `468c43f`.
+
+### 22b. Two real sessions replayed prompt by prompt, no compaction
+
+Both replays feed every prompt the user typed in a recorded session, in order, to a fresh
+`claude -p` session resumed under one id, through one proxy process for the whole run
+(`~/onepass-corpus/replay/replay.sh`). Shipped defaults: T=80k, batch minimum 20k. The repo is
+an isolated copy at the commit the original session started from. The agent's *answers*
+diverge from the original — it is a different run — so what is measured is only the shape of
+the context: peak, final, trips, compactions.
+
+**The planning session (chp99 take-home, 11–12 Aug 2026 — the eval corpus's `planning` branch:
+57 typed turns, `claude-fable-5` at xhigh).** This is the biggest session on record here, and the
+one the eval spec names. Unproxied it peaked at **290,591** tokens and compacted twice (at 173k
+and at 291k). Replayed through the proxy — 53 prompts (the two `/compact`s, the interrupt and the
+post-compaction "continue" dropped), each fed in order, no compaction allowed:
+
+| | original (no proxy) | replay (proxy at `468c43f`, T=80k) |
+|---|---|---|
+| model turns | 523 | 489 |
+| peak context | **290,591** | **199,457** |
+| final context | 155,432 (after 2nd compaction) | 199,457 |
+| compactions | 2 | **0** |
+| median / p90 context per request | — | 137k / 173k |
+| trips / segments evicted / chars removed | — | 12 / 367 / 2.34M |
+| raw request size the proxy saw at its largest (est.) | — | ~824k tokens |
+| cost (Claude Code's own estimate, subscription) | — | $81.55 |
+| wall clock | ~20 h of a real day | 63 min |
+
+The session that had to be compacted twice ran end to end with no compaction, peaking 31% under
+the unproxied peak, with its last request at 199k against a 1M window. Twelve trips over 311
+requests: the batch minimum is doing what §21 said it would, and every request stayed at or
+under the un-evictable floor the proxy's own README warns about — user prose, assistant text,
+the last-K window — which is what the 137k median is made of. At prompt 49 the original was at
+241k; the replay was at 187k. The ceiling is now the floor, not the tool output.
+
+It is a different run, not a re-execution: the replay's agent could not use the desktop
+browser MCP the original leaned on for its front-end work, and it answered every prompt afresh,
+so its answers and turn count differ. Peak, final and compaction count are the measurements; the
+answers are not compared. Replay dir: `~/onepass-corpus/replay/out-chp99/`; repo copy at
+`~/onepass-corpus/replay/chp99-takehome` (commit `261d149`, the session's start state).
+
+**A smaller session that never reaches T (`Downloads/pax-takehome-main`, 5 prompts,
+`claude-opus-5` at high).** Original peak 80,235, no compaction. Replayed: 63 model turns,
+**peak 58,922, final 58,922, 0 trips, 0 compactions, $1.65**. The proxy forwarded every request
+untouched, which is the designed behaviour: a session that fits in the window costs exactly what
+it would have cost without the proxy.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.

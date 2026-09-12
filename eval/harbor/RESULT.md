@@ -1,5 +1,11 @@
 # Onepass on Terminal-Bench 2.0
 
+> **Re-run, 2026-09-11.** The worst task here by cost, `make-mips-interpreter` ($44.93 proxied vs
+> $6.46 control), re-run once on the proxy at `468c43f` with everything else held: **$8.72, reward
+> 1.0**, 5 trips instead of 112, cache reads 94% of input instead of 28%. Table and caveats in
+> [docs/findings.md §22a](../../docs/findings.md#22-live-re-runs-of-the-030-proxy-the-7x-cost-blow-up-is-gone-and-a-session-under-the-trip-line-costs-nothing).
+> The 20-task table below is the *old* proxy (`1ddb4fa` / `462bb37`) and stands as recorded.
+
 - proxied jobs (2 batches):
   - `/Users/phyonyanwinn/onepass-corpus/harbor/jobs/onepass-first-pass-proxied-20260909T220608Z`
   - `/Users/phyonyanwinn/onepass-corpus/harbor/jobs/onepass-first-pass-proxied-remaining-proxied-20260910T055000Z`
