@@ -1,55 +1,107 @@
 # Onepass
 
-Context management for coding agents. Run a long Claude Code session to the end without it
-compacting:
+Run one long Claude Code session from start to finish, without compaction.
+
+Onepass is a small proxy that sits between Claude Code and the Anthropic API on your
+machine. Before each request goes out, it removes old tool output and file reads that are
+still on disk, so the context stops growing. Anything it removes can be fetched back word
+for word.
+
+Building this was the easy part. [How I knew it worked](docs/how-i-solved-it.md) is the part
+I'd want a reviewer to read.
+
+## Install and run
 
 ```bash
 npm install -g onepass-proxy
-claudep
 ```
 
-`claudep` is `claude` with the context problem taken care of. Everything runs on your own
-machine. See [proxy/README.md](proxy/README.md).
+Then use `claudep` wherever you would use `claude`:
+
+```bash
+claudep                          # a new session
+claudep --resume                 # pick up an old one
+claudep -c                       # continue the last one
+claudep -p "fix the failing test"
+```
+
+Every flag passes straight through to `claude`. Open as many `claudep` sessions as you
+like at the same time; each one gets its own proxy.
+
+To turn it off, run `claude`. Nothing else on your machine changes.
+
+Works with the `claude` command in a terminal. The desktop app and IDE extensions are not
+supported yet. Needs Node 20 or newer.
+
+## Why I built it
+
+Sometimes I take on a really big task, and a big task rarely fits in one session. I noticed
+the agent gets noticeably dumber somewhere past 150k tokens, and the task was never done by
+then. So I kept starting new sessions, either by writing a handoff file or by letting
+compaction run. Both take minutes, and both drop things. A handoff file only holds what I
+remembered to put in it. A compaction summary only holds what the model chose to keep.
+Decisions from an hour earlier were gone, and the agent started contradicting them.
+
+I wanted the session to just keep going. That meant finding out what actually fills the
+context, removing only the parts that can be recovered, and then measuring it hard enough
+to trust it.
 
 ## The problem
 
-A long coding session dies of its own context. Claude Code resends the whole conversation every
-turn, so the request only grows, and when it hits the limit the session compacts: a model call
-that throws away ~95% of the context and takes a couple of minutes, every time. Compaction #2
-summarizes summary #1, so the loss compounds — the agent forgets what it decided an hour ago and
-starts contradicting itself. Today the way out is to give up on the session and start a new one.
+Claude Code resends the whole conversation on every turn, so each request is bigger than
+the last. When it reaches the limit, the session compacts: a model call that throws most
+of the context away and takes a couple of minutes. The next compaction summarizes the
+previous summary, so the loss compounds.
 
-The numbers behind this were measured from 335 real transcripts: see [docs/findings.md](docs/findings.md).
+## What it does
 
-## The idea
+The largest recoverable part of a request is old tool output, the calls that produced it,
+and files the agent has read. All of it is still on disk. Onepass replaces the old ones
+with a short marker before the request leaves your machine, and leaves the rest alone.
 
-Evict aggressively, recall verbatim.
+It never touches what you typed or what the model wrote back. Your plan, your decisions
+and the conversation itself stay exactly as they were.
 
-The context does not need to be summarized — it needs to be *addressable*. Most of a request is
-old tool results and file contents that are still sitting on disk. Drop them, leave a pointer,
-and let the agent fetch the original back word-for-word if it turns out to matter.
+The marker is not just a placeholder — it is a message to the agent. It says something was
+removed and roughly how big it was, and the agent knows what it means, so it can go and get
+the content back. Usually that means simply reading the file again. For things that are not
+on disk, like old command output, Onepass gives the agent a tool called recall that fetches
+the exact original from the session transcript. The agent decides when to use it; you never
+have to.
 
-## The two pieces
+The session still grows, because your text and the model's stay. Onepass makes a session
+much longer, not endless.
 
-**Recall** (`proxy/src/recall.ts`) — an MCP server that searches and fetches from the session
-transcript, so anything removed from context can be retrieved verbatim. Ships with the proxy,
-and `claudep` registers it for the session it starts.
+## Results
 
-**The eviction proxy** (`proxy/`) — a local HTTP proxy between Claude Code and the API. Before
-each request goes upstream it replaces old tool results, tool inputs, and injected file content
-with short stubs, so the context the model sees stops growing and compaction never triggers.
+| | Without Onepass | With Onepass |
+|---|---|---|
+| **Long planning session** — nearly a full day, 57 prompts ([§22b](docs/findings.md)) | Peak 291k tokens, **two compactions** | Peak 199k tokens, **zero compactions** |
+| **Implementation task** — 30 min, three runs each way ([§19](docs/findings.md)) | Peak 284k. Tests 64/65 every run | Peak 113k. Tests 64, 62, 64 of 65. Same cost in two runs of three |
+| **Terminal-Bench 2.0** — 20 hardest tasks, one run each ([RESULT.md](eval/harbor/RESULT.md)) | 16 passed | 14 passed, a gap inside the noise. Peak context down 30% |
 
-Order matters: recall first, then eviction. Eviction without a way to get content back has to be
-timid, which is why it doesn't help.
+The Terminal-Bench numbers are from an earlier build, before the cost fix in 0.3.0. Full
+numbers and every caveat are behind the links above.
 
-**The eval** (`eval/`) — replays real recorded sessions with and without the proxy and has a
-grader score the answers, to find out whether eviction actually costs the agent anything. This
-is how we'll know if it works.
+## Sharp edges
 
-## Status
+- **Your key or login passes through to api.anthropic.com and nowhere else.** The proxy
+  listens on your machine only.
+- **It is not cheaper.** Removing context rewrites Anthropic's prompt cache, so the aim is
+  a session that costs about the same.
+- **A huge paste in your own message stays.** Your text is never touched, so one big paste
+  can outweigh everything else in the session.
+- **The agent usually re-reads a file itself** rather than calling recall. Recall is there
+  for what is not on disk.
 
-Published as `onepass-proxy` on npm, and measured: ~1.49M tokens of raw conversation in one
-session, 289 turns, zero compactions. What is still open is whether eviction costs the agent
-anything on real work — that is the question the eval exists to answer, and the recall half has
-had one deliberate probe rather than a workload behind it. Read `proxy/README.md` before
-trusting it with a long session.
+## How it was tested
+
+Three ways, cheapest first. Unit tests on the eviction code, which is plain deterministic
+logic. A replay of recorded real traffic through a changed build, with the API faked, which
+answers in seconds and is what caught the one expensive bug. Live runs last, to confirm
+what the first two already showed. The details are in
+[how I knew it worked](docs/how-i-solved-it.md).
+
+## License
+
+MIT

@@ -177,7 +177,7 @@ never recorded, which is what keeps a few hundred snapshots at megabytes.
   neither of which involves tools. A planning fork that calls tools before answering, which is
   what the eval will actually run, is not covered here.
 - **The fixture is a two-turn session of a few hundred tokens.** Nothing about behaviour at the
-  110k–160k contexts the eval forks at was measured.
+  80k+ contexts the eval forks at was measured.
 - **One fork point shape.** A text turn followed by a text turn. A fork at a turn that ended on
   a tool result, or one carrying a trailing attachment, was only ever covered by `readTurns`'
   unit tests against a fixture, never against a live resume — and those tests went with the

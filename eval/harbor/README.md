@@ -45,7 +45,7 @@ proxied arm's `ANTHROPIC_MODEL` and a bare `claude-opus-5` in the control's. A b
 identically in both.
 
 **Claude Code version:** whatever Harbor's installer resolves on the day of the run (2.1.266 at the
-time of writing). Both arms install through the same code path in the same job window, and the
+time of writing; the recorded runs got 2.1.267, and the §22a re-run 2.1.269). Both arms install through the same code path in the same job window, and the
 version each trial actually got is recorded in `results.json` under `agent_info.version` — the
 report prints it. Pin it with `ONEPASS_CLAUDE_VERSION=2.1.266` to remove even that.
 
@@ -55,14 +55,14 @@ natively-1M model at 200k behind a host that is not `api.anthropic.com`, so with
 benchmark from the control (`docs/findings.md` §11).
 
 **Trip threshold: `ONEPASS_TRIP_TOKENS=30000` — a stress dose, not the shipped default.** The
-proxy ships at 110,000 and Terminal-Bench tasks mostly stay under that, where the proxy never trips
+proxy ships at 80,000 (110,000 when this run was made) and Terminal-Bench tasks mostly stay under that, where the proxy never trips
 and the two arms are identical by construction. 30k makes eviction fire on a normal task, which is
 what this run is for. It is not the configuration anyone should use in a real session, and any
 number quoted from this run has to carry that sentence with it.
 
-**Judge: off.** `ONEPASS_JUDGE_API_KEY` is explicitly unset in the container. `docs/findings.md`
-§17 measures it at 1.1% of what the rules remove, for ~$3.19 a session on a second key; leaving it
-on would put another model's spend inside a benchmark number for a rounding error of eviction.
+**Judge: none.** The judge was deleted in 0.3.0. When this run was made it still existed and was
+explicitly unset in the container (`docs/findings.md` §17 measures it at 1.1% of what the rules
+remove, for ~$3.19 a session on a second key).
 
 **Model routing is equalised across arms.** Harbor's stock `run()` pins the Sonnet/Opus/Haiku tier
 aliases and the subagent model to the run's model *whenever `ANTHROPIC_BASE_URL` is set* — which is
@@ -292,7 +292,7 @@ change.
 * **Trips, segments evicted, chars removed** — from each trial's own proxy log.
 * **`recall_search` / `recall_get` calls** — scanned out of the Claude Code transcript. Expect zero:
   the recall MCP server is not registered in these containers, and it was called zero times in
-  every real proxied run so far anyway (`docs/findings.md` §17). The row is there to keep that
+  every real proxied run so far anyway (`docs/findings.md` §17, §19). The row is there to keep that
   honest rather than to flatter the result.
 
 The headline is the **paired difference**: per task, mean over that task's trials in each arm, then
@@ -307,5 +307,5 @@ resampling tasks *is* the paired bootstrap.
   of ±1 on a binary score is one flip of a nondeterministic agent. Read the interval, not the mean.
 - **The recovery path stays unexercised.** Recall is not wired into these containers, so this
   measures eviction with re-reading from disk as the only recovery — which is what real proxied
-  runs have always done anyway (`docs/findings.md` §17), but it is not evidence that recall works.
+  runs have always done anyway (`docs/findings.md` §17, §19), but it is not evidence that recall works.
 - **30k is not a real setting.** See above. The reduction is real; the dose is not the shipped one.
