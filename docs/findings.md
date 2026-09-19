@@ -1175,6 +1175,55 @@ answers are not compared. Replay dir: `~/onepass-corpus/replay/out-chp99/`; repo
 untouched, which is the designed behaviour: a session that fits in the window costs exactly what
 it would have cost without the proxy.
 
+## 23. The proxy made a session slower: three sizing errors and an unread legend
+
+A `claudep` session on a large Python repository ("adforge", 2026-09, Claude Code with MCP
+schemas deferred) was slower than the same work unproxied, and the transcript said why: files
+were evicted one or two turns after being read, so the agent read them again. `tasks.py` was
+read **28 times** in one session; across 15 files the session made **160+ re-reads**. The
+recall tools were called **0 times**. All four causes are in the proxy, and the fix for each
+shipped in 0.4.0.
+
+**1. The size estimate counted bytes the API does not bill.** The proxy sized a request as
+`JSON length ÷ chars-per-token`. §15 established that a thinking block's `signature` costs
+nothing when replayed; Claude Code sends thinking with `display: "omitted"`, so a signature is
+all a thinking block carries, and on this session signatures were **~60% of the request
+bytes**. Counted, they made the request look up to **3×** its billed size. The estimate and the
+calibration now both drop them (`billableChars` in `evict.ts`).
+
+**2. The ratio was calibrated on the wrong requests.** The calibration took a sample from any
+response over 1,000 tokens. Claude Code makes side calls beside the conversation — title
+generation, warm-ups — that carry no signatures and are plain prose. In this log they
+calibrated at **2.6 chars per token** while the conversation itself, signatures counted, ran at
+**8** (the clamp's ceiling). A side call's ratio applied to the conversation's bytes multiplied
+error 1. A sample now counts only when its context is at least half the largest the proxy has
+seen, which no side call reaches.
+
+**3. A fixed T against a floor it was never sized for.** The un-evictable floor of this session
+— tool schemas, system prompt, CLAUDE.md, the last K turns — was **~63k** real tokens against
+T = 80k: 17k of room, less than the batch minimum. The normal pass could never bring the request
+under T, so the pressure pass fired on **every request** and took everything older than K = 4
+turns. The agent's working memory was its last four tool calls. Setting
+`ONEPASS_TRIP_TOKENS=130000` by hand fixed the session; the fix in the proxy is an automatic T:
+the first conversation-sized request's real size less what eviction could take from it, plus
+60k of headroom (`ONEPASS_HEADROOM_TOKENS`). That gives this session ~123k and a bare project
+the old 80k.
+
+**4. The legend was somewhere the agent cannot read.** The stub legend lived in the
+`recall_search` tool's description (§15 amendment). Claude Code 2.1.258+ defers MCP tool
+schemas behind ToolSearch, sending only the names (§15, "MCP servers are not a lever"). The
+agent therefore met `[onepass: evicted N chars]` with no idea what it was or that recall
+existed, and did the one thing it knew: read the file again. The legend is now one text block
+appended to the system prompt of every request that carries a stub — identical each time, and
+stubs are monotonic, so from the first trip on it is inside the cached prefix, while a session
+that never trips is still forwarded byte for byte — and it says how to load the deferred tools.
+
+Caveat: n=1, read from the proxy log and transcript of the session rather than reproduced in a
+controlled run. The mechanisms are exact (they are in the code); the 28 / 160 / 60% / 2.6 / 8
+/ 63k figures are that session's. Fixes 1–3 each have a unit or integration test in
+`proxy/src` that pins the mechanism; fix 4's effect on recall use is not yet measured on a
+live run.
+
 ## Caveats
 
 - Token counts are estimated as `len(json.dumps(block)) / 4`, not tokenizer-exact.
@@ -1206,6 +1255,8 @@ it would have cost without the proxy.
   the wall-clock ordering (35.0 vs 38.0 min) does not, and neither does the imitation count,
   which scales with how many calls got stubbed. The judge's two runs differ in build as well
   as in luck — treat "1 accepted pick" as the order of magnitude, not the number.
+- §23 is one session, diagnosed from its log and transcript. Whether the agent reaches for recall
+  once the legend is in the system prompt is the claim a live run has yet to test.
 - §21 is replay only: recorded request bodies against a fake upstream, no model and no bill. It
   measures what the eviction code does with real inputs, not what a session costs. Two of its
   seven bar sets fail the trips bar, both on recordings whose baseline trips 2 and 8 times, where

@@ -48,8 +48,11 @@ export interface ProxySettings {
   evictAfterTurns: number;
   /** K: blocks inside the last K assistant turns are never touched. */
   protectLastTurns: number;
-  /** T: the trip threshold, in tokens. */
-  tripTokens: number;
+  /**
+   * T: the trip threshold, in tokens — or automatic, measured by the child as the first
+   * conversation-sized request's floor plus this headroom.
+   */
+  tripTokens: number | { auto: { headroomTokens: number } };
   /** The batch minimum, in tokens. Null for a build from before it existed, which printed none. */
   batchMinTokens: number | null;
 }
@@ -209,15 +212,18 @@ function parseBanner(text: string): Banner | null {
   };
 }
 
-/** `evict after N=8 assistant turns, protect last K=4, trip over T=110000 …, batch min 20000 tokens`. */
+/**
+ * `evict after N=8 assistant turns, protect last K=4, trip over T=110000 …, batch min 20000 tokens`,
+ * or from 0.4.0 with T unset, `trip over T=auto (floor + 60000 headroom; …)`.
+ */
 function parseSettings(text: string): ProxySettings | null {
-  const line = /^\[onepass\] evict after N=(\d+)\b.*?protect last K=(\d+)\b.*?trip over T=(\d+)\b(.*)$/m.exec(text);
+  const line = /^\[onepass\] evict after N=(\d+)\b.*?protect last K=(\d+)\b.*?trip over T=(\d+|auto \(floor \+ (\d+) headroom[^)]*\))(.*)$/m.exec(text);
   if (line === null) return null;
-  const batchMin = /batch min (\d+) tokens/.exec(line[4] as string);
+  const batchMin = /batch min (\d+) tokens/.exec(line[5] as string);
   return {
     evictAfterTurns: Number(line[1]),
     protectLastTurns: Number(line[2]),
-    tripTokens: Number(line[3]),
+    tripTokens: line[4] === undefined ? Number(line[3]) : { auto: { headroomTokens: Number(line[4]) } },
     batchMinTokens: batchMin === null ? null : Number(batchMin[1]),
   };
 }

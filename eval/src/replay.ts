@@ -276,17 +276,32 @@ function readLog(path: string): LogEntry[] {
 }
 
 /**
- * The stubs in a forwarded body. Read off the serialized body rather than by walking the message
- * tree: a stub can stand in for a tool result, a tool call's input or a block of injected text, and
- * what replay is checking is that the text the model would see is the text this build writes.
+ * The stubs in a forwarded body. Read off the serialized messages rather than by walking the
+ * message tree: a stub can stand in for a tool result, a tool call's input or a block of injected
+ * text, and what replay is checking is that the text the model would see is the text this build
+ * writes. The messages only, because from 0.4.0 the system prompt of a stubbed request carries
+ * the legend, which quotes the marker to say what it means and is not a stub.
  */
 function readStubs(body: string): string[] {
   // Built from the constant rather than spelled again: a second copy of the marker would let a
   // renamed stub go on being found here while nothing else recognised it.
   const marker = new RegExp(`${STUB_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"]*`, "g");
   const stubs: string[] = [];
-  for (const match of body.matchAll(marker)) stubs.push(unescapeJson(match[0]));
+  for (const match of messagesText(body).matchAll(marker)) stubs.push(unescapeJson(match[0]));
   return stubs;
+}
+
+/** The serialized `messages` of a body, or the whole body where it is not a request. */
+function messagesText(body: string): string {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed === "object" && parsed !== null && "messages" in parsed) {
+      return JSON.stringify((parsed as { messages: unknown }).messages);
+    }
+  } catch {
+    // Not JSON: nothing to narrow to.
+  }
+  return body;
 }
 
 /** How many stubs a result document keeps in full. Enough to read a wording change off. */

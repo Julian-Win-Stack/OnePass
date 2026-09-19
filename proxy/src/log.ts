@@ -48,6 +48,24 @@ export interface RequestLogEntry {
   aboveAlarmLine?: true;
   /** Chars-per-token ratio used for this request's token estimates (calibrated from API usage). */
   charsPerToken?: number;
+  /** T as it stood for this request: the configured value, or the automatic one once measured. */
+  tripThresholdTokens?: number;
+}
+
+/**
+ * Written once per session, when T is automatic and the floor has just been measured: the first
+ * conversation-sized request's real size less what eviction could still take from it.
+ */
+export interface ThresholdLogEntry {
+  kind: "threshold";
+  timestamp: string;
+  /** Real tokens the API reported for the request the floor was read from. */
+  measuredTokens: number;
+  /** Those less the evictable part, at the calibrated ratio: what eviction can never reach. */
+  floorTokens: number;
+  headroomTokens: number;
+  /** floor + headroom: T for every request from here on. */
+  tripThresholdTokens: number;
 }
 
 export interface TripLogEntry {
@@ -69,7 +87,7 @@ export interface ProxyErrorLogEntry {
   message: string;
 }
 
-export type ProxyLogEntry = RequestLogEntry | TripLogEntry | ProxyErrorLogEntry;
+export type ProxyLogEntry = RequestLogEntry | TripLogEntry | ThresholdLogEntry | ProxyErrorLogEntry;
 
 export const proxyLogDir = join(homedir(), ".onepass");
 
