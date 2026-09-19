@@ -759,11 +759,19 @@ test("a user's paste goes upstream untouched while the tool result beside it is 
       assert.equal(sent[0]?.content[0]?.text, PASTED_USER_TEXT);
       assert.equal(sent[2]?.content[0]?.content, "[onepass: evicted 5,000 chars]");
     }
-    const evictedIds = readFileSync(logPath, "utf8")
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .map((line) => JSON.parse(line) as ProxyLogEntry)
-      .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    // The writer opens its stream lazily and flushes on its own schedule, so the trip entry can
+    // still be in flight when the second response has already reached the client — on a slow
+    // runner reading the file once found nothing at all. Wait for the one trip this proxy makes.
+    const deadline = Date.now() + 2000;
+    let evictedIds: string[] = [];
+    while (evictedIds.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      evictedIds = (existsSync(logPath) ? readFileSync(logPath, "utf8") : "")
+        .split("\n")
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line) as ProxyLogEntry)
+        .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    }
     assert.deepEqual(evictedIds, ["toolu_read"], "the paste's content hash must never enter the set");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
