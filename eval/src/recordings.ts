@@ -35,7 +35,7 @@ export const PLANNING_RECORDING = "planning";
  * against, so a reader can see at a glance whether a recording is deep enough to be worth having.
  * Replay reports the proxy's own calibrated estimate instead.
  */
-const FALLBACK_CHARS_PER_TOKEN = 3.2;
+const FALLBACK_CHARS_PER_TOKEN = 2.5;
 
 /** A recorded body's size in the unit the threshold is written in. The one place that division lives. */
 export function approximateTokens(bytes: number): number {

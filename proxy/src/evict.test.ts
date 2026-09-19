@@ -2,8 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  addStubLegend,
+  billableChars,
+  estimateTokens,
   evictContextSegments,
   measureContentChars,
+  STUB_LEGEND,
   STUB_PREFIX,
   textSegmentId,
   type EvictionConfig,
@@ -784,7 +788,7 @@ test("a request estimated at exactly T does not trip", () => {
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, { ...ALWAYS_TRIP, tripThresholdTokens: 1_400 });
 
   assert.equal(outcome.estimatedTokensBefore, 1_400, "this test's body is no longer 1,400 tokens");
-  assert.equal(outcome.tripped, false);
+  assert.equal(outcome.overThreshold, false);
   assert.deepEqual(outcome.newlyEvictedIds, []);
 });
 
@@ -793,7 +797,7 @@ test("a request estimated one token above T trips", () => {
   const outcome = evictContextSegments(body, NO_EVICTED_IDS, { ...ALWAYS_TRIP, tripThresholdTokens: 1_399 });
 
   assert.equal(outcome.estimatedTokensBefore, 1_400, "this test's body is no longer 1,400 tokens");
-  assert.equal(outcome.tripped, true);
+  assert.equal(outcome.overThreshold, true);
   assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
 });
 
@@ -823,4 +827,129 @@ test("a result whose stub saves exactly the minimum is stubbed", () => {
 
   assert.deepEqual(outcome.newlyEvictedIds, ["toolu_1"]);
   assert.equal(blockAt(outcome.body, 1).content, "[onepass: evicted 77 chars]");
+});
+
+// ---------------------------------------------------------------------------------------
+// What the size estimate counts. A thinking block's signature is bytes the API reads and never
+// bills (docs/findings.md §15); on a long session they were ~60% of the body (§23), so counting
+// them had the proxy sizing every request at up to three times what the API charged for it.
+
+function assistantThinking(signatureChars: number): unknown {
+  return {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "", signature: "s".repeat(signatureChars) },
+      { type: "text", text: "thought about it" },
+    ],
+  };
+}
+
+test("thinking signatures are not counted toward the request size", () => {
+  const withoutSignature = requestBody([
+    { role: "user", content: "hello" },
+    { role: "assistant", content: [{ type: "text", text: "thought about it" }] },
+  ]);
+  const withSignature = requestBody([{ role: "user", content: "hello" }, assistantThinking(40_000)]);
+
+  // 40,000 chars of signature at 4 chars per token would be 10,000 tokens.
+  const plain = estimateTokens(withoutSignature, 4);
+  const signed = estimateTokens(withSignature, 4);
+  assert.ok(Math.abs(signed - plain) < 20, `signature moved the estimate from ${plain} to ${signed}`);
+  assert.ok(billableChars(withSignature) < JSON.stringify(withSignature).length - 40_000);
+});
+
+test("a `signature` key anywhere but a thinking block still counts — only the free bytes are dropped", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_1", "Write", { file_path: "/x.ts", signature: "k".repeat(4_000) }),
+    userToolResult("toolu_1", "ok"),
+  ]);
+  assert.ok(billableChars(body) >= 4_000, "a tool input's own field is real content");
+});
+
+test("signatures alone never push a request over T", () => {
+  // 3,000 chars of evictable result, then 200,000 chars of signatures: 50,000 tokens at 4 chars
+  // each if they were counted, against T = 5,000. They are not, so the request is under the line
+  // and nothing is evicted.
+  const body = requestBody([
+    assistantToolUse("toolu_1", "Read", { file_path: "/a.ts" }),
+    userToolResult("toolu_1", "x".repeat(3_000)),
+    ...Array.from({ length: 20 }, () => assistantThinking(10_000)),
+    ...filler(4),
+  ]);
+  const outcome = evictContextSegments(body, NO_EVICTED_IDS, { ...ALWAYS_TRIP, tripThresholdTokens: 5_000 });
+  assert.equal(outcome.overThreshold, false, `estimated ${outcome.estimatedTokensBefore} tokens`);
+  assert.deepEqual(outcome.newlyEvictedIds, []);
+});
+
+// ---------------------------------------------------------------------------------------
+// What a later trip could still take. The server reads the floor off it: the API's count for
+// the request, less this at the calibrated ratio, is what eviction can never reach.
+
+test("evictableCharsSent counts every live candidate at what its stub would save, and nothing stubbed", () => {
+  const body = requestBody([
+    assistantToolUse("toolu_old", "Read", { file_path: "/old.ts" }),
+    userToolResult("toolu_old", "x".repeat(5_000)),
+    ...filler(3),
+    assistantToolUse("toolu_young", "Read", { file_path: "/young.ts" }),
+    userToolResult("toolu_young", "y".repeat(2_000)),
+    { role: "user", content: "typed text the rules never touch ".repeat(50) },
+  ]);
+
+  // Under T nothing is stubbed: both results are live, and both would save their content less a
+  // 30-char stub. The typed text and the Read calls (a stub would save nothing) are not candidates.
+  const quiet = evictContextSegments(body, NO_EVICTED_IDS, NEVER_TRIP);
+  assert.equal(quiet.evictableCharsSent, 5_000 - 30 + 2_000 - 30);
+
+  // Over T the old result is taken and only the young one is left to take.
+  const tripped = evictContextSegments(body, NO_EVICTED_IDS, ALWAYS_TRIP);
+  assert.deepEqual(tripped.newlyEvictedIds, ["toolu_old"]);
+  assert.equal(tripped.evictableCharsSent, 2_000 - 30);
+});
+
+// ---------------------------------------------------------------------------------------
+// The stub legend. Its other home, the recall tool's description, is invisible whenever Claude
+// Code defers MCP schemas behind ToolSearch — so it rides in the system prompt, identical on
+// every request, where the agent reads it before it meets its first stub.
+
+test("addStubLegend appends one text block after the client's system blocks, and only once", () => {
+  const clientBlocks = [
+    { type: "text", text: "You are Claude Code." },
+    { type: "text", text: "CLAUDE.md says so.", cache_control: { type: "ephemeral" } },
+  ];
+  const body = { model: "m", system: clientBlocks, messages: [{ role: "user", content: "hi" }] };
+
+  const once = addStubLegend(body);
+  assert.equal(once.changed, true);
+  const system = (once.body as { system: unknown[] }).system;
+  assert.equal(system.length, 3);
+  assert.equal(system[0], clientBlocks[0], "the client's blocks are the same objects, in place");
+  assert.equal(system[1], clientBlocks[1]);
+  assert.deepEqual(system[2], { type: "text", text: STUB_LEGEND });
+  assert.deepEqual(body.system, clientBlocks, "the input is not mutated");
+
+  const twice = addStubLegend(once.body);
+  assert.equal(twice.changed, false);
+  assert.equal(twice.body, once.body, "already carrying the legend, the body comes back as it was");
+});
+
+test("addStubLegend handles a string system prompt, none at all, and a body that is not a request", () => {
+  const asString = addStubLegend({ system: "Be brief.", messages: [] });
+  assert.equal((asString.body as { system: string }).system, `Be brief.\n\n${STUB_LEGEND}`);
+  assert.equal(addStubLegend(asString.body).changed, false);
+
+  const none = addStubLegend({ messages: [] });
+  assert.deepEqual((none.body as { system: unknown }).system, [{ type: "text", text: STUB_LEGEND }]);
+
+  const notARequest = { model: "m" };
+  assert.equal(addStubLegend(notARequest).body, notARequest);
+  assert.equal(addStubLegend("text").changed, false);
+});
+
+test("the legend names the stub shapes exactly as the proxy writes them, and how to load the deferred tools", () => {
+  for (const shape of ["[onepass: evicted N chars]", "`{}`", "[onepass: evicted attached file", "[onepass: evicted task notification"]) {
+    assert.ok(STUB_LEGEND.includes(shape), `legend does not mention ${shape}`);
+  }
+  assert.ok(STUB_LEGEND.startsWith(`Onepass`));
+  assert.ok(STUB_LEGEND.includes("select:mcp__onepass__recall_search,mcp__onepass__recall_get"));
+  assert.ok(STUB_LEGEND.length < 1_200, `the legend rides in every request: ${STUB_LEGEND.length} chars is too many`);
 });

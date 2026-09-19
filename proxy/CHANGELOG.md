@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0
+
+A session in a large repository was slower through the proxy than without it: files evicted
+one or two turns after they were read, one file re-read 28 times, recall never called. Four
+causes, all in how the proxy sized and explained its work (docs/findings.md §23).
+
+- **Thinking signatures are no longer counted.** The API bills replayed thinking at its
+  generated count and a `signature` at nothing, and Claude Code sends thinking with
+  `display: "omitted"`, so signatures are all a thinking block carries — ~60% of the body on a
+  long session. Counting them had the proxy sizing requests at up to 3× what the API charged.
+  The estimate and the calibration now both run on billable chars.
+- **Calibration samples the conversation only.** A response sets the chars-per-token ratio only
+  when its context is at least half the largest seen. Claude Code's side calls (titles,
+  warm-ups) are prose at ~4 chars per token against the conversation's ~2.3, and one of them
+  setting the ratio put every estimate for the conversation 40% low — or, multiplied by the
+  signatures, 3× high. The uncalibrated fallback is 2.5, was 3.2, for the same reason.
+- **T is automatic.** `ONEPASS_TRIP_TOKENS` unset, T is the first conversation-sized request's
+  real size less what eviction could take from it — the floor — plus `ONEPASS_HEADROOM_TOKENS`
+  (60k). A fixed 80k over a 63k prefix left 17k of room: the pressure pass fired on every
+  request and the agent kept its last K turns and nothing else. Over a 20k prefix the automatic
+  T is the old 80k; over 63k it is ~123k. Setting `ONEPASS_TRIP_TOKENS` still pins it. The log
+  gains a `threshold` entry saying what was measured, and every request entry records the T it
+  ran under.
+- **The stub legend rides in the system prompt.** One text block appended after the client's
+  own blocks on every request that carries a stub — identical each time, and stubs are
+  monotonic, so from the first trip on it lives in the cached prefix; a session that never
+  trips still goes upstream byte for byte. Its old home, the
+  `recall_search` description, is invisible whenever Claude Code defers MCP schemas behind
+  ToolSearch (2.1.258 on) — the agent saw stubs it had never been told about, and re-read the
+  file rather than recall it. The legend also says how to load the deferred tools.
+
 ## 0.3.0
 
 The first published release: `npm i -g onepass-proxy`, then `claudep` instead of `claude`.

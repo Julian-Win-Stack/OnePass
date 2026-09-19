@@ -163,10 +163,11 @@ export function describeSettings(settings: ProxySettings | null | undefined): st
       : settings.batchMinTokens === 0
         ? "batch minimum off"
         : `batch minimum ${tokens(settings.batchMinTokens)} tokens`;
-  return (
-    `T = ${tokens(settings.tripTokens)} tokens, N = ${settings.evictAfterTurns}, ` +
-    `K = ${settings.protectLastTurns}, ${batchMin}`
-  );
+  const trip =
+    typeof settings.tripTokens === "number"
+      ? `T = ${tokens(settings.tripTokens)} tokens`
+      : `T = automatic (floor + ${tokens(settings.tripTokens.auto.headroomTokens)} tokens headroom)`;
+  return `${trip}, N = ${settings.evictAfterTurns}, K = ${settings.protectLastTurns}, ${batchMin}`;
 }
 
 /** Both known and alike in every field. Unknown settings match nothing, not even each other. */
@@ -175,7 +176,7 @@ export function sameSettings(one: ProxySettings | null | undefined, other: Proxy
   return (
     one.evictAfterTurns === other.evictAfterTurns &&
     one.protectLastTurns === other.protectLastTurns &&
-    one.tripTokens === other.tripTokens &&
+    JSON.stringify(one.tripTokens) === JSON.stringify(other.tripTokens) &&
     one.batchMinTokens === other.batchMinTokens
   );
 }

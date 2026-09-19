@@ -38,10 +38,11 @@ export interface EvictionConfig {
    */
   batchMinTokens: number;
   /**
-   * Chars-per-token ratio used to convert body size to tokens. The server calibrates this
-   * from the API's reported usage on the previous response; 4 is the uncalibrated fallback.
-   * Real code averages ~3.2, so chars ÷ 4 alone under-counts by ~25% — enough to let a
-   * session cross the client's compaction threshold while the estimate still looks safe.
+   * Chars-per-token ratio used to convert body size to tokens, measured on billable chars (see
+   * `billableChars`). The server calibrates this from the API's reported usage on the previous
+   * response; 4 is the uncalibrated fallback. A real conversation body runs ~2.1–2.5 billable
+   * chars per token (docs/findings.md §23), so chars ÷ 4 alone under-counts by ~40% — enough to
+   * let a session cross the client's compaction threshold while the estimate still looks safe.
    */
   charsPerToken: number;
 }
@@ -77,6 +78,8 @@ export interface EvictionOutcome {
   newlyEvictedCharsRemoved: number;
   estimatedTokensBefore: number;
   estimatedTokensSent: number;
+  /** Billable chars of the body as returned — what the API's usage for it is measured against. */
+  billableCharsSent: number;
   /**
    * Tokens a trip would have newly evicted but held back, because they came to less than the
    * batch minimum. Absent when nothing was held back.
@@ -87,6 +90,13 @@ export interface EvictionOutcome {
    * eviction; it is how a reader learns the floor has outgrown what eviction can hold.
    */
   aboveAlarmLine: boolean;
+  /**
+   * Chars a later trip could still take out of the body as sent: every candidate segment left
+   * live on this request, each counted at what its stub would save. What the API reports for
+   * this request minus these, at the calibrated ratio, is the floor — the part of the request
+   * eviction can never reach — which is what the server sizes an automatic T from.
+   */
+  evictableCharsSent: number;
 }
 
 /**
@@ -125,13 +135,77 @@ export function formatThousands(n: number): string {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-export function estimateTokens(value: unknown, charsPerToken = 4): number {
+/**
+ * Drops what the API does not charge for. A thinking block's `signature` is an opaque token
+ * the API reads back to verify the block and bills at zero — replayed thinking costs its
+ * generated count, never its signature's length (docs/findings.md §15). Claude Code sends
+ * thinking with `display: "omitted"`, so those signatures are the only thing a thinking block
+ * carries, and on a long session they were ~60% of the bytes in the body (§23). Counting them
+ * made every request look up to three times its billed size, which is the difference between
+ * a proxy that evicts what has aged and one that strips the conversation down to the last K
+ * turns on every request.
+ */
+function omitUnbilled(this: unknown, key: string, value: unknown): unknown {
+  return key === "signature" && isRecord(this) && this.type === "thinking" ? undefined : value;
+}
+
+/** Chars the API will tokenize: the JSON of `value` less what `omitUnbilled` drops. */
+export function billableChars(value: unknown): number {
   try {
-    const json = JSON.stringify(value);
-    return json === undefined ? 0 : Math.round(json.length / charsPerToken);
+    const json = JSON.stringify(value, omitUnbilled);
+    return json === undefined ? 0 : json.length;
   } catch {
     return 0;
   }
+}
+
+export function estimateTokens(value: unknown, charsPerToken = 4): number {
+  return Math.round(billableChars(value) / charsPerToken);
+}
+
+/**
+ * The stub legend, one text block the proxy appends to the system prompt of every request that
+ * carries a stub. Identical each time, and stubs are monotonic, so from the first trip on it sits
+ * inside the cached prefix and costs nothing per turn. It exists because the legend's other
+ * home — the `recall_search` tool's description — is invisible to the agent whenever Claude
+ * Code defers MCP tool schemas behind ToolSearch, which it has since 2.1.258: the agent then
+ * sees stubs it was never told about, never learns recall can fetch the content back, and
+ * re-reads the file instead. One session re-read one file 28 times and called recall 0 times
+ * before this existed (docs/findings.md §23).
+ */
+export const STUB_LEGEND =
+  "Onepass is managing this session's context. " +
+  "A block reading `[onepass: evicted N chars]`, a tool call whose input is `{}`, or a marker starting " +
+  "`[onepass: evicted attached file` or `[onepass: evicted task notification` is content the Onepass " +
+  "proxy removed from this request to keep your context small. Nothing is lost: the original is intact " +
+  "on disk. For a file's or command's current state, read the file or re-run the command. For what " +
+  "the removed content said at the time, use the `recall_search` and `recall_get` tools of the " +
+  "`onepass` MCP server; if they are deferred, load them first with ToolSearch " +
+  "(`select:mcp__onepass__recall_search,mcp__onepass__recall_get`). Never copy a stub's shape into " +
+  "a call of your own.";
+
+/**
+ * The body with the legend as its last system block. A string system prompt gains it as a
+ * trailing paragraph. The messages array is the mark of a body this proxy transforms; anything
+ * else passes through as it was. Idempotent: a body that already ends in the legend is returned
+ * as the same reference.
+ */
+export function addStubLegend(body: unknown): { body: unknown; changed: boolean } {
+  if (!isRecord(body) || !Array.isArray(body.messages)) return { body, changed: false };
+  const system = body.system;
+  if (system === undefined || system === null) {
+    return { body: { ...body, system: [{ type: "text", text: STUB_LEGEND }] }, changed: true };
+  }
+  if (typeof system === "string") {
+    if (system.endsWith(STUB_LEGEND)) return { body, changed: false };
+    return { body: { ...body, system: `${system}\n\n${STUB_LEGEND}` }, changed: true };
+  }
+  if (Array.isArray(system)) {
+    const last = system[system.length - 1];
+    if (isRecord(last) && last.text === STUB_LEGEND) return { body, changed: false };
+    return { body: { ...body, system: [...system, { type: "text", text: STUB_LEGEND }] }, changed: true };
+  }
+  return { body, changed: false };
 }
 
 export function measureContentChars(content: unknown): number {
@@ -430,7 +504,8 @@ export function evictContextSegments(
   alreadyEvictedIds: ReadonlySet<string>,
   config: EvictionConfig,
 ): EvictionOutcome {
-  const estimatedTokensBefore = estimateTokens(body, config.charsPerToken);
+  const billableCharsBefore = billableChars(body);
+  const estimatedTokensBefore = Math.round(billableCharsBefore / config.charsPerToken);
   const isAboveAlarmLine = (tokensSent: number): boolean =>
     tokensSent > config.tripThresholdTokens + ALARM_LINE_MARGIN_TOKENS;
   const passthrough: EvictionOutcome = {
@@ -444,7 +519,9 @@ export function evictContextSegments(
     newlyEvictedCharsRemoved: 0,
     estimatedTokensBefore,
     estimatedTokensSent: estimatedTokensBefore,
+    billableCharsSent: billableCharsBefore,
     aboveAlarmLine: isAboveAlarmLine(estimatedTokensBefore),
+    evictableCharsSent: 0,
   };
   if (!isRecord(body) || !Array.isArray(body.messages)) return passthrough;
 
@@ -522,11 +599,15 @@ export function evictContextSegments(
 
   const newlyEvictedIds = [...afterNew.stubbedIds, ...afterPressure.stubbedIds];
   const stubbedIds = [...afterExisting.stubbedIds, ...newlyEvictedIds];
-  if (stubbedIds.length === 0) return { ...passthrough, overThreshold, ...heldBack };
+  const stubbed = new Set(stubbedIds);
+  const evictableCharsSent = candidates.reduce(
+    (sum, segment) => (stubbed.has(segment.id) ? sum : sum + segment.contentChars - stubbedChars(segment)),
+    0,
+  );
+  if (stubbedIds.length === 0) return { ...passthrough, overThreshold, ...heldBack, evictableCharsSent };
 
   // A pair earns a suffix only when both halves were stubbed on this request: a live result
   // still names its own file, and a live call still carries its own input.
-  const stubbed = new Set(stubbedIds);
   const suffixByToolUseId = new Map<string, string>();
   for (const segment of candidates) {
     if (segment.kind !== "call" || !stubbed.has(segment.id) || !stubbed.has(segment.toolUseId)) continue;
@@ -535,7 +616,8 @@ export function evictContextSegments(
   const namedMessages = nameEvictedCallsInResultStubs(afterPressure.messages, suffixByToolUseId);
 
   const finalBody = { ...body, messages: namedMessages };
-  const estimatedTokensSent = estimateTokens(finalBody, config.charsPerToken);
+  const billableCharsSent = billableChars(finalBody);
+  const estimatedTokensSent = Math.round(billableCharsSent / config.charsPerToken);
   return {
     body: finalBody,
     bodyChanged: true,
@@ -547,7 +629,9 @@ export function evictContextSegments(
     newlyEvictedCharsRemoved: afterNew.charsRemoved + afterPressure.charsRemoved,
     estimatedTokensBefore,
     estimatedTokensSent,
+    billableCharsSent,
     ...heldBack,
     aboveAlarmLine: isAboveAlarmLine(estimatedTokensSent),
+    evictableCharsSent,
   };
 }

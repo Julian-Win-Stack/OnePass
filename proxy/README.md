@@ -95,11 +95,27 @@ attached file, N chars]`, its path left in the `Called the Read tool` reminder n
 which is never evicted. Only a task notification still names its target (`[onepass: evicted
 task notification abc123, N chars; output at /tmp/out/task.log]`), because nothing else in
 the request carries the task id or its output path. How to get any of it back is one
-paragraph in the recall tool's own description, where it is prompt-cached and costs nothing
-per turn — so it is not repeated in every stub. Naming the target in every stub is what made
+paragraph — the stub legend — that the proxy appends as the last block of the system prompt
+of every request that carries a stub. Stubs are monotonic, so from the first trip on it is in
+every request, identical each time, inside the cached prefix and costing nothing per turn; a
+session that never trips never sees it and goes upstream byte for byte. It is not repeated in
+every stub. Naming the target in every stub is what made
 stubs 12% of the measured peak request (docs/findings.md §15). A result now stubs to about 30
 chars whatever it held, and a call to 2 — plus the ~30-char suffix its result's stub gains,
 which is charged to the call whether the result takes it or not.
+
+The legend lives in the system prompt and not only in the recall tool's description because
+Claude Code defers MCP tool schemas behind ToolSearch (2.1.258 and later): the agent sees the
+tool's name and never its description, so a legend kept there is a legend it never reads. One
+session met its stubs with no idea what they were, re-read one file 28 times, and called recall
+not once (docs/findings.md §23). The legend also says how to load the deferred tools.
+
+The request is sized in **billable** chars: a thinking block's `signature` is dropped before
+counting, because the API bills replayed thinking at its generated count and the signature at
+nothing (§15). Claude Code sends thinking with `display: "omitted"`, so signatures are all a
+thinking block carries, and on a long session they were ~60% of the body — counted, they had
+the proxy sizing requests at up to three times what the API charged, and evicting on every
+one of them (§23).
 
 A stub is only applied when it saves at least `ONEPASS_MIN_SAVED_CHARS`. The saving is
 measured on the finished stub, not the raw segment, so a segment that stubs to no less than
@@ -146,9 +162,15 @@ a base URL whose host is not `api.anthropic.com` makes it cap native-1M models (
 first-party — it is, the proxy forwards to `api.anthropic.com`. Details under "Known Claude
 Code interactions".
 
-One proxy serves one session. Its evicted-id set, its chars-per-token calibration and its log
-are per-process, so two sessions sharing a proxy put one session's stubs into the other's
-request. `claudep` exists so you never have to think about this.
+One proxy serves one session. Its evicted-id set, its chars-per-token calibration, its measured
+T and its log are per-process, so two sessions sharing a proxy put one session's stubs into
+the other's request. `claudep` exists so you never have to think about this.
+
+The calibration takes its samples from the conversation only: a response counts when its
+context is at least half the largest the proxy has seen. Claude Code's side calls — titles,
+warm-ups — are plain prose at ~4 chars per token, where the conversation, code plus the
+replayed thinking the body never shows, runs nearer 2.3; a side call setting the ratio put the
+conversation's estimates 40% low, or with signatures counted 3× high (docs/findings.md §23).
 
 To register recall by hand, add it to your MCP config with the session id in its environment:
 
@@ -172,7 +194,8 @@ To register recall by hand, add it to your MCP config with the session id in its
 | `ONEPASS_UPSTREAM` | `https://api.anthropic.com` | Where requests are forwarded |
 | `ONEPASS_EVICT_AFTER_TURNS` | `8` | N: a tool result is eligible once ≥ N assistant messages follow it |
 | `ONEPASS_PROTECT_LAST_TURNS` | `4` | K: results inside the last K assistant turns are never touched |
-| `ONEPASS_TRIP_TOKENS` | `80000` | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Mid-session, peaks run well over T: at T=110k the measured peak was 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The default moved 110k → 80k once the batch minimum existed, because a lower T then costs a handful of larger trips instead of a swarm of small ones (§21). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it — once the floor is above T, no value of T brings the peak down: one recorded session peaked at 150,811 tokens at T=110k and at T=80k alike. Size T so `T + 60k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) — then watch the alarm line in your log, because `T + 60k` is a rule of thumb and not a guarantee: once the floor is above T the peak is the floor's, and one recorded session peaked at T + 76k |
+| `ONEPASS_HEADROOM_TOKENS` | `60000` | Room above the floor before eviction starts, when T is automatic (below). 60k is N turns of tool results before the first trip plus the batch a trip holds back under the minimum. Over the ~20k prefix of a bare project it gives the old default of 80k exactly; over the 63k prefix of a large one it gives ~123k, where a fixed 80k left 17k of room, fired the pressure pass on every request and left the agent with its last K turns (docs/findings.md §23). Tune this, not T: it is the gap that decides how much the agent keeps, and the gap is what a fixed T gets wrong for every prefix size but one |
+| `ONEPASS_TRIP_TOKENS` | auto | T: new ids are evicted only when the projected request size, in **real tokens**, exceeds this (measured after re-applying existing stubs). Unset, T is measured: the first conversation-sized request's size as the API reports it, less what eviction could still take from it, plus `ONEPASS_HEADROOM_TOKENS` — the log's `threshold` line says what it came to, and until it is measured T is 80k. Set it to pin T for the whole session instead. Mid-session, peaks run well over T: at T=110k the measured peak was 140,253 across 588 assistant turns, with no turn above 150k (docs/findings.md §17). The default moved 110k → 80k once the batch minimum existed, because a lower T then costs a handful of larger trips instead of a swarm of small ones (§21). The un-evictable floor (system + last-K turns + small results) still grows with the session and is what eventually bounds it — once the floor is above T, no value of T brings the peak down: one recorded session peaked at 150,811 tokens at T=110k and at T=80k alike. Size T so `T + 60k` clears your effective compact line (`window − 13k`; the window is 1M with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` in the launch command, 200k without it) — then watch the alarm line in your log, because `T + 60k` is a rule of thumb and not a guarantee: once the floor is above T the peak is the floor's, and one recorded session peaked at T + 76k |
 | `ONEPASS_BATCH_MIN_TOKENS` | `20000` | The least a trip may newly evict. A smaller batch is held back, and that content waits for a later request where the batch has grown past the minimum; `0` turns it off. Every trip rewrites the prompt cache, and a cache write costs 1.25× base input against a cache read's 0.1×, so trips are the proxy's main running cost. Without a minimum, a session whose floor has passed T trips on nearly every request for a few hundred tokens each: on one recording at T=80k, **50 trips in 68 requests, against 1** with the default minimum (§21) |
 | `ONEPASS_MIN_SAVED_CHARS` | `50` | A segment is stubbed only when its finished stub is at least this many chars smaller than the content. The stub's own cost decides, so no fixed size floor is needed |
 | `ONEPASS_SESSION_ID` | unset | Which session's transcript `recall` reads. `claudep` sets it; without it recall falls back to the newest transcript for the current directory |
@@ -206,11 +229,12 @@ To register recall by hand, add it to your MCP config with the session id in its
   breaks.
 - T is denominated in **real tokens**, not chars ÷ 4. The proxy reads the `usage` object out
   of every API response it forwards (stripping `accept-encoding` on those requests so the
-  body is scannable) and calibrates a live chars-per-token ratio. Measured on real traffic:
-  2.1–2.7 chars per token for `.d.ts`-heavy content and ~3.2 for mixed code, so a fixed ÷ 4
-  under-counts by 25–40% — enough to cross Claude Code's compaction threshold while the
-  estimate still looks safe. Until the first sample the fallback is a deliberately
-  conservative 3.2.
+  body is scannable) and calibrates a live chars-per-token ratio, on billable chars — thinking
+  signatures left out — and from conversation-sized responses only. Measured on real traffic a
+  conversation body runs ~2.1–2.5 billable chars per token (code, plus the replayed thinking
+  the body never shows), so a fixed ÷ 4 under-counts by ~40% — enough to cross Claude Code's
+  compaction threshold while the estimate still looks safe. Until the first sample the fallback
+  is a deliberately conservative 2.5.
 - **Pressure pass**: a burst of large reads in quick succession is younger than N and
   normally un-evictable. If the normal pass leaves the request over T, the age gate relaxes
   down to K for that trip — only the last K turns are ever untouchable. Without this, a

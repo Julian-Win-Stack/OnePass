@@ -9,8 +9,9 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { createProxyServer } from "./server.js";
-import type { ProxyLogEntry, RequestLogEntry } from "./log.js";
+import { createProxyServer, DEFAULT_TRIP_TOKENS } from "./server.js";
+import { STUB_LEGEND } from "./evict.js";
+import type { ProxyLogEntry, RequestLogEntry, ThresholdLogEntry } from "./log.js";
 
 interface RecordedRequest {
   method: string;
@@ -26,12 +27,14 @@ let sseGate: Promise<void> = Promise.resolve();
 const STREAMED_USAGE = { input_tokens: 7, cache_creation_input_tokens: 11, cache_read_input_tokens: 400 };
 
 /**
- * The stub reports usage at 2 chars per token so calibration is observable, split across the
- * three fields the speed gauge reads. Cache creation stays a small share, so a plain request
- * is not classified as a rebuild.
+ * The stub reports usage at 2 chars per token so calibration is observable — or at whatever
+ * ratio the request's `x-test-chars-per-token` header names, so one test can send the proxy a
+ * side request at a different rate than the conversation. Split across the three fields the
+ * speed gauge reads. Cache creation stays a small share, so a plain request is not classified
+ * as a rebuild.
  */
-function stubUsage(requestBytes: number): Record<string, number> {
-  const total = Math.round(requestBytes / 2);
+function stubUsage(requestBytes: number, charsPerToken = 2): Record<string, number> {
+  const total = Math.round(requestBytes / charsPerToken);
   const cacheRead = Math.round(total * 0.8);
   const cacheCreation = Math.round(total * 0.15);
   return {
@@ -64,9 +67,11 @@ const upstream = http.createServer((request, response) => {
     } else {
       const isMessages = (request.url ?? "").split("?")[0] === "/v1/messages";
       response.writeHead(200, { "content-type": "application/json", "x-upstream": "stub" });
+      const ratioHeader = request.headers["x-test-chars-per-token"];
+      const ratio = typeof ratioHeader === "string" ? Number(ratioHeader) : 2;
       response.end(
         isMessages
-          ? JSON.stringify({ ok: true, echoPath: request.url, usage: stubUsage(body.byteLength) })
+          ? JSON.stringify({ ok: true, echoPath: request.url, usage: stubUsage(body.byteLength, ratio) })
           : JSON.stringify({ ok: true, echoPath: request.url }),
       );
     }
@@ -223,10 +228,11 @@ test("forwards non-messages requests verbatim and returns the upstream response"
   assert.equal(seen.headers.host, `127.0.0.1:${upstreamPort}`);
 });
 
-test("forwards /v1/messages byte-for-byte when nothing is stubbed", async () => {
+test("forwards /v1/messages byte-for-byte when nothing is stubbed — no legend on a request without a stub", async () => {
   const body = JSON.stringify({
     model: "claude-test",
     max_tokens: 100,
+    system: [{ type: "text", text: "You are a test.", cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: "hello" }],
   });
   const response = await sendRequest(proxyOrigin, "/v1/messages", {
@@ -321,6 +327,117 @@ test("calibrates chars-per-token from the API's reported usage", async () => {
   const last = await loggedRequestSince("/v1/messages", mark);
   assert.ok(last.charsPerToken !== undefined, "request log entry should record charsPerToken");
   assert.ok(Math.abs(last.charsPerToken - 2) < 0.1, `expected ~2 chars/token, got ${last.charsPerToken}`);
+});
+
+test("a side request smaller than half the conversation does not move the ratio the conversation set", async () => {
+  // Its own proxy: the shared one has a calibration history of its own by now.
+  const ownLog = join(mkdtempSync(join(tmpdir(), "onepass-proxy-test-")), "proxy.log.jsonl");
+  const server = createProxyServer({
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    evictAfterAssistantTurns: 2,
+    protectLastAssistantTurns: 1,
+    minSavedChars: 50,
+    tripThresholdTokens: 1_000_000,
+    batchMinTokens: 0,
+    logFilePath: ownLog,
+    quiet: true,
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${listeningPort(server)}`;
+  const post = (chars: number, charsPerToken: number): Promise<SimpleResponse> =>
+    sendRequest(origin, "/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-test-chars-per-token": String(charsPerToken) },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "c".repeat(chars) }] }),
+    });
+  const loggedRatios = async (count: number): Promise<number[]> => {
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const entries = existsSync(ownLog)
+        ? readFileSync(ownLog, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as ProxyLogEntry)
+        : [];
+      const ratios = entries.flatMap((entry) => (entry.kind === "request" && entry.charsPerToken !== undefined ? [entry.charsPerToken] : []));
+      if (ratios.length >= count) return ratios;
+      assert.ok(Date.now() < deadline, `logged ${ratios.length} ratios, expected ${count}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  try {
+    // The conversation: 40,000 chars the stub bills at 2 per token, 20,000 tokens. It teaches 2.
+    await post(40_000, 2);
+    // A side call of 8,000 chars billed at 4 per token: 2,000 tokens, over the old floor of 1,000
+    // and under half of 20,000. Before, this set the ratio to 4 for the conversation's next request.
+    await post(8_000, 4);
+    // The conversation again: a sample at 2 per token, taken because it is conversation-sized.
+    await post(40_000, 2);
+    const ratios = await loggedRatios(3);
+    const [afterNothing, afterConversation, afterSideCall] = ratios;
+    assert.equal(afterNothing, 2.5, "the first request runs at the uncalibrated fallback");
+    assert.ok(Math.abs((afterConversation ?? 0) - 2) < 0.05, `the conversation taught ${afterConversation}`);
+    assert.ok(Math.abs((afterSideCall ?? 0) - 2) < 0.05, `the side call moved the ratio to ${afterSideCall}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("an automatic T is the first conversation request's floor plus the headroom, and holds from then on", async () => {
+  const ownLog = join(mkdtempSync(join(tmpdir(), "onepass-proxy-test-")), "proxy.log.jsonl");
+  const headroomTokens = 10_000;
+  const server = createProxyServer({
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    evictAfterAssistantTurns: 2,
+    protectLastAssistantTurns: 1,
+    minSavedChars: 50,
+    tripThresholdTokens: "auto",
+    headroomTokens,
+    batchMinTokens: 0,
+    logFilePath: ownLog,
+    quiet: true,
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${listeningPort(server)}`;
+  const entriesOf = (): ProxyLogEntry[] =>
+    existsSync(ownLog)
+      ? readFileSync(ownLog, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as ProxyLogEntry)
+      : [];
+  const requestEntries = async (count: number): Promise<RequestLogEntry[]> => {
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const requests = entriesOf().filter((entry): entry is RequestLogEntry => entry.kind === "request");
+      if (requests.length >= count) return requests;
+      assert.ok(Date.now() < deadline, `logged ${requests.length} requests, expected ${count}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  try {
+    // A conversation-sized first request: 60,000 chars of typed text eviction may never touch —
+    // the floor — and one aged 5,000-char result it could take. The stub bills at 2 per token.
+    const conversation = JSON.parse(agedConversation()) as { messages: unknown[] };
+    const send = (): Promise<SimpleResponse> =>
+      sendRequest(origin, "/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...conversation, messages: [{ role: "user", content: "p".repeat(60_000) }, ...conversation.messages] }),
+      });
+    await send();
+    await send();
+    const [first, second] = await requestEntries(2);
+    const threshold = entriesOf().find((entry): entry is ThresholdLogEntry => entry.kind === "threshold");
+
+    assert.equal(first?.tripThresholdTokens, DEFAULT_TRIP_TOKENS, "until the floor is measured T is the default");
+    assert.ok(threshold, "the floor was never measured");
+    assert.equal(threshold.headroomTokens, headroomTokens);
+    assert.equal(threshold.tripThresholdTokens, threshold.floorTokens + headroomTokens);
+    // The floor is what the API reported less the one evictable result, (5,000 − 30) chars at the
+    // ratio this very response calibrated (~2): about 2,485 tokens under the measured size.
+    const evictable = threshold.measuredTokens - threshold.floorTokens;
+    assert.ok(Math.abs(evictable - 2_485) < 60, `floor left ${evictable} tokens for the evictable result`);
+    assert.ok(threshold.measuredTokens > 30_000, `measured ${threshold.measuredTokens}: the request was not conversation-sized`);
+    assert.equal(second?.tripThresholdTokens, threshold.tripThresholdTokens, "the second request runs at the measured T");
+    assert.equal(entriesOf().filter((entry) => entry.kind === "threshold").length, 1, "the floor is read once");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("logs the speed gauge: proxy time, first byte, and the cache numbers from usage", async () => {
@@ -458,9 +575,9 @@ test("a batch held back under the minimum, and a request above the alarm line, b
   });
   await new Promise<void>((resolve) => batchingProxy.listen(0, "127.0.0.1", resolve));
   try {
-    // The aged 5,000-char result is the whole batch: (5,000 − 30) chars at the uncalibrated 3.2
-    // chars per token is 1,553 tokens, far under the minimum. The 200,000 chars of typed text in
-    // front of it are ~62k tokens the rules may never touch, which is over T = 0 plus 40k.
+    // The aged 5,000-char result is the whole batch: (5,000 − 30) chars at the uncalibrated 2.5
+    // chars per token is 1,988 tokens, far under the minimum. The 200,000 chars of typed text in
+    // front of it are ~80k tokens the rules may never touch, which is over T = 0 plus 40k.
     const conversation = JSON.parse(agedConversation()) as { messages: unknown[] };
     const body = JSON.stringify({
       ...conversation,
@@ -484,12 +601,38 @@ test("a batch held back under the minimum, and a request above the alarm line, b
     assert.ok(request, "the proxy logged no request entry");
     assert.equal(request.overThreshold, true);
     assert.equal(request.newlyEvictedCount, 0);
-    assert.equal(request.heldBackTokens, 1_553);
+    assert.equal(request.heldBackTokens, 1_988);
     assert.equal(request.aboveAlarmLine, true);
     assert.equal(entries.filter((entry) => entry.kind === "trip").length, 0, "a held-back batch is not a trip");
   } finally {
     await new Promise<void>((resolve) => batchingProxy.close(() => resolve()));
   }
+});
+
+test("a request that carries a stub carries the legend as its last system block, on count_tokens too", async () => {
+  // Its own tool_use id: the shared proxy's evicted set must not learn `toolu_big` from here.
+  const conversation = JSON.parse(agedConversation().replaceAll("toolu_big", "toolu_legend")) as Record<string, unknown>;
+  const clientSystem = [{ type: "text", text: "You are a test.", cache_control: { type: "ephemeral" } }];
+  await sendRequest(proxyOrigin, "/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...conversation, system: clientSystem }),
+  });
+  const forwarded = JSON.parse(lastRecorded().body.toString("utf8")) as {
+    system: unknown[];
+    messages: { content: { content?: unknown }[] }[];
+  };
+  assert.equal(forwarded.messages[1]?.content[0]?.content, "[onepass: evicted 5,000 chars]", "the request carries a stub");
+  // After the client's own blocks and their cache breakpoint, so the prefix the client built is
+  // the same bytes it was.
+  assert.deepEqual(forwarded.system, [...clientSystem, { type: "text", text: STUB_LEGEND }]);
+
+  await sendRequest(proxyOrigin, "/v1/messages/count_tokens", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...conversation, system: "Be brief." }),
+  });
+  assert.equal((JSON.parse(lastRecorded().body.toString("utf8")) as { system: string }).system, `Be brief.\n\n${STUB_LEGEND}`);
 });
 
 /** The same shape one turn later: a big Edit call whose result is a short confirmation. */
@@ -616,11 +759,19 @@ test("a user's paste goes upstream untouched while the tool result beside it is 
       assert.equal(sent[0]?.content[0]?.text, PASTED_USER_TEXT);
       assert.equal(sent[2]?.content[0]?.content, "[onepass: evicted 5,000 chars]");
     }
-    const evictedIds = readFileSync(logPath, "utf8")
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .map((line) => JSON.parse(line) as ProxyLogEntry)
-      .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    // The writer opens its stream lazily and flushes on its own schedule, so the trip entry can
+    // still be in flight when the second response has already reached the client — on a slow
+    // runner reading the file once found nothing at all. Wait for the one trip this proxy makes.
+    const deadline = Date.now() + 2000;
+    let evictedIds: string[] = [];
+    while (evictedIds.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      evictedIds = (existsSync(logPath) ? readFileSync(logPath, "utf8") : "")
+        .split("\n")
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line) as ProxyLogEntry)
+        .flatMap((entry) => (entry.kind === "trip" ? entry.addedToolUseIds : []));
+    }
     assert.deepEqual(evictedIds, ["toolu_read"], "the paste's content hash must never enter the set");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

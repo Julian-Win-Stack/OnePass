@@ -14,9 +14,12 @@ Order is load-bearing. Eviction without recall must be timid, which is why the e
 implementations do not prevent compaction. See [docs/findings.md](docs/findings.md) §6.
 
 `proxy/src/recall.ts` is the recall MCP server, published with the proxy: `.mcp.json` registers it
-for work in this repo, and `claudep` registers it per session with that session's id. Its
-`recall_search` description carries the legend for the proxy's stubs. `spike/` keeps only the
-throwaway parts — the librarian subagent (`librarian.md`) and the harness that raced them.
+for work in this repo, and `claudep` registers it per session with that session's id. The legend
+for the proxy's stubs is `STUB_LEGEND` in `proxy/src/evict.ts`, appended to the system prompt of
+every request that carries a stub — its `recall_search` description repeats it, but Claude Code defers MCP tool
+descriptions behind ToolSearch, so the description alone is never read (docs/findings.md §23).
+`spike/` keeps only the throwaway parts — the librarian subagent (`librarian.md`) and the
+harness that raced them.
 
 The proxy runs compiled `dist/`, not `src/`, and it reads no git — uncommitted edits go live once
 built, and switching branches changes what runs. It is not a background service — `claudep`

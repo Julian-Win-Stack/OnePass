@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
-import { createProxyServer } from "./server.js";
+import { createProxyServer, DEFAULT_HEADROOM_TOKENS, DEFAULT_TRIP_TOKENS } from "./server.js";
 import { newProxyLogPath } from "./log.js";
 
 if (process.argv.includes("--version")) {
@@ -31,10 +31,15 @@ const config = {
   upstreamUrl: process.env.ONEPASS_UPSTREAM ?? "https://api.anthropic.com",
   evictAfterAssistantTurns: envInt("ONEPASS_EVICT_AFTER_TURNS", 8),
   protectLastAssistantTurns: envInt("ONEPASS_PROTECT_LAST_TURNS", 4),
-  // 80k, not the 110k this shipped with: with a batch minimum in front of it, a lower threshold
-  // buys a flatter curve for a handful of larger trips rather than a swarm of small ones
-  // (docs/findings.md §21). Below it the proxy is inert, so T is what decides when it starts.
-  tripThresholdTokens: envInt("ONEPASS_TRIP_TOKENS", 80_000),
+  // Automatic unless pinned: the floor the first conversation request reports, plus headroom.
+  // A fixed T fits one prefix size only — 80k over a 63k prefix left 17k of room and the agent
+  // with its last K turns (docs/findings.md §23). Below T the proxy is inert, so T is what
+  // decides when it starts; the headroom is what decides how much room it leaves.
+  tripThresholdTokens:
+    process.env.ONEPASS_TRIP_TOKENS === undefined || process.env.ONEPASS_TRIP_TOKENS === ""
+      ? ("auto" as const)
+      : envInt("ONEPASS_TRIP_TOKENS", DEFAULT_TRIP_TOKENS),
+  headroomTokens: envInt("ONEPASS_HEADROOM_TOKENS", DEFAULT_HEADROOM_TOKENS),
   batchMinTokens: envInt("ONEPASS_BATCH_MIN_TOKENS", 20_000),
   minSavedChars: envInt("ONEPASS_MIN_SAVED_CHARS", 50),
   logFilePath: newProxyLogPath(),
@@ -56,9 +61,13 @@ server.listen(port, host, () => {
   const boundPort = (server.address() as AddressInfo).port;
   console.log(`[onepass] eviction proxy listening on http://${host}:${boundPort}`);
   console.log(`[onepass] upstream: ${config.upstreamUrl}`);
+  const threshold =
+    config.tripThresholdTokens === "auto"
+      ? `T=auto (floor + ${config.headroomTokens} headroom; ${DEFAULT_TRIP_TOKENS} until the floor is measured)`
+      : `T=${config.tripThresholdTokens}`;
   console.log(
     `[onepass] evict after N=${config.evictAfterAssistantTurns} assistant turns, ` +
-      `protect last K=${config.protectLastAssistantTurns}, trip over T=${config.tripThresholdTokens} real tokens (live-calibrated), ` +
+      `protect last K=${config.protectLastAssistantTurns}, trip over ${threshold} real tokens (live-calibrated), ` +
       `min chars saved per stub ${config.minSavedChars}, batch min ${config.batchMinTokens} tokens`,
   );
   console.log(`[onepass] log: ${config.logFilePath}`);

@@ -108,9 +108,9 @@ test("a request over the threshold trips the build and comes back stubbed", asyn
   assert.deepEqual(listed, ["1/1 req-0001"], "each request is offered to the caller as it goes");
   assert.equal(outcome.overThreshold, true);
   assert.equal(outcome.newlyEvicted, 1);
-  // (600,000 − 32) chars at the proxy's uncalibrated 3.2 chars per token: what the trip took, in the
+  // (600,000 − 32) chars at the proxy's uncalibrated 2.5 chars per token: what the trip took, in the
   // unit T and the batch minimum are written in.
-  assert.equal(outcome.newlyEvictedTokens, 187_490);
+  assert.equal(outcome.newlyEvictedTokens, 239_987);
   assert.equal(outcome.heldBackTokens, null);
   assert.equal(outcome.aboveAlarmLine, false, "the stub brought it far under T + 40k");
   // One evictable block in the request, so one stub — and the stub itself is what the model would
@@ -164,8 +164,8 @@ test("a request over the line whose content is too young to take says so, rather
 });
 
 test("a batch under the minimum is held back, and a request over T + 40k says it is above the alarm line", async () => {
-  // 700,000 chars of typed text are ~219k tokens the rules may never take. The one block they may,
-  // a 10,000-char result, frees (10,000 − 31) ÷ 3.2 = 3,115 tokens: under a 20k minimum.
+  // 700,000 chars of typed text are ~280k tokens the rules may never take. The one block they may,
+  // a 10,000-char result, frees (10,000 − 31) ÷ 2.5 = 3,988 tokens: under a 20k minimum.
   const [outcome] = (await replayRecordings({
     ...options(recordingOf([{ chars: 10_000, typedChars: 700_000 }]), []),
     childEnv: { ONEPASS_TRIP_TOKENS: "110000", ONEPASS_BATCH_MIN_TOKENS: "20000" },
@@ -174,7 +174,7 @@ test("a batch under the minimum is held back, and a request over T + 40k says it
   assert.equal(outcome.overThreshold, true);
   assert.equal(outcome.newlyEvicted, 0);
   assert.equal(outcome.newlyEvictedTokens, 0);
-  assert.equal(outcome.heldBackTokens, 3_115);
+  assert.equal(outcome.heldBackTokens, 3_988);
   assert.equal(outcome.aboveAlarmLine, true);
 });
 
@@ -198,9 +198,10 @@ test("a recording that carries the real API's ratios is answered at them, so the
 
   assert.deepEqual(
     outcomes.map((one) => one.charsPerToken),
-    // 3.2 before any answer; 2.5 taught by the first; the count-tokens request carries no ratio of its
-    // own, so the fake stays at the last one and teaches it again; then 5.
-    [3.2, 2.5, 2.5, 5],
+    // 2.5 before any answer, the uncalibrated fallback; 2.5 taught by the first; the count-tokens
+    // request carries no ratio of its own, so the fake stays at the last one and teaches it again;
+    // then 5.
+    [2.5, 2.5, 2.5, 5],
   );
 
   const plain = await replayRecordings(options(recordingOf([{ chars: 8_000 }, { chars: 8_000 }]), []));

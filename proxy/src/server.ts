@@ -4,6 +4,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ALARM_LINE_MARGIN_TOKENS,
+  addStubLegend,
+  billableChars,
   evictContextSegments,
   formatThousands,
   type EvictionConfig,
@@ -20,19 +22,47 @@ import {
 } from "./speed.js";
 
 /** charsPerToken is calibrated live from API responses, not configured. */
-export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken"> {
+export interface ProxyConfig extends Omit<EvictionConfig, "charsPerToken" | "tripThresholdTokens"> {
   upstreamUrl: string;
   logFilePath: string;
+  /**
+   * T, or `"auto"`: the floor of the first conversation-sized request, as the API reports it,
+   * plus `headroomTokens`. Automatic is the default. A fixed T is right for one prefix size and
+   * wrong for every other: 80k over a 63k prefix leaves 17k of room, the pressure pass then fires
+   * on every request and the agent keeps only its last K turns (docs/findings.md §23).
+   */
+  tripThresholdTokens: number | "auto";
+  /** Room above the floor before eviction starts, when T is automatic. */
+  headroomTokens?: number;
   /** Suppress per-request stdout lines (used by tests). The JSONL log is always written. */
   quiet?: boolean;
   /** When set, every transformable request body is written here pre-eviction — debugging only. */
   dumpDir?: string;
 }
 
-// Deliberately low (code averages ~3.2–3.5): over-estimating tokens before the first
+// Deliberately low: a conversation body runs ~2.1–2.5 billable chars per token once thinking
+// signatures are left out (docs/findings.md §23), and over-estimating before the first
 // calibration sample trips eviction early rather than letting a session overshoot the cap.
-export const FALLBACK_CHARS_PER_TOKEN = 3.2;
+export const FALLBACK_CHARS_PER_TOKEN = 2.5;
 const CALIBRATION_MIN_TOKENS = 1000;
+/**
+ * A response calibrates the ratio only when its context is at least this share of the largest
+ * the proxy has seen. Claude Code makes small side calls beside the conversation — titles,
+ * warm-ups, count_tokens — of plain prose at ~4 chars per token, where the conversation itself,
+ * code plus the replayed thinking the body never shows, runs nearer 2.3. A side call setting the
+ * ratio for the conversation put every estimate 40% low or, with signatures counted, 3× high.
+ */
+const CALIBRATION_MIN_SHARE_OF_LARGEST = 0.5;
+const CHARS_PER_TOKEN_MIN = 1.5;
+const CHARS_PER_TOKEN_MAX = 8;
+/** T until the floor is measured, and for good when no conversation-sized request ever arrives. */
+export const DEFAULT_TRIP_TOKENS = 80_000;
+/**
+ * 60k of room over the floor: N turns of tool results before the first trip, plus the batch a
+ * trip holds back under the minimum. 80k over the ~20k prefix of a bare project is the old
+ * default exactly; over the 63k prefix of a large one it comes to ~123k, where 80k left 17k.
+ */
+export const DEFAULT_HEADROOM_TOKENS = 60_000;
 /** How many bodies this process has dumped, so that each name carries the order it was written in. */
 let dumpSequence = 0;
 const USAGE_SCAN_LIMIT_CHARS = 262_144;
@@ -122,6 +152,12 @@ export function createProxyServer(config: ProxyConfig): http.Server {
   // Live chars-per-token ratio, calibrated from the API's reported usage on each response so
   // the trip threshold is denominated in real tokens rather than a fixed chars ÷ 4 guess.
   let charsPerToken = FALLBACK_CHARS_PER_TOKEN;
+  let largestContextTokens = 0;
+  // T. Fixed when configured; otherwise the default until the first conversation-sized
+  // response reports what the floor really is, and floor + headroom from then on.
+  const headroomTokens = config.headroomTokens ?? DEFAULT_HEADROOM_TOKENS;
+  let tripThresholdTokens = config.tripThresholdTokens === "auto" ? DEFAULT_TRIP_TOKENS : config.tripThresholdTokens;
+  let floorMeasured = config.tripThresholdTokens !== "auto";
   // Speed-gauge bookkeeping. Only /v1/messages requests are classified, but a trip on a
   // count_tokens request changes the prefix for the /v1/messages request that follows it.
   let previousMessagesRequestAt: number | null = null;
@@ -138,6 +174,17 @@ export function createProxyServer(config: ProxyConfig): http.Server {
     heldBackTokens?: number;
     aboveAlarmLine?: true;
     charsPerToken: number;
+    tripThresholdTokens: number;
+    /** Billable chars of the body as sent — what the response's usage is measured against. */
+    billableCharsSent: number;
+    /** What eviction could still take from the sent body; see `EvictionOutcome`. */
+    evictableCharsSent: number;
+  }
+
+  /** The meta as the log records it: the two char tallies are working state, not a metric. */
+  function requestLogFields(meta: EvictionRequestMeta): Omit<EvictionRequestMeta, "billableCharsSent" | "evictableCharsSent"> {
+    const { billableCharsSent: _billable, evictableCharsSent: _evictable, ...fields } = meta;
+    return fields;
   }
 
   /** What the rebuild rule needs to know about this request's place in the session. */
@@ -202,7 +249,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         sentBodyBytes: bufferedBody?.byteLength ?? requestBodyBytes,
         ...(usage ?? {}),
         ...(rebuild !== null ? { rebuild } : {}),
-        ...(evictionMeta ?? {}),
+        ...(evictionMeta === null ? {} : requestLogFields(evictionMeta)),
       };
       logWriter.append(entry);
       if (config.quiet !== true) console.log(formatLiveLine(entry));
@@ -228,10 +275,43 @@ export function createProxyServer(config: ProxyConfig): http.Server {
       });
       upstreamResponse.on("end", () => {
         const usage = scanUsage ? extractUsage(responseHead) : null;
-        if (usage !== null && bufferedBody !== null) {
+        if (usage !== null && evictionMeta !== null) {
           const realInputTokens = totalContextTokens(usage);
-          if (realInputTokens >= CALIBRATION_MIN_TOKENS) {
-            charsPerToken = Math.min(8, Math.max(2, bufferedBody.byteLength / realInputTokens));
+          if (
+            realInputTokens >= CALIBRATION_MIN_TOKENS &&
+            realInputTokens >= largestContextTokens * CALIBRATION_MIN_SHARE_OF_LARGEST
+          ) {
+            largestContextTokens = Math.max(largestContextTokens, realInputTokens);
+            charsPerToken = Math.min(
+              CHARS_PER_TOKEN_MAX,
+              Math.max(CHARS_PER_TOKEN_MIN, evictionMeta.billableCharsSent / realInputTokens),
+            );
+            // The floor is read once, off the first request the gauge counts as the conversation:
+            // its real size less what eviction could still take from it. A resumed session
+            // measures its resumed conversation, whose replies are as unevictable as a prefix.
+            if (!floorMeasured && rebuildContext !== null) {
+              floorMeasured = true;
+              const floorTokens = Math.max(
+                0,
+                Math.round(realInputTokens - evictionMeta.evictableCharsSent / charsPerToken),
+              );
+              tripThresholdTokens = floorTokens + headroomTokens;
+              logWriter.append({
+                kind: "threshold",
+                timestamp: new Date().toISOString(),
+                measuredTokens: realInputTokens,
+                floorTokens,
+                headroomTokens,
+                tripThresholdTokens,
+              });
+              if (config.quiet !== true) {
+                console.log(
+                  `[onepass] floor measured: ${formatTokensShort(floorTokens)} real tokens eviction cannot reach ` +
+                    `(${formatTokensShort(realInputTokens)} reported on the first conversation request) -> ` +
+                    `T = ${formatTokensShort(tripThresholdTokens)} (floor + ${formatTokensShort(headroomTokens)} headroom)`,
+                );
+              }
+            }
           }
         }
         logRequest(status, usage);
@@ -329,7 +409,7 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         evictAfterAssistantTurns: config.evictAfterAssistantTurns,
         protectLastAssistantTurns: config.protectLastAssistantTurns,
         minSavedChars: config.minSavedChars,
-        tripThresholdTokens: config.tripThresholdTokens,
+        tripThresholdTokens,
         batchMinTokens: config.batchMinTokens,
         charsPerToken: requestCharsPerToken,
       });
@@ -353,7 +433,13 @@ export function createProxyServer(config: ProxyConfig): http.Server {
           );
         }
       }
-      if (outcome.bodyChanged) forwardBody = Buffer.from(JSON.stringify(outcome.body), "utf8");
+      // The legend rides only on a request that carries a stub. Stubs are monotonic, so from the
+      // first trip on it is in every request and the system prompt is stable again; before it, a
+      // session under the line goes upstream byte for byte and costs nothing (docs/findings.md
+      // §22). The first trip therefore rewrites the cached prefix as well as the conversation —
+      // once, which is the price of the agent reading the legend at the moment it meets a stub.
+      const legend = outcome.stubbedIds.length > 0 ? addStubLegend(outcome.body) : { body: outcome.body, changed: false };
+      if (outcome.bodyChanged || legend.changed) forwardBody = Buffer.from(JSON.stringify(legend.body), "utf8");
       evictionMeta = {
         estimatedTokensBefore: outcome.estimatedTokensBefore,
         estimatedTokensSent: outcome.estimatedTokensSent,
@@ -364,6 +450,9 @@ export function createProxyServer(config: ProxyConfig): http.Server {
         ...(outcome.heldBackTokens !== undefined ? { heldBackTokens: outcome.heldBackTokens } : {}),
         ...(outcome.aboveAlarmLine ? { aboveAlarmLine: true as const } : {}),
         charsPerToken: requestCharsPerToken,
+        tripThresholdTokens,
+        billableCharsSent: legend.changed ? billableChars(legend.body) : outcome.billableCharsSent,
+        evictableCharsSent: outcome.evictableCharsSent,
       };
     } catch {
       // Unparseable body: forward the original bytes untouched. Never fail a request.
