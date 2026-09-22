@@ -16,7 +16,8 @@ tokens can go at once, a handful of times in a session rather than every turn. M
 sessions cost about the same. The worst case measured was 1.35x.
 
 Building this was the easy part. [How I knew it worked](docs/how-i-solved-it.md) is the part
-I'd want a reviewer to read.
+I'd want a reviewer to read. The evals still missed things: the [biggest bugs](docs/bugs.md)
+are there too, and one of them is open.
 
 ## Install and run
 
